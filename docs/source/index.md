@@ -72,6 +72,7 @@ record
 teleoperation
 workflows/replay_in_sim
 workflows/franka_emika_panda
+workflows/vive_umi_rm75b
 workflows/datasets
 workflows/context_inpainting
 workflows/dataset_curation

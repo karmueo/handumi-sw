@@ -543,7 +543,7 @@ def arm_activity_metrics(rollout: dict[str, Any], runtime) -> dict[str, float | 
     activity = {}
     openings = rollout.get("gripper_normalized")
     widths = None
-    if openings is not None and np.ndim(openings) == 2 and np.shape(openings)[1] == 2:
+    if any(runtime.finger_joints.values()) and openings is not None and np.ndim(openings) == 2 and np.shape(openings)[1] == 2:
         widths = np.asarray(openings, dtype=np.float32) * float(
             runtime.config.gripper_max_width_m
         )

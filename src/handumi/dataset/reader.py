@@ -123,6 +123,15 @@ def validate_raw_state_metadata(info_or_root: dict[str, Any] | str | Path) -> No
         "capture_schema": capture_schema,
         "state_semantics": semantics,
     }
+    if capture_schema == "synchronized_sources_v2":
+        expected["capture_schema"] = capture_schema
+        grippers = meta.get("sources", {}).get("gripper", {})
+        for side in meta.get("active_sides", []):
+            entry = grippers.get(side, {})
+            if not entry.get("enabled") or not entry.get("normalized_available") or "width_available" not in entry:
+                raise ValueError("新版数据缺少夹爪能力声明")
+        if not meta.get("active_sides"):
+            raise ValueError("新版数据必须声明活动侧")
     if actual != expected:
         raise ValueError(
             "Unsupported HandUMI raw layout. Re-record with the current "
@@ -189,6 +198,7 @@ def load_raw_episode(
     prefixes = (
         "observation.tracking.",
         "observation.feetech.",
+        "observation.gripper.",
         "observation.camera.",
         "observation.sync.",
     )
@@ -200,6 +210,9 @@ def load_raw_episode(
         if values.ndim == 2 and values.shape[1] == 1:
             values = values[:, 0]
         signals[key] = values
+    if metadata.get("capture_schema") == "synchronized_sources_v2":
+        from handumi.dataset.gripper import read_normalized
+        read_normalized(table, metadata)
     signals = normalize_raw_signals(states, signals, metadata=metadata)
     return RawEpisode(states=states, fps=fps, signals=signals)
 
@@ -281,6 +294,9 @@ def _restore_enabled_signals(
     if not isinstance(sources, dict):
         raise TypeError("Current HandUMI layout requires handumi.sources metadata.")
 
+    for side, config in sources.get("gripper", {}).items():
+        for flag in ("enabled", "width_available"):
+            signals[f"observation.gripper.{side}.{flag}"] = np.full(frame_count, int(bool(config.get(flag))), dtype=np.int64)
     feetech = sources.get("feetech")
     if isinstance(feetech, dict) and "enabled" in feetech:
         signals.setdefault(

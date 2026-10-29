@@ -304,6 +304,17 @@ def load_joint_episode(
     actions = _column_float32(table, "action")
     if len(states) == 0:
         raise SystemExit(f"Episode {args.episode} is empty.")
+    prefix = "action" if getattr(args, "source", "observation.state") == "action" else "observation"
+    keys = [f"{prefix}.gripper.{side}.normalized" for side in ("left", "right")]
+    args.recorded_openings = None
+    info = getattr(getattr(dataset, "meta", None), "info", {})
+    if info.get("handumi", {}).get("capture_schema") == "synchronized_sources_v2" and not all(key in table.column_names for key in keys):
+        raise ValueError("转换后的 UMI 数据缺少独立开度列")
+    if all(key in table.column_names for key in keys):
+        openings = np.column_stack([_column_float32(table, key).reshape(-1) for key in keys])
+        if not np.isfinite(openings).all() or np.any((openings < 0) | (openings > 1)):
+            raise ValueError("转换数据开度无效")
+        args.recorded_openings = openings
     return states, actions, fps
 
 
@@ -354,6 +365,8 @@ def build_rollout(args: argparse.Namespace) -> dict[str, np.ndarray]:
         canonical = to_canonical(canonical, layout=external, runtime=runtime)
     qpos, gripper_normalized = expand_canonical_trajectory(canonical, runtime=runtime)
 
+    if getattr(args, "recorded_openings", None) is not None:
+        gripper_normalized = args.recorded_openings[frame_indices]
     solver = runtime.solver_cls()
     start = time.perf_counter()
     left_tcp = np.empty((len(qpos), 7), dtype=np.float32)
@@ -733,6 +746,9 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
 
     runtime = load_embodiment(args.robot)
     server = viser.ViserServer(port=args.port)
+    from handumi.visualize.gripper_curve import add_gripper_curve
+    if "gripper_normalized" in rollout:
+        add_gripper_curve(server, rollout["gripper_normalized"], float(np.asarray(rollout.get("fps", [30])).reshape(-1)[0]))
     urdf = runtime.load_urdf(load_meshes=True)
     robot_view = ViserUrdf(server, urdf, root_node_name="/robot")
     _render_task_scene(server, args, rollout)

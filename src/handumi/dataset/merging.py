@@ -341,6 +341,11 @@ def _require_compatible(
 
     if dataset_active_sides(reference.get("handumi", {})) != dataset_active_sides(candidate.get("handumi", {})):
         raise ValueError("Cannot merge recordings with different handumi.active_sides.")
+    left_meta, right_meta = reference.get("handumi", {}), candidate.get("handumi", {})
+    if "synchronized_sources_v2" in (left_meta.get("capture_schema"), right_meta.get("capture_schema")):
+        for key in ("capture_schema", "sources", "umi_calibration"):
+            if left_meta.get(key) != right_meta.get(key):
+                raise ValueError(f"Cannot merge incompatible UMI {key}")
     for key in _COMPATIBILITY_KEYS:
         if reference.get(key) != candidate.get(key):
             raise ValueError(

@@ -182,6 +182,11 @@ def validate_episode(
     )
     if not active_sides:
         raise ValueError("A capture must have at least one active tracking side.")
+    modern = any(key.startswith("observation.gripper.") for key in signals)
+    if modern:
+        from dataclasses import replace
+        cfg = replace(cfg, max_bad_tracking_fraction=0, max_bad_sensor_fraction=0,
+                      max_bad_sync_fraction=0, sensor_warmup_s=0)
     dt = _row_deltas(signals, frame_count, fps)
     _check_tracking_fraction(signals, frame_count, cfg, findings, metrics)
     # Ignore the opening frames while every source fills its buffer.
@@ -194,7 +199,8 @@ def validate_episode(
     _check_sync_error(signals, frame_count, cfg, findings, metrics, warmup)
     _check_signal_freezes(signals, frame_count, dt, cfg, findings, metrics)
     _check_kinematics(states, dt, cfg, findings, metrics, active_sides)
-    _check_pose_freezes(states, dt, cfg, findings, metrics, active_sides)
+    if not modern:
+        _check_pose_freezes(states, dt, cfg, findings, metrics, active_sides)
     _check_aperture(states, signals, cfg, findings, metrics, active_sides)
 
     return EpisodeQualityReport(
@@ -501,6 +507,16 @@ def _check_aperture(
     metrics: dict[str, float | int | bool],
     active_sides: tuple[str, ...] = ("left", "right"),
 ) -> None:
+    modern = any(key.startswith("observation.gripper.") for key in signals)
+    if modern:
+        for side in active_sides:
+            values = _signal(signals, f"observation.gripper.{side}.normalized", len(states))
+            valid = _signal(signals, f"observation.gripper.{side}.valid", len(states))
+            if values is None or valid is None or not np.all(valid == 1) or not np.isfinite(values).all() or np.any((values < 0) | (values > 1)):
+                findings.append(QualityFinding("invalid_gripper", "reject", f"{side} 夹爪包含无效测量"))
+            else:
+                metrics[f"aperture_range_normalized.{side}"] = float(np.ptp(values))
+        return
     enabled = _signal(signals, "observation.feetech.enabled", len(states))
     if enabled is not None and not np.any(enabled >= 0.5):
         return

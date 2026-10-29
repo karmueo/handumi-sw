@@ -199,3 +199,7 @@ If you use HandUMI, please cite:
 ## License
 
 Original HandUMI software and documentation are licensed under the [Apache License 2.0](LICENSE). Dataset, hardware, headset application, robot firmware, and trademark licenses remain separate.
+
+## 单台 Vive UMI 与 RM75B
+
+Vive Tracker、USB 鱼眼相机和 ArUco 夹爪的原生采集、时间标定与七轴仿真流程见 [操作指南](docs/source/workflows/vive_umi_rm75b.md)。新配置以该设备为默认，原有 Quest/PICO/Feetech 流程保留。

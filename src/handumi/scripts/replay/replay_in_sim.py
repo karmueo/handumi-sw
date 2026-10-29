@@ -140,7 +140,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--controller-device",
-        choices=("pico", "meta"),
+        choices=("pico", "meta", "vive"),
         default=None,
         help=advanced(
             "Controller device. Defaults to handumi.recording_device in dataset "
@@ -345,6 +345,9 @@ def load_episode_states(
     )
     source_info = ensure_metadata(ref)
     validate_raw_state_metadata(source_info)
+    if getattr(args, "gripper_retarget", None) == "physical-width":
+        from handumi.dataset.gripper import require_physical_width
+        require_physical_width(handumi_metadata(source_info))
     _reject_joint_level_dataset(source_info)
     dataset = open_dataset(ref, episode=args.episode, download_videos=False)
     fps = float(getattr(dataset, "fps", 30) or 30)
@@ -360,13 +363,8 @@ def load_episode_states(
             f"Expected HandUMI state width {HANDUMI_RAW_STATE_SIZE} "
             f"(poses + grippers) in {args.source!r}, got {width}."
         )
-    if all(key in table.column_names for key in GRIPPER_NORMALIZED_KEYS):
-        normalized = np.column_stack(
-            [_column_float32(table, key).reshape(-1) for key in GRIPPER_NORMALIZED_KEYS]
-        )
-        normalized = np.clip(normalized, 0.0, 1.0)
-    else:
-        normalized = None
+    from handumi.dataset.gripper import read_normalized
+    normalized = read_normalized(table, handumi_metadata(source_info))
     return states, fps, source_info, normalized
 
 
@@ -411,7 +409,7 @@ def _resolve_gripper_openings(
     if mode not in {"normalized", "physical-width"}:
         raise ValueError(f"Unsupported gripper retarget mode {mode!r}.")
     if mode == "normalized" and recorded_normalized is not None:
-        return np.clip(recorded_normalized, 0.0, 1.0), "recorded Feetech normalized"
+        return np.clip(recorded_normalized, 0.0, 1.0), "recorded normalized opening"
     if states.ndim != 2 or states.shape[1] != HANDUMI_RAW_STATE_SIZE:
         raise ValueError(
             f"Expected HandUMI states shape (T, {HANDUMI_RAW_STATE_SIZE}), "
@@ -780,6 +778,9 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
     controller_device = _resolved_controller_device(args, source_info)
     requested_retarget_mode = str(args.retarget_mode)
     retarget_mode = _resolved_retarget_mode(args, source_info)
+    if runtime.config.replay_gripper_mode == "physical-width":
+        from handumi.dataset.gripper import require_physical_width
+        require_physical_width(source_metadata)
     gripper_openings, gripper_source = _resolve_gripper_openings(
         states,
         recorded_gripper_openings,
@@ -1542,6 +1543,9 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
 
     runtime = load_embodiment(args.robot)
     server = viser.ViserServer(port=args.port)
+    from handumi.visualize.gripper_curve import add_gripper_curve
+    if "gripper_normalized" in rollout:
+        add_gripper_curve(server, rollout["gripper_normalized"], float(np.asarray(rollout.get("fps", [30])).reshape(-1)[0]))
     urdf = runtime.load_urdf(load_meshes=True)
     robot_view = ViserUrdf(server, urdf, root_node_name="/robot")
     _render_task_scene(server, args, rollout)
@@ -1570,6 +1574,7 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
     play = server.gui.add_checkbox("Play", True)
     frame = server.gui.add_slider("Frame", 0, total_frames - 1, 1, 0)
     err_text = server.gui.add_text("EE error (cm/deg)", "-", disabled=True)
+    opening_text = server.gui.add_text("Gripper opening (Link7 flange replay)", "-", disabled=True)
 
     def draw(index: int) -> None:
         # Frames before the episode replay the home -> start lead-in; markers
@@ -1581,6 +1586,7 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
         else:
             i = index - approach_frames
             robot_view.update_cfg(rollout["qpos"][i])
+        opening_text.value = " ".join(f"{side}={rollout['gripper_normalized'][i, column]:.1%}" for column, side in enumerate(("left", "right")) if side in runtime.active_sides)
         for (kind, side), marker in markers.items():
             marker.position = tuple(rollout[f"{kind}_{side}_pose7_robot_world"][i, :3])
         if index < approach_frames:

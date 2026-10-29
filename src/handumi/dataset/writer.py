@@ -158,6 +158,8 @@ class EpisodeResult:
     source_episode_index: int = -1
     calibration_id: int = -1
     source_kind: int = 0
+    gripper_normalized: np.ndarray | None = None
+    action_gripper_normalized: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.source_episode_index < 0:
@@ -692,6 +694,20 @@ def write_dataset(
             "calibration_id": calibration_ids,
             "source_kind": source_kinds,
         }
+        if ep.gripper_normalized is not None:
+            openings = np.asarray(ep.gripper_normalized, dtype=np.float32)
+            if openings.shape != (T, 2) or not np.isfinite(openings).all() or np.any((openings < 0) | (openings > 1)):
+                raise ValueError("转换后开度必须为有限的 (T,2) 归一化数值")
+            for index, side in enumerate(("left", "right")):
+                prefix = f"observation.gripper.{side}"
+                rows[f"{prefix}.normalized"] = openings[:, index]
+                rows[f"{prefix}.valid"] = np.full(T, int(side in source_info.get("handumi", {}).get("active_sides", ["left", "right"])), dtype=np.int64)
+        if ep.action_gripper_normalized is not None:
+            action_openings = np.asarray(ep.action_gripper_normalized, dtype=np.float32)
+            if action_openings.shape != (T, 2) or not np.isfinite(action_openings).all() or np.any((action_openings < 0) | (action_openings > 1)):
+                raise ValueError("下一帧开度必须为有限的 (T,2) 归一化数值")
+            for index, side in enumerate(("left", "right")):
+                rows[f"action.gripper.{side}.normalized"] = action_openings[:, index]
         df = pd.DataFrame(rows)
         df.to_parquet(data_dir / f"file-{file_idx:03d}.parquet", index=False)
 
@@ -766,6 +782,17 @@ def write_dataset(
         handumi_metadata=output_handumi_metadata,
         chunks_size=chunks_size,
     )
+    if any(ep.gripper_normalized is not None for ep in episodes):
+        if not all(ep.gripper_normalized is not None for ep in episodes):
+            raise ValueError("同一输出数据集不能混合有开度与无开度片段")
+        for side in ("left", "right"):
+            for suffix, dtype in (("normalized", "float32"), ("valid", "int64")):
+                info["features"][f"observation.gripper.{side}.{suffix}"] = {"dtype": dtype, "shape": [1], "names": None}
+    if any(ep.action_gripper_normalized is not None for ep in episodes):
+        if not all(ep.action_gripper_normalized is not None for ep in episodes):
+            raise ValueError("转换结果缺少一致的下一帧开度")
+        for side in ("left", "right"):
+            info["features"][f"action.gripper.{side}.normalized"] = {"dtype": "float32", "shape": [1], "names": None}
     with open(meta_dir / "info.json", "w") as fh:
         json.dump(info, fh, indent=4)
 
@@ -795,6 +822,16 @@ def write_dataset(
             all_source_kinds=all_source_kinds,
             video_features=video_features,
         )
+        if episodes and all(ep.gripper_normalized is not None for ep in episodes):
+            openings = np.concatenate([ep.gripper_normalized for ep in episodes])
+            for index, side in enumerate(("left", "right")):
+                stats[f"observation.gripper.{side}.normalized"] = _compute_feature_stats(openings[:, index:index+1])
+                valid = np.full((len(openings), 1), int(side in source_info.get("handumi", {}).get("active_sides", ["left", "right"])))
+                stats[f"observation.gripper.{side}.valid"] = _compute_feature_stats(valid)
+        if episodes and all(ep.action_gripper_normalized is not None for ep in episodes):
+            action_openings = np.concatenate([ep.action_gripper_normalized for ep in episodes])
+            for index, side in enumerate(("left", "right")):
+                stats[f"action.gripper.{side}.normalized"] = _compute_feature_stats(action_openings[:, index:index+1])
         with open(meta_dir / "stats.json", "w") as fh:
             json.dump(stats, fh, indent=4)
 

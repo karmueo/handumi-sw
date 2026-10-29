@@ -298,7 +298,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     )
     ik.add_argument(
         "--controller-device",
-        choices=("pico", "meta"),
+        choices=("pico", "meta", "vive"),
         default=None,
         help=advanced(
             "Override the source tracking device. Defaults to dataset metadata, "
@@ -678,12 +678,13 @@ def _resolve_conversion_tcp_calibration(
     if snapshot is not None and is_identity_bound_controller_tcp_metadata(snapshot):
         output_metadata = dict(snapshot)
         output_metadata["applied_to_state"] = True
+        source_identity = snapshot.get("source_robot") or snapshot.get("source_tool")
         return ConversionTcpCalibrationSelection(
             calibration=controller_tcp_calibration_from_metadata(snapshot),
             metadata=output_metadata,
             source=(
                 "dataset robot-tool snapshot "
-                f"{snapshot['source_robot']}/{snapshot['tracking_device']} "
+                f"{source_identity}/{snapshot['tracking_device']} "
                 f"sha256={snapshot.get('sha256', 'unknown')}"
             ),
         )
@@ -1062,7 +1063,7 @@ def _replay_args_for_episode(
     replay_args.episode = source_episode_index
     replay_args.robot = args.embodiment
     replay_args.source = args.source
-    replay_args.retarget_mode = "absolute-table"
+    replay_args.retarget_mode = args.retarget_mode
     replay_args.compose_source = args.compose_source
     replay_args.translation_scale = args.translation_scale
     replay_args.controller_device = args.controller_device
@@ -1214,7 +1215,7 @@ def process_episode(
             "cannot construct (state, action) pairs."
         )
 
-    if args.retarget_mode == "absolute-table":
+    if args.retarget_mode == "absolute-table" or getattr(args, "umi_v2", False):
         try:
             rollout = _solve_with_replay_pipeline(
                 args=args,
@@ -1289,6 +1290,8 @@ def process_episode(
         source_episode_index=source_episode_index,
         calibration_id=-1 if getattr(args, "raw_controller_debug", False) else 0,
         source_kind=0,
+        gripper_normalized=np.asarray(rollout["gripper_normalized"][:-1], dtype=np.float32) if getattr(args, "umi_v2", False) else None,
+        action_gripper_normalized=np.asarray(rollout["gripper_normalized"][1:], dtype=np.float32) if getattr(args, "umi_v2", False) else None,
     )
 
 
@@ -1436,6 +1439,7 @@ def main() -> None:
         validate_raw_state_metadata(source_info)
     except ValueError as exc:
         parser.error(str(exc))
+    args.umi_v2 = source_info.get("handumi", {}).get("capture_schema") == "synchronized_sources_v2"
     _resolve_retarget_mode(parser, args, source_info)
 
     print(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified HandUMI recorder for PICO and Meta Quest tracking backends.
+"""统一录制追踪与相机数据，支持覆盖输出目录和追加录制。
 
 Episode control: hands-free by voice unless disabled -- say "start recording",
 "stop recording", or "restart". Feetech double-clap control is enabled by
@@ -14,7 +14,9 @@ to cap the session.
 
 Spoken status announcements ("Recording episode 3", "Episode 3 saved, 812
 frames", ...) are on by default — pass --no-sounds to disable them. The
-required --output-dir selects the local output directory.
+required --output-dir selects the local output directory. --overwrite true
+(default) replaces its entire contents; --overwrite false refuses existing
+directories. --resume always appends and ignores --overwrite.
 """
 
 from __future__ import annotations
@@ -92,6 +94,11 @@ from handumi.feetech import (
 )
 from handumi.feetech.bus import FeetechUnavailableError
 from handumi.robots.utils import IDENTITY_POSE7
+from handumi.scripts._record_output import (
+    _check_output_directory,
+    _overwrite_arg,
+    _prepare_output_directory,
+)
 from handumi.synchronization import (
     SustainedHealthGate,
     capture_timing_frame,
@@ -103,8 +110,8 @@ from handumi.tracking.gestures import BilateralClapArbiter, DoubleClapDetector
 from handumi.tracking.meta_quest import MetaQuestConfig, MetaQuestTrackingProvider
 from handumi.tracking.pico import (
     PICO_MODE_CHOICES,
-    PicoTrackingFrozenError,
     START_BUTTON_CHOICES,
+    PicoTrackingFrozenError,
     PicoTrackingProvider,
     normalize_pico_mode,
     read_start_button_value,
@@ -1306,6 +1313,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Local dataset directory, for example outputs/my-dataset.",
     )
     p.add_argument(
+        "--overwrite",
+        type=_overwrite_arg,
+        default=True,
+        metavar="{true,false}",
+        help=(
+            "Replace the entire existing output directory (default: true). "
+            "Pass --overwrite false to refuse existing directories. "
+            "Ignored with --resume, which always appends."
+        ),
+    )
+    p.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -1767,7 +1785,9 @@ def _print_recording_plan(
         )
         for spec in camera_specs
     )
-    mode = "resume" if args.resume else "new dataset"
+    mode = "resume" if args.resume else (
+        "overwrite entire directory" if Path(args.output_dir).exists() else "new dataset"
+    )
     workspace = "table-calibrated" if spatial_session_metadata else "HMD-recentered"
     episodes = "until stopped" if args.num_episodes <= 0 else str(args.num_episodes)
     print("\nRecording plan")
@@ -1796,6 +1816,7 @@ def main() -> None:
     program_start_s = time.perf_counter()
     args = _resolve_recording_args(parse_args())
     _validate_args(args)
+    _check_output_directory(args)
     play_sounds = not args.no_sounds
 
     camera_names = _selected_camera_names(args)
@@ -1919,6 +1940,7 @@ def main() -> None:
     if args.dry_run:
         return
 
+    _prepare_output_directory(args)
     log.info("--- Tracking setup ---")
     calibration = ControllerTcpCalibration(
         left=IDENTITY_POSE7.astype(np.float32).copy(),

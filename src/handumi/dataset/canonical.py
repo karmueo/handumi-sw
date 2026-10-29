@@ -141,6 +141,8 @@ def _resolve_widths_m(
     gripper_normalized: np.ndarray | None,
     fallback_gripper: float,
 ) -> np.ndarray:
+    if not any(runtime.finger_joints.values()):
+        return np.zeros((len(qpos), 2), dtype=np.float32)
     max_width = np.float32(max(float(runtime.config.gripper_max_width_m), 1e-6))
     if gripper_widths_m is not None:
         widths = np.asarray(gripper_widths_m, dtype=np.float32)

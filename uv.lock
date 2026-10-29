@@ -1131,6 +1131,9 @@ sim = [
     { name = "pyvista" },
     { name = "viser" },
 ]
+vive = [
+    { name = "openvr" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1152,6 +1155,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.0" },
     { name = "openarm-can", marker = "extra == 'openarm'", git = "https://github.com/enactic/openarm_can.git?subdirectory=python&rev=1.2.9" },
     { name = "opencv-python", specifier = ">=4.10,<5" },
+    { name = "openvr", marker = "extra == 'vive'", specifier = ">=2.5,<3" },
     { name = "piper-sdk", marker = "extra == 'piper'", git = "https://github.com/agilexrobotics/piper_sdk.git" },
     { name = "pybind11", specifier = ">=2.13" },
     { name = "pyroki", git = "https://github.com/chungmin99/pyroki.git" },
@@ -1167,7 +1171,7 @@ requires-dist = [
     { name = "vosk", specifier = ">=0.3.45" },
     { name = "yourdfpy" },
 ]
-provides-extras = ["piper", "openarm", "sim", "cuda", "inpaint"]
+provides-extras = ["vive", "piper", "openarm", "sim", "cuda", "inpaint"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]
@@ -2591,6 +2595,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/4b/33/b5db29a6c00eb8f50708110d8d453747ca125c8b805bc437b289dbdcc057/opencv_python_headless-4.13.0.92-cp37-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:0bd48544f77c68b2941392fcdf9bcd2b9cdf00e98cb8c29b2455d194763cf99e", size = 60391106, upload-time = "2026-02-05T10:30:14.236Z" },
     { url = "https://files.pythonhosted.org/packages/fb/c3/52cfea47cd33e53e8c0fbd6e7c800b457245c1fda7d61660b4ffe9596a7f/opencv_python_headless-4.13.0.92-cp37-abi3-win32.whl", hash = "sha256:a7cf08e5b191f4ebb530791acc0825a7986e0d0dee2a3c491184bd8599848a4b", size = 30812232, upload-time = "2026-02-05T07:02:29.594Z" },
     { url = "https://files.pythonhosted.org/packages/4a/90/b338326131ccb2aaa3c2c85d00f41822c0050139a4bfe723cfd95455bd2d/opencv_python_headless-4.13.0.92-cp37-abi3-win_amd64.whl", hash = "sha256:77a82fe35ddcec0f62c15f2ba8a12ecc2ed4207c17b0902c7a3151ae29f37fb6", size = 40070414, upload-time = "2026-02-05T07:02:26.448Z" },
+]
+
+[[package]]
+name = "openvr"
+version = "2.12.1401"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/23/37/7217f40ba5525a6189827f8d9671d2ce326e578a6e5d958a8adb348ce603/openvr-2.12.1401.tar.gz", hash = "sha256:245afacb008b66f10bc38eab1f4806cf634a70400c4a0baf349295f617d0f6df", size = 1957770, upload-time = "2025-08-20T03:55:09.792Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/46/a2/e6cb89bd1803ffe70a25c20121ad8bb533fa1f1334ce7f0f7585d35e5096/openvr-2.12.1401-py3-none-any.whl", hash = "sha256:ef761cef3162843a8025a7812d5e244fd94ab3a992ca8f5ef0d1b0188ad56cb3", size = 1965222, upload-time = "2025-08-20T03:55:06.858Z" },
 ]
 
 [[package]]

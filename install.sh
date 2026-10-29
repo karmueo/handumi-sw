@@ -4,13 +4,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-SKIP_XRT=0
+SKIP_XRT=1
+TRACKING_DEVICE="vive"
 ROBOT=""
 WITH_SIM=0
 WITH_CUDA=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-xrt) SKIP_XRT=1 ;;
+    --device)
+      shift
+      TRACKING_DEVICE="${1:-}"
+      case "$TRACKING_DEVICE" in
+        vive|meta) SKIP_XRT=1 ;;
+        pico) SKIP_XRT=0 ;;
+        *) echo "error: --device expects vive, meta or pico" >&2; exit 1 ;;
+      esac
+      ;;
     --sim) WITH_SIM=1 ;;
     --cuda) WITH_CUDA=1 ;;
     --robot)
@@ -23,7 +33,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "error: unknown argument: $1" >&2
-      echo "       usage: $0 [--skip-xrt] [--sim] [--cuda] [--robot piper|openarmv1]" >&2
+      echo "       usage: $0 [--device vive|meta|pico] [--skip-xrt] [--sim] [--cuda] [--robot piper|openarmv1]" >&2
       exit 1
       ;;
   esac
@@ -62,7 +72,11 @@ ensure_rig_config() {
     echo "==> Reusing local rig configuration (configs/rig.yaml)"
     return 0
   fi
-  cp configs/rig.example.yaml configs/rig.yaml
+  if [[ "$TRACKING_DEVICE" == "vive" ]]; then
+    cp configs/rig.example.yaml configs/rig.yaml
+  else
+    sed "s/device: meta/device: $TRACKING_DEVICE/" configs/rig.legacy.example.yaml > configs/rig.yaml
+  fi
   echo "==> Created configs/rig.yaml from the example; edit it for this machine"
 }
 
@@ -204,6 +218,7 @@ ensure_venv() {
 ensure_project_deps() {
   echo "==> Syncing project dependencies (update only if needed)"
   local extras=()
+  [[ "$TRACKING_DEVICE" == "vive" ]] && extras+=(--extra vive)
   [[ "$WITH_SIM" -eq 1 ]] && extras+=(--extra sim)
   [[ "$WITH_CUDA" -eq 1 ]] && extras+=(--extra cuda)
   [[ -n "$ROBOT" ]] && extras+=(--extra "${ROBOT/openarmv1/openarm}")
@@ -287,7 +302,9 @@ echo "Activate the environment with: source $VENV_DIR/bin/activate"
 echo ""
 
 # ── Runtime note: XRoboToolkit service ───────────────────────────────────────
-if [[ "$SKIP_XRT" -eq 1 ]]; then
+if [[ "$TRACKING_DEVICE" == "vive" ]]; then
+  echo "NOTE: Start SteamVR before using Vive. Run handumi calibrate umi --help for calibration."
+elif [[ "$SKIP_XRT" -eq 1 ]]; then
   echo "NOTE: XRoboToolkit (PICO) was skipped (--skip-xrt). Using Meta Quest"
   echo "      tracking needs no PC service — see docs/README_quest.md."
 else

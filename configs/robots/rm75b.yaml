@@ -1,0 +1,20 @@
+# 瑞尔曼 RM75B 单臂运动学回放配置，Link7 表示法兰。
+kind: rm75b
+urdf: assets/rm75b/rm75b.urdf
+pkg_root: assets/rm75b
+arms:
+  right:
+    ee_link: Link7
+    joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
+    gripper_joints: []
+# 参考设备的初始关节角，按弧度保存。
+home_q: [0.0, 0.3490658504, 0.0, 1.2217304764, 0.0, 1.5707963268, 1.5707963268]
+ik_weights:
+  pos: 100.0
+  ori: 15.0
+  rest: 1.0
+  max_joint_delta: 0.12
+  max_reach: 0.9
+replay:
+  max_joint_delta: 0.20
+  gripper_retarget: normalized

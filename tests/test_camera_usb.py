@@ -55,3 +55,31 @@ def test_invalid_opencv_fourcc_is_rejected(tmp_path: Path) -> None:
             laptop_cam_name="laptop",
             rig_config=rig,
         )
+
+
+def test_failed_camera_connect_can_be_cleaned_up(monkeypatch) -> None:
+    """底层打开失败后，清理不会用未连接异常掩盖原始连接错误。"""
+    import lerobot.cameras.opencv as opencv
+    from lerobot.utils.errors import DeviceNotConnectedError
+
+    class BrokenCamera:
+        """模拟无法打开的 LeRobot 相机。"""
+
+        def __init__(self, config):
+            """接收相机配置。"""
+
+        def connect(self):
+            """报告原始打开错误。"""
+            raise ConnectionError("camera open failed")
+
+        def disconnect(self):
+            """模拟底层已释放未打开设备的情况。"""
+            raise DeviceNotConnectedError("camera not connected")
+
+    monkeypatch.setattr(opencv, "OpenCVCamera", BrokenCamera)
+    camera = OpenCVCameraDevice(0, 30, 640, 480)
+    with pytest.raises(ConnectionError, match="camera open failed"):
+        camera.connect()
+    camera.disconnect()
+    camera.disconnect()
+    assert camera._camera is None

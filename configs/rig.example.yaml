@@ -1,97 +1,18 @@
-# Machine-local HandUMI configuration. Copy this file to configs/rig.yaml and
-# edit it for the connected cameras, Feetech adapters, and Quest network.
-
-cameras:
-  # index_or_path accepts either an OpenCV integer index (for example 0) or
-  # an explicit Linux device path (for example /dev/video0).
-  # Keys are user-defined. For custom names, add role: left, right, or
-  # workspace so side-based calibration commands can resolve the camera.
-  left_wrist:
-    type: opencv
-    index_or_path: 0
-    width: 640
-    height: 480
-    fps: 30
-  right_wrist:
-    type: zedmini
-    index_or_path: 2
-    width: 1344
-    height: 376
-    fps: 30
-  workspace:
-    # Any logical view can use type: opencv or type: zedmini. ZED Mini captures
-    # stereo UVC; HandUMI keeps only the 672x376 left half.
-    type: opencv
-    index_or_path: 4
-    width: 640
-    height: 480
-    fps: 30
-
-# Optional operator defaults, so the usual recording flags can be omitted from
-# the command line. Delete this whole section to fall back to built-in
-# defaults. CLI values override it; --resume loads the dataset snapshot first.
+# 默认单台 UMI 配置；本机序列号和标定保存在忽略版本管理的 local 目录。
 recording:
-  device: meta
-  # Which of the cameras declared above to capture. Defaults to both wrists.
-  cameras: [left_wrist, right_wrist]
-  # Fallbacks for legacy camera entries that omit width, height, or fps.
-  width: 640
-  height: 480
-  camera_fps: 30
+  device: vive
+  robot: rm75b
+  side: right
+  cameras: [right_wrist]
   fps: 30
-  robot: piper
-
-# Optional physical robot/table placement for this laboratory. Put the ignored
-# per-robot files in configs/calibration/table/local/<robot>.yaml. Replay profile
-# `auto` discovers them and otherwise uses the canonical simulation placement.
-# deployment:
-#   lab: example_research_lab
-#   # Optional overrides for calibrations stored outside the conventional path.
-#   table_calibrations:
-#     piper: /private/calibrations/piper.yaml
-
-feetech:
-  baudrate: 1000000
-  protocol_version: 0
-  left:
-    servo_id: 0
-    port: /dev/ttyACM0
-  right:
-    servo_id: 1
-    port: /dev/ttyACM1
-
-robots:
-  piper:
-    can:
-      bitrate: 1000000
-      restart_ms: 100
-      left_port: can0
-      right_port: can1
-  openarmv1:
-    backend: openarm_can
-    home_pose: forward_open
-    can:
-      fd: true
-      bitrate: 1000000
-      dbitrate: 5000000
-      left_port: can1
-      right_port: can0
-
-meta_quest:
-  connection:
-    quest_ip: "192.168.1.100"
-    tcp_port: 65432
-    sync_port: 42000
-    connect_retry_s: 1.0
-  health:
-    frame_stale_timeout_s: 0.25
-
-spatial_calibration:
-  board:
-    id: opencv_charuco_5x7_30mm_v1
-    squares_x: 5
-    squares_y: 7
-    dictionary: DICT_5X5_100
-    square_length_m: 0.030
-    marker_length_m: 0.015
-    legacy_pattern: false
+cameras:
+  right_wrist:
+    type: opencv
+    role: right
+    index_or_path: /dev/v4l/by-path/REPLACE_WITH_CAMERA-video-index0
+    width: 1920
+    height: 1080
+    fps: 30
+    fourcc: MJPG
+umi:
+  calibration: configs/calibration/umi/local/calibration.yaml

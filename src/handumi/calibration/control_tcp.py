@@ -26,7 +26,7 @@ from handumi.robots.utils import IDENTITY_POSE7, pose_mul, quat_normalize
 
 DEFAULT_PARQUET = Path("pico_recording/data/chunk-000/file-000.parquet")
 DEFAULT_DEVICE = "pico"
-SUPPORTED_DEVICES = ("pico", "meta")
+SUPPORTED_DEVICES = ("pico", "meta", "vive")
 DEFAULT_CALIBRATION_DIR = Path("configs/calibration/controller_tcp")
 DEFAULT_CALIBRATION = DEFAULT_CALIBRATION_DIR / f"{DEFAULT_DEVICE}.yaml"
 STATE_COLUMN = "observation.state"
@@ -133,7 +133,8 @@ def is_identity_bound_controller_tcp_metadata(metadata: dict[str, Any]) -> bool:
     return (
         schema_version >= CONTROLLER_TCP_METADATA_SCHEMA_VERSION
         and metadata.get("applied_to_state") is not True
-        and all(str(metadata.get(key, "")).strip() for key in required)
+        and all(str(metadata.get(key, "")).strip() for key in required if key != "source_robot")
+        and bool(metadata.get("source_robot") or metadata.get("source_tool"))
     )
 
 

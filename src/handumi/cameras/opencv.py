@@ -107,17 +107,25 @@ class OpenCVCameraDevice(CameraDevice):
         )
 
     def disconnect(self) -> None:
+        """关闭相机及采集线程；连接尚未完成时也允许安全清理。"""
         if self._camera is None:
             return
+        from lerobot.utils.errors import DeviceNotConnectedError
+
         self._monitor_stop.set()
         monitor = self._monitor_thread
         if monitor is not None:
             monitor.join(timeout=1.0)
         self._monitor_thread = None
-        self._camera.disconnect()
-        self._camera = None
-        with self._samples_lock:
-            self._samples.clear()
+        try:
+            self._camera.disconnect()
+        except DeviceNotConnectedError:
+            # 底层打开失败后已释放设备，无需再次断开。
+            pass
+        finally:
+            self._camera = None
+            with self._samples_lock:
+                self._samples.clear()
 
     def _monitor_frames(self) -> None:
         """Mirror LeRobot's native capture buffer without resampling it."""

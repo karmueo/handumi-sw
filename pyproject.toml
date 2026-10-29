@@ -40,6 +40,7 @@ Repository = "https://github.com/murobotics-ai/handumi-sw"
 Issues = "https://github.com/murobotics-ai/handumi-sw/issues"
 
 [project.optional-dependencies]
+vive = ["openvr>=2.5,<3"]
 piper = [
     "piper_sdk @ git+https://github.com/agilexrobotics/piper_sdk.git",
 ]
@@ -85,6 +86,7 @@ packages = ["src/handumi"]
 "assets/metal" = "handumi/assets/metal"
 "assets/openarm" = "handumi/assets/openarm"
 "assets/piper" = "handumi/assets/piper"
+"assets/rm75b" = "handumi/assets/rm75b"
 "assets/franka_emika_panda" = "handumi/assets/franka_emika_panda"
 "assets/r1lite" = "handumi/assets/r1lite"
 "assets/scenes" = "handumi/assets/scenes"
@@ -92,6 +94,7 @@ packages = ["src/handumi"]
 "assets/yam" = "handumi/assets/yam"
 "configs/quality.yaml" = "handumi/configs/quality.yaml"
 "configs/rig.example.yaml" = "handumi/configs/rig.example.yaml"
+"configs/rig.legacy.example.yaml" = "handumi/configs/rig.legacy.example.yaml"
 "configs/robots" = "handumi/configs/robots"
 "configs/inpainting-prompts" = "handumi/configs/inpainting-prompts"
 # Include calibration pieces explicitly: lab-local measurements under
@@ -104,6 +107,7 @@ packages = ["src/handumi"]
 "configs/calibration/table/local/example.yaml" = "handumi/configs/calibration/table/local/example.yaml"
 
 [tool.hatch.build.targets.sdist]
+exclude = ["configs/calibration/umi/local/**"]
 include = [
     "src/handumi",
     "assets",
