@@ -77,3 +77,4 @@ docs/build/
 interlatent/
 # 本机 UMI 安装与时间标定，不纳入版本管理。
 configs/calibration/umi/local/
+plan.md
