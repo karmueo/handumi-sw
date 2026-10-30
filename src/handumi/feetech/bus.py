@@ -1,4 +1,4 @@
-"""Low-level Feetech servo bus access for HandUMI gripper encoders."""
+"""提供夹爪 Feetech 编码器底层通信及可选通信诊断日志。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from types import MethodType
 from typing import Any
+
+from handumi.feetech.diagnostics import log_diagnostic
 
 
 class FeetechUnavailableError(RuntimeError):
@@ -123,8 +125,20 @@ class FeetechBus:
                 if hasattr(port, "is_using"):
                     port.is_using = False
                 last_error = _format_sdk_exception(exc)
+                log_diagnostic(
+                    "position_read", port=self.port, servo_id=servo_id,
+                    attempt=attempt + 1, raw_ticks=None, comm=None, error=None,
+                    success=False, exception=last_error,
+                )
             else:
-                if _comm_success(comm, self._sdk) and _no_error(error):
+                # 通信成功时也保留原始值，以识别被 SDK 接受的异常位置。
+                success = _comm_success(comm, self._sdk) and _no_error(error)
+                log_diagnostic(
+                    "position_read", port=self.port, servo_id=servo_id,
+                    attempt=attempt + 1, raw_ticks=value, comm=comm, error=error,
+                    success=success,
+                )
+                if success:
                     return int(value)
                 last_error = f"comm={comm}, error={error}"
             if attempt < retries:

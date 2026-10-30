@@ -1,4 +1,4 @@
-"""HandUMI gripper aperture sensing backed by Feetech servo encoders."""
+"""采集 Feetech 夹爪编码器并换算开度，支持后台采样和诊断日志。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from handumi.feetech.bus import FeetechBus
 from handumi.feetech.calibration import FeetechConfig, GripperCalibration
+from handumi.feetech.diagnostics import log_diagnostic
 
 log = logging.getLogger("handumi.record")
 
@@ -324,7 +325,7 @@ class FeetechGripperPair:
             widths[side] = _read_width(
                 self._buses[self._ports[side]], getattr(self.config, side),
                 getattr(self, f"_{side}_unwrap"), retries=retries,
-                retry_delay_s=retry_delay_s,
+                retry_delay_s=retry_delay_s, side=side,
             )
         left, right = widths["left"], widths["right"]
         return GripperWidths(
@@ -346,16 +347,25 @@ def _read_width(
     *,
     retries: int = 4,
     retry_delay_s: float = 0.05,
+    side: str | None = None,
 ) -> dict[str, float | int]:
-    ticks = unwrap(
-        bus.read_position(
-            calibration.servo_id,
-            retries=retries,
-            retry_delay_s=retry_delay_s,
-        )
+    """读取单侧位置并换算开度，诊断时记录展开及限幅前后的数值。"""
+    # 分别保留原始位置与展开位置，以辨认跨圈和瞬时跳变。
+    raw_ticks = bus.read_position(
+        calibration.servo_id, retries=retries, retry_delay_s=retry_delay_s,
     )
+    ticks = unwrap(raw_ticks)
     normalized = calibration.normalized_width(ticks)
     width_mm = calibration.width_mm(ticks)
+    log_diagnostic(
+        "width_conversion", side=side, port=getattr(bus, "port", calibration.port),
+        servo_id=calibration.servo_id, raw_ticks=raw_ticks, ticks=ticks,
+        closed_ticks=calibration.closed_ticks, open_ticks=calibration.open_ticks,
+        max_width_mm=calibration.max_width_mm,
+        unclamped_normalized=(ticks - calibration.closed_ticks)
+        / (calibration.open_ticks - calibration.closed_ticks),
+        normalized=normalized, width_mm=width_mm,
+    )
     return {
         "ticks": ticks,
         "normalized": normalized,

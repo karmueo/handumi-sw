@@ -5,6 +5,8 @@ from typing import Protocol
 
 import numpy as np
 
+from handumi.feetech.diagnostics import log_diagnostic
+
 
 @dataclass(frozen=True)
 class GripperObservation:
@@ -39,27 +41,97 @@ class GripperProvider(Protocol):
 
 
 class VisualGripperProvider:
-    """缓存同一帧的估计结果，防止重复图像推进平滑状态。"""
+    """缓存同一帧的估计结果，并在短暂漏检时保持最近成功开度。"""
 
-    def __init__(self, estimator):
-        """注入纯视觉估计器，输入图像采用 CameraSample 的 RGB 约定。"""
+    def __init__(self, estimator, *, hold_timeout_ns=500_000_000):
+        """注入纯视觉估计器，默认在 500 毫秒漏检期内沿用上一开度。"""
         self.estimator = estimator
+        self.hold_timeout_ns = hold_timeout_ns
         self._key = None
         self._result = None
+        # 最近一次成功估计的开度及其相机采集时间；保持期间不刷新。
+        self._last_openness = None
+        self._last_success_ns = None
+        # 上一输入帧的相机采集时间，用于识别时间倒退。
+        self._last_frame_ns = None
 
     def observe(self, sample, *, offset_ns=0):
-        """将共享 RGB 图像转换为 BGR 后估计；时间来自相机而非计算完成时刻。"""
+        """将共享 RGB 图像转换为 BGR 后估计；漏检时按相机时间保持旧值。"""
         key = (sample.sequence, sample.capture_time_ns, offset_ns)
-        if key != self._key:
-            estimate = self.estimator.estimate(sample.image[:, :, ::-1])
-            self._result = GripperObservation(
-                normalized=0 if estimate is None else estimate.openness,
-                valid=estimate is not None,
-                sample_time_ns=sample.capture_time_ns + offset_ns,
-                sequence=sample.sequence,
-                reason="未检测到有效双标签" if estimate is None else "",
-            )
-            self._key = key
+        if key == self._key:
+            return self._result
+        capture_time_ns = sample.capture_time_ns
+        # 时间倒退可能来自时钟重置，跨时间段复用旧开度会掩盖真实变化。
+        if self._last_frame_ns is not None and capture_time_ns < self._last_frame_ns:
+            self._last_openness = None
+            self._last_success_ns = None
+        estimate = self.estimator.estimate(sample.image[:, :, ::-1])
+        detected = estimate is not None
+        sample_time_ns = capture_time_ns + offset_ns
+        age_ns = None
+        if detected:
+            self._last_openness = estimate.openness
+            self._last_success_ns = capture_time_ns
+            normalized = estimate.openness
+            valid = True
+            outcome = "measured"
+            reason = ""
+            age_ns = 0
+        elif (
+            self.hold_timeout_ns > 0
+            and self._last_success_ns is not None
+            and capture_time_ns - self._last_success_ns <= self.hold_timeout_ns
+        ):
+            # 保持值沿用上一次成功估计，但帧身份和校正时间属于当前帧。
+            age_ns = capture_time_ns - self._last_success_ns
+            normalized = self._last_openness
+            valid = True
+            outcome = "held"
+            reason = "短暂漏检，保持最近成功开度"
+        else:
+            normalized = 0
+            valid = False
+            outcome = "invalid"
+            if self._last_success_ns is None:
+                reason = "未检测到有效双标签"
+            else:
+                age_ns = capture_time_ns - self._last_success_ns
+                reason = "未检测到有效双标签且超过保持期限"
+        self._result = GripperObservation(
+            normalized=normalized,
+            valid=valid,
+            sample_time_ns=sample_time_ns,
+            sequence=sample.sequence,
+            reason=reason,
+        )
+        # 记录真实视觉来源及结果类别；无效帧的 0 是占位值，不能解释为闭合。
+        # 漏检时位姿和距离保持为空，避免把保持值伪装成新测量。
+        log_diagnostic(
+            "visual_gripper", source="aruco", outcome=outcome,
+            sequence=sample.sequence, capture_time_ns=capture_time_ns,
+            sample_time_ns=sample_time_ns,
+            valid=valid, reason=reason, normalized=normalized,
+            detected=detected,
+            last_success_time_ns=self._last_success_ns,
+            last_success_age_ns=age_ns,
+            hold_timeout_ns=self.hold_timeout_ns,
+            detected_marker_count=getattr(
+                self.estimator, "last_detected_marker_count", None
+            ),
+            distance_mm=getattr(estimate, "distance_mm", None),
+            raw_openness=getattr(estimate, "raw_openness", None),
+            left_position_mm=getattr(
+                getattr(estimate, "left_pose", None), "translation_mm", None
+            ),
+            right_position_mm=getattr(
+                getattr(estimate, "right_pose", None), "translation_mm", None
+            ),
+            roi=getattr(estimate, "roi", None),
+            closed_distance_mm=getattr(self.estimator, "closed_distance_mm", None),
+            open_distance_mm=getattr(self.estimator, "open_distance_mm", None),
+        )
+        self._key = key
+        self._last_frame_ns = capture_time_ns
         return self._result
 
 
