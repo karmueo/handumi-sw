@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
+from handumi.robots.utils import pose_mul
 from handumi.tracking.base import ControllerPairSample, apply_tcp_calibration_pose7
 
 
@@ -32,6 +33,28 @@ class ViveTrackingProvider:
         self._stop = threading.Event()
         self._thread = None
         self.error = None
+        self._workspace = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
+
+    def set_workspace_from_device_pose(self, pose):
+        """启动前固定桌面变换；采集期间拒绝更换，防止同段坐标系变化。"""
+        if self._thread is not None:
+            raise RuntimeError("采集期间不能更换桌面标定")
+        pose = np.asarray(pose, dtype=np.float32)
+        if (
+            pose.shape != (7,) or not np.isfinite(pose).all()
+            or not np.isclose(np.linalg.norm(pose[3:]), 1, atol=1e-5)
+        ):
+            raise ValueError("桌面变换必须是有限且单位四元数的 pose7")
+        self._workspace = pose.copy()
+
+    def _in_workspace(self, sample):
+        """从原始设备样本派生桌面锚点和 TCP，无效样本也保留桌面变换。"""
+        sample = replace(sample, workspace_from_device_pose=self._workspace.copy())
+        if not sample.right_tracked:
+            return sample
+        anchor = pose_mul(self._workspace, sample.right_device_controller_pose).astype(np.float32)
+        _, tcp = apply_tcp_calibration_pose7(sample.left_controller_pose, anchor, self.calibration)
+        return replace(sample, right_controller_pose=anchor, right_tcp_pose=tcp)
 
     def start(self):
         """启动后台 OpenVR 会话；初始化失败直接报告。"""
@@ -128,8 +151,8 @@ class ViveTrackingProvider:
                 else ControllerPairSample.empty("vive")
             )
         if self.error or time.monotonic_ns() - sample.pc_monotonic_ns > 100_000_000:
-            return replace(sample, right_tracked=False, right_pose_valid=False)
-        return sample
+            sample = replace(sample, right_tracked=False, right_pose_valid=False)
+        return self._in_workspace(sample)
 
     def sample_at(self, target_time_ns):
         """仅在两端有效且间隔不超过 50 ms 时插值，禁止外推。"""
@@ -145,7 +168,7 @@ class ViveTrackingProvider:
                 ):
                     break
                 fraction = (target_time_ns - a.pc_monotonic_ns) / gap
-                pa, pb = a.right_controller_pose, b.right_controller_pose
+                pa, pb = a.right_device_controller_pose, b.right_device_controller_pose
                 rotation = Slerp([0, 1], Rotation.from_quat([pa[3:], pb[3:]]))(
                     [fraction]
                 ).as_quat()[0]
@@ -155,7 +178,7 @@ class ViveTrackingProvider:
                 left, right = apply_tcp_calibration_pose7(
                     a.left_controller_pose, anchor, self.calibration
                 )
-                return replace(
+                return self._in_workspace(replace(
                     a,
                     right_controller_pose=anchor,
                     right_device_controller_pose=anchor.copy(),
@@ -163,8 +186,8 @@ class ViveTrackingProvider:
                     right_tcp_pose=right,
                     aligned_time_ns=target_time_ns,
                     pc_monotonic_ns=target_time_ns,
-                )
-        return ControllerPairSample.empty("vive")
+                ))
+        return self._in_workspace(ControllerPairSample.empty("vive"))
 
     def stop(self):
         """停止采集并释放 OpenVR 会话。"""

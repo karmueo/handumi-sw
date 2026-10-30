@@ -161,7 +161,8 @@ def test_vive_record_entrypoint(tmp_path, monkeypatch, dry_run, overwrite, resum
     calibration = tmp_path / "calibration.yaml"
     calibration.write_text("{}")
     monkeypatch.setattr(umi_capture, "verify", lambda *a, **k: {})
-    monkeypatch.setattr(umi_capture, "metadata", lambda _: {})
+    monkeypatch.setattr(umi_capture, "metadata", lambda *a: {})
+    monkeypatch.setattr(umi_capture, "load_session", lambda *a, **k: {})
     monkeypatch.setattr(umi_capture, "validate_resume_target", lambda *a: None)
 
     class HardwareReached(Exception):

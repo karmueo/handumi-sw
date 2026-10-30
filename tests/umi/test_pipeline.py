@@ -7,12 +7,14 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from handumi.calibration.umi import digest
+from handumi.calibration.control_tcp import ControllerTcpCalibration
+from handumi.calibration.umi import digest, pose7
 from handumi.cameras.base import CameraSample
 from handumi.dataset.reader import load_raw_episode
 from handumi.grippers.base import GripperObservation
 from handumi.scripts.umi_capture import assemble_frame, features, metadata
 from handumi.tracking.base import ControllerPairSample
+from handumi.tracking.vive import ViveTrackingProvider
 
 
 def snapshot():
@@ -50,11 +52,15 @@ def snapshot():
 
 
 @pytest.fixture
-def capture(tmp_path):
+def capture(tmp_path, table_setup):
     """写入可被项目真实 reader 打开的 32 帧原始数据集。"""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    profile = snapshot()
+    profile, _, session, _ = table_setup
+    provider = ViveTrackingProvider("synthetic", ControllerTcpCalibration(
+        np.array([0, 0, 0, 0, 0, 0, 1]), pose7(profile["tracker_tcp"]),
+    ))
+    provider.set_workspace_from_device_pose(pose7(session["table_from_device"]))
     root = tmp_path / "capture"
     dataset = LeRobotDataset.create(
         repo_id="local/umi-test",
@@ -66,7 +72,7 @@ def capture(tmp_path):
         vcodec="h264",
         image_writer_threads=2,
     )
-    dataset.meta.info["handumi"] = metadata(profile)
+    dataset.meta.info["handumi"] = metadata(profile, session)
     for i in range(32):
         stamp = 1_000_000_000 + round(i * 1e9 / 30)
         anchor = np.r_[
@@ -86,6 +92,7 @@ def capture(tmp_path):
             aligned_time_ns=stamp,
             sequence=i + 1,
         )
+        tracking = provider._in_workspace(tracking)
         image = CameraSample(np.full((48, 64, 3), i, dtype=np.uint8), stamp, i + 1)
         gripper = GripperObservation(i / 31, True, stamp, i + 1)
         dataset.add_frame(
@@ -178,6 +185,7 @@ def test_convert_command_uses_source_tool_calibration(capture, tmp_path):
         [
             "convert", str(capture), "--robot", "rm75b", "--output", str(output),
             "--allow-flagged-episodes", "--no-solve-cache", "--jobs", "1",
+            "--retarget-mode", "local-relative",
         ]
     )
 
@@ -227,3 +235,26 @@ def test_convert_resolves_bound_tool_and_robot_calibrations(identity_key, identi
     assert source_calibration["applied_to_state"] is False
     assert args.controller_device == "vive"
     np.testing.assert_allclose(selection.calibration.right[:3], [0.125, 0, 0])
+
+
+def test_table_record_preserves_raw_transform_and_auto_mode(capture):
+    """真实存储保留设备原始位姿及桌面变换，自动回放识别桌面语义。"""
+    import pandas as pd
+
+    from handumi.robots.utils import pose7_to_mat
+    from handumi.scripts.replay import replay_in_sim as replay
+
+    info = json.loads((capture / "meta/info.json").read_text())
+    assert info["handumi"]["tracking_workspace"] == "table"
+    assert info["handumi"]["controller_tcp_calibration"]["applied_to_state"] is False
+    rows = pd.read_parquet(capture / "data/chunk-000/file-000.parquet")
+    first = rows.iloc[0]
+    raw = first["observation.tracking.right_device_controller_pose"]
+    workspace = first["observation.tracking.workspace_from_device_pose"]
+    state = first["observation.state"]
+    np.testing.assert_allclose(raw, [0, 0, 0, 0, 0, 0, 1])
+    np.testing.assert_allclose(pose7_to_mat(state[7:14]), pose7_to_mat(workspace) @ pose7_to_mat(raw), atol=1e-6)
+    args = replay.build_parser().parse_args([str(capture), "--robot", "rm75b"])
+    assert replay._resolved_retarget_mode(args, info) == "absolute-table"
+    args.retarget_mode = "local-relative"
+    assert replay._resolved_retarget_mode(args, info) == "local-relative"

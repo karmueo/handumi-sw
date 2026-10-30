@@ -16,3 +16,5 @@ cameras:
     fourcc: MJPG
 umi:
   calibration: configs/calibration/umi/local/calibration.yaml
+  # 独立桌面会话；正式录制前必须完成求解和独立验证。
+  session_calibration: configs/calibration/umi/local/session.yaml

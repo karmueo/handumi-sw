@@ -10,6 +10,7 @@ import termios
 import time
 import tty
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ from handumi.calibration.control_tcp import (
     calibration_to_dict,
 )
 from handumi.calibration.umi import estimator, pose7, verify
+from handumi.calibration.umi_table import session_core
 from handumi.cameras.opencv import OpenCVCameraDevice
 from handumi.dataset.raw import (
     HANDUMI_STATE_SEMANTICS,
@@ -36,9 +38,14 @@ from handumi.scripts._record_output import (
     _overwrite_arg,
     _prepare_output_directory,
 )
+from handumi.scripts._umi_session import (
+    DEFAULT_CALIBRATION as DEFAULT_CALIBRATION,
+)
+from handumi.scripts._umi_session import (
+    calibration_paths,
+    load_session,
+)
 from handumi.tracking.vive import ViveTrackingProvider
-
-DEFAULT_CALIBRATION = Path("configs/calibration/umi/local/calibration.yaml")
 
 
 @contextmanager
@@ -61,7 +68,10 @@ def keyboard():
 class NativeUmi:
     """独占管理一台相机和 Tracker，向所有消费者提供同一组选定样本。"""
 
-    def __init__(self, snapshot, *, tracker=None, camera=None):
+    def __init__(
+        self, snapshot, *, tracker=None, camera=None, session=None,
+        gripper_hold_ns=500_000_000,
+    ):
         """注入设备便于测试；默认按已验证快照创建原生设备。"""
         verify(snapshot, require_time=False)
         self.snapshot = snapshot
@@ -69,6 +79,8 @@ class NativeUmi:
         identity = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
         calibration = ControllerTcpCalibration(identity, pose7(snapshot["tracker_tcp"]))
         self.tracker = tracker or ViveTrackingProvider(snapshot["serial"], calibration)
+        if session is not None:
+            self.tracker.set_workspace_from_device_pose(pose7(session["table_from_device"]))
         width, height = snapshot["resolution"]
         self.camera = camera or OpenCVCameraDevice(
             snapshot["camera_device"],
@@ -77,7 +89,9 @@ class NativeUmi:
             height,
             snapshot["fourcc"],
         )
-        self.gripper = VisualGripperProvider(estimator(snapshot))
+        self.gripper = VisualGripperProvider(
+            estimator(snapshot), hold_timeout_ns=gripper_hold_ns
+        )
 
     def __enter__(self):
         """打开设备；任一步失败均释放已经取得的资源。"""
@@ -120,18 +134,19 @@ class NativeUmi:
         return image, tracking, gripper, target, healthy
 
 
-def metadata(snapshot):
+def metadata(snapshot, session=None):
     """生成独立 UMI 身份和原始数据契约，不依赖目标机器人夹爪。"""
     identity = np.array([0, 0, 0, 0, 0, 0, 1])
     tcp = calibration_to_dict(left=identity, right=pose7(snapshot["tracker_tcp"]))[
         "calibration"
     ]
-    return {
+    result = {
         "recording_device": "vive",
         "active_sides": ["right"],
         "tracking_schema": HANDUMI_TRACKING_SCHEMA,
         "capture_schema": "synchronized_sources_v2",
         "state_semantics": HANDUMI_STATE_SEMANTICS,
+        "tracking_workspace": "table" if session is not None else "openvr_raw",
         "controller_tcp_calibration": {
             "schema_version": 2,
             "applied_to_state": False,
@@ -161,6 +176,9 @@ def metadata(snapshot):
             "cameras": {"right_wrist": {"enabled": True}},
         },
     }
+    if session is not None:
+        result["umi_table_session"] = deepcopy(session)
+    return result
 
 
 def features(snapshot):
@@ -232,7 +250,7 @@ def transition(recording, key, healthy):
 
 
 
-def validate_resume_target(root: Path, expected_metadata: dict) -> None:
+def validate_resume_target(root: Path, expected_metadata: dict) -> dict:
     """启动设备前检查本地续录元数据；无已保存段或元数据缺失时拒绝续录。"""
     try:
         info = json.loads((root / "meta/info.json").read_text())
@@ -247,11 +265,19 @@ def validate_resume_target(root: Path, expected_metadata: dict) -> None:
         raise ValueError("无法续录：本地缺少 meta/tasks.parquet，请检查或恢复原数据集。")
     if not any((root / "meta/episodes").rglob("*.parquet")):
         raise ValueError("无法续录：本地缺少 meta/episodes 段元数据，请检查或恢复原数据集。")
-    if info.get("handumi") != expected_metadata:
-        raise ValueError("续录的设备、数据契约或标定不一致")
+    def stable(value):
+        """排除桌面复验报告变化，仍严格比较会话身份和其他数据契约。"""
+        result = deepcopy(value)
+        if isinstance(result, dict) and "umi_table_session" in result:
+            result["umi_table_session"] = session_core(result["umi_table_session"])
+        return result
+
+    if stable(info.get("handumi")) != stable(expected_metadata):
+        raise ValueError("续录的设备、数据契约或标定不一致；重新求解桌面后请创建新数据集")
+    return info["handumi"]
 
 
-def log_live_preview(viewer, image, tracking, gripper, healthy, camera_age_s):
+def log_live_preview(viewer, image, tracking, gripper, healthy, camera_age_s, axis_length=0.08):
     """相机始终显示最新帧，其余曲线和 TCP 保留原有时间轴语义。"""
     viewer.set_time("capture", duration=image.capture_time_ns / 1e9)
     viewer.log(
@@ -263,7 +289,42 @@ def log_live_preview(viewer, image, tracking, gripper, healthy, camera_age_s):
     viewer.log("health/valid", viewer.Scalars(int(healthy)))
     viewer.log("health/camera_sequence", viewer.Scalars(image.sequence))
     viewer.log("health/camera_age_s", viewer.Scalars(camera_age_s))
-    viewer.log("tracking/tcp", viewer.Points3D([tracking.right_tcp_pose[:3]]))
+    if tracking.right_tracked and tracking.right_pose_valid:
+        viewer.log("tracking/tcp", viewer.Transform3D(
+            translation=tracking.right_tcp_pose[:3],
+            rotation=viewer.Quaternion(xyzw=tracking.right_tcp_pose[3:]),
+            axis_length=axis_length,
+        ))
+    else:
+        viewer.log("tracking/tcp", viewer.Clear(recursive=True))
+
+
+def init_tracking_preview(viewer, session):
+    """显示固定参考系三轴；未标定诊断明确使用 OpenVR 原始参考系。"""
+    viewer.log("tracking", (
+        viewer.ViewCoordinates.RIGHT_HAND_Z_UP if session is not None
+        else viewer.ViewCoordinates.RIGHT_HAND_Y_UP
+    ), static=True)
+    viewer.log("tracking/reference", viewer.Transform3D(axis_length=0.12), static=True)
+    reference = (
+        "Desktop frame: X right, Y away from operator, Z up"
+        if session
+        else "Raw OpenVR frame (desktop not calibrated)"
+    )
+    viewer.log("reference_frame", viewer.TextDocument(reference), static=True)
+
+
+def _parse_gripper_hold_ms(value):
+    """校验漏检保持期限为整数毫秒；0 表示关闭保持。"""
+    try:
+        milliseconds = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "--gripper-hold-ms 必须是非负整数毫秒"
+        ) from error
+    if milliseconds < 0:
+        raise argparse.ArgumentTypeError("--gripper-hold-ms 必须是非负整数毫秒")
+    return milliseconds
 
 
 def main(argv=None, *, mode="record"):
@@ -271,10 +332,16 @@ def main(argv=None, *, mode="record"):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=["vive"], default="vive")
     parser.add_argument("--calibration", type=Path)
+    parser.add_argument("--session-calibration", type=Path)
+    parser.add_argument("--tcp-axis-length-m", type=float, default=0.08)
     parser.add_argument("--rig-config", type=Path, default=Path("configs/rig.yaml"))
     parser.add_argument("--robot", choices=["rm75b"], default="rm75b")
     parser.add_argument("--side", choices=["right"], default="right")
     parser.add_argument("--fps", type=int, choices=[30], default=30)
+    parser.add_argument(
+        "--gripper-hold-ms", type=_parse_gripper_hold_ms, default=500, metavar="MS",
+        help="ArUco 短暂漏检保持期限（整数毫秒，默认 500；0 关闭保持）",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--repo-id", default="local/umi")
     parser.add_argument("--task", default="UMI demonstration")
@@ -288,23 +355,27 @@ def main(argv=None, *, mode="record"):
         )
         parser.add_argument("--dry-run", action="store_true", help="仅展示录制计划，不修改目录或连接硬件。")
     args = parser.parse_args(argv)
-    if args.calibration is None:
-        rig = (
-            yaml.safe_load(args.rig_config.read_text())
-            if args.rig_config.exists()
-            else {}
-        )
-        args.calibration = Path(
-            (rig or {}).get("umi", {}).get("calibration", DEFAULT_CALIBRATION)
-        )
+    if not np.isfinite(args.tcp_axis_length_m) or args.tcp_axis_length_m <= 0:
+        parser.error("--tcp-axis-length-m 必须为正的有限数值")
+    explicit_session = args.session_calibration is not None
+    args.calibration, args.session_calibration = calibration_paths(args)
     snapshot = verify(
         yaml.safe_load(args.calibration.read_text()), require_time=mode != "visualize"
     )
     if mode == "record" and args.output_dir is None:
         parser.error("录制需要 --output-dir")
+    try:
+        session = load_session(
+            args.session_calibration, snapshot, required=mode == "record",
+            explicit=explicit_session,
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        parser.error(str(exc))
+    recording_metadata = metadata(snapshot, session)
+    print("参考坐标系：桌面" if session else "参考坐标系：OpenVR 原始坐标系（尚未标定桌面）")
     if mode == "record" and args.resume:
         try:
-            validate_resume_target(args.output_dir, metadata(snapshot))
+            recording_metadata = validate_resume_target(args.output_dir, recording_metadata)
         except ValueError as exc:
             parser.error(str(exc))
     if mode == "record":
@@ -328,9 +399,13 @@ def main(argv=None, *, mode="record"):
 
         rr.init("handumi_umi", spawn=True)
         viewer = rr
+        init_tracking_preview(viewer, session)
     try:
         with (
-            NativeUmi(snapshot) as devices,
+            NativeUmi(
+                snapshot, session=session,
+                gripper_hold_ns=args.gripper_hold_ms * 1_000_000,
+            ) as devices,
             nullcontext(lambda: "") if mode == "doctor" else keyboard() as read_key,
         ):
             if mode == "record":
@@ -351,7 +426,7 @@ def main(argv=None, *, mode="record"):
                         image_writer_threads=4,
                         vcodec="h264",
                     )
-                dataset.meta.info["handumi"] = metadata(snapshot)
+                dataset.meta.info["handumi"] = recording_metadata
             print("空格开始/保存；Esc 取消/退出；Ctrl+C 退出。无效帧立即丢弃当前段。")
             deadline = time.monotonic()
             readiness_deadline = deadline + 10
@@ -403,7 +478,8 @@ def main(argv=None, *, mode="record"):
                 previous_sequence = image.sequence
                 if viewer is not None and time.monotonic() >= next_preview:
                     log_live_preview(
-                        viewer, image, tracking, gripper, healthy, camera_age_s
+                        viewer, image, tracking, gripper, healthy, camera_age_s,
+                        args.tcp_axis_length_m,
                     )
                     next_preview = time.monotonic() + 1 / 15
                 if mode == "doctor":
@@ -425,7 +501,7 @@ def main(argv=None, *, mode="record"):
             dataset.finalize()
             path = args.output_dir / "meta/info.json"
             info = json.loads(path.read_text())
-            info["handumi"] = metadata(snapshot)
+            info["handumi"] = recording_metadata
             path.write_text(json.dumps(info, indent=2) + "\n")
         if viewer is not None:
             viewer.disconnect()

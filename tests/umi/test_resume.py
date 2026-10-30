@@ -14,7 +14,8 @@ def test_empty_resume_stops_before_devices(tmp_path, monkeypatch):
     calibration = tmp_path / "calibration.yaml"
     calibration.write_text("{}")
     monkeypatch.setattr(umi_capture, "verify", lambda *a, **k: {})
-    monkeypatch.setattr(umi_capture, "metadata", lambda _: {})
+    monkeypatch.setattr(umi_capture, "metadata", lambda *a: {})
+    monkeypatch.setattr(umi_capture, "load_session", lambda *a, **k: {})
 
     def unexpected_device(*args, **kwargs):
         """打开设备意味着启动前校验失效。"""

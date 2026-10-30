@@ -74,18 +74,43 @@ def detect_board(rgb, matrix, distortion):
     return observation
 
 
-def detect_board_details(rgb, matrix, distortion):
-    """返回标定观测和有效标签的图像角点，观测不足时仍保留已检测标签。"""
+def board_detector():
+    """创建 AprilGrid 检测器；参数针对倾斜板面上被透视压缩的小标签。
+
+    3–23 像素、步长 4 的自适应阈值窗口和更宽松的多边形近似，可避免标签黑边与
+    AprilGrid 角块在窄间隙处连成一片而丢失候选框；更大的窗口不增加检出，
+    只增加耗时。周长下限约为图像长边的 5%（1080p 下标签边长约 24 px），
+    远小于实际最小标签，用于提前丢弃背景小轮廓。缩小比特采样边距以
+    容忍透视压缩后的格子偏移。误检仍由 ID 范围、重复 ID、边界修正和 PnP 拒绝。
+    """
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
     dictionary.maxCorrectionBits = 3
     parameters = cv2.aruco.DetectorParameters()
     parameters.errorCorrectionRate = 1.0
+    parameters.adaptiveThreshWinSizeMin = 3
+    parameters.adaptiveThreshWinSizeMax = 23
+    parameters.adaptiveThreshWinSizeStep = 4
+    parameters.minMarkerPerimeterRate = 0.05
+    parameters.polygonalApproxAccuracyRate = 0.05
     parameters.perspectiveRemovePixelPerCell = 16
-    parameters.perspectiveRemoveIgnoredMarginPerCell = 0.25
+    parameters.perspectiveRemoveIgnoredMarginPerCell = 0.13
     parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_CONTOUR
-    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+    return cv2.aruco.ArucoDetector(dictionary, parameters)
+
+
+def detect_board_details(rgb, matrix, distortion, *, stats=None):
+    """返回标定观测和有效标签的图像角点，观测不足时仍保留已检测标签。
+
+    传入 ``stats`` 字典时写入检测器原始标签数和被拒候选数，便于区分
+    候选框丢失与边界修正拒绝。
+    """
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    corners, ids, _ = detector.detectMarkers(gray)
+    corners, ids, rejected = board_detector().detectMarkers(gray)
+    if stats is not None:
+        stats["aruco_tag_count"] = 0 if ids is None else int(
+            np.count_nonzero((ids >= 0) & (ids < 36))
+        )
+        stats["rejected_candidate_count"] = len(rejected)
     if ids is None:
         return None, []
     points, pixels, markers = [], [], []
