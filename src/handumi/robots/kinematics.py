@@ -176,10 +176,15 @@ def _solve(
         costs.append(
             _limit_margin_cost(JointVar(0), margin_lower, margin_upper, margin_weights)
         )
+    # q_prev 必须作为优化初值传入。rest cost 只是软约束，不能代替初值；
+    # 否则优化器会从 pyroki 的默认中间位形启动，在奇异 home 附近跳到另一
+    # IK 分支，即使目标只移动了毫米级。
+    initial_vals = jaxls.VarValues.make([JointVar(0).with_value(q_prev)])
     sol = (
         jaxls.LeastSquaresProblem(costs=costs, variables=[JointVar(0)])
         .analyze()
         .solve(
+            initial_vals=initial_vals,
             verbose=False,
             linear_solver="dense_cholesky",
             trust_region=jaxls.TrustRegionConfig(lambda_initial=10.0),
@@ -250,10 +255,13 @@ def _solve_self_collision(
             weight=self_collision_weight,
         )
     )
+    # 与 _solve 相同：从上一关节角启动，保持分支连续。
+    initial_vals = jaxls.VarValues.make([JointVar(0).with_value(q_prev)])
     sol = (
         jaxls.LeastSquaresProblem(costs=costs, variables=[JointVar(0)])
         .analyze()
         .solve(
+            initial_vals=initial_vals,
             verbose=False,
             linear_solver="dense_cholesky",
             trust_region=jaxls.TrustRegionConfig(lambda_initial=10.0),
