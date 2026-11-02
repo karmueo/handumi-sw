@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from handumi.dataset.direction import (
@@ -52,7 +53,7 @@ def _create_dataset(
         features=features,
         root=root,
         use_videos=True,
-        vcodec="h264",
+        rgb_encoder=RGBEncoderConfig(vcodec="h264"),
     )
     rng = np.random.default_rng(0)
     for episode_index in range(count):

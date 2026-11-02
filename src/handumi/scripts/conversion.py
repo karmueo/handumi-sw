@@ -1335,6 +1335,8 @@ def _write_converted_dataset_readme(
     """Write a Hub card that identifies the joint-level derivation."""
     from lerobot.datasets.utils import create_lerobot_dataset_card
 
+    from handumi.dataset.lerobot_compat import DatasetCardInfo
+
     info = json.loads((output_root / "meta" / "info.json").read_text())
     handumi_info = info.get("handumi", {})
     layout = str(handumi_info.get("state_layout", "full_sim_qpos"))
@@ -1357,7 +1359,7 @@ def _write_converted_dataset_readme(
         representation = "The state uses the selected embodiment joint layout."
     card = create_lerobot_dataset_card(
         tags=["HandUMI", embodiment, "joint-level"],
-        dataset_info=info,
+        dataset_info=DatasetCardInfo(info),
         license="other",
         repo_id=repo_id,
         dataset_description=(

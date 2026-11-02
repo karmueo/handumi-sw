@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
+from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from handumi.dataset.merging import (
@@ -341,7 +342,7 @@ def _create_video_dataset(
         features=features,
         root=root,
         use_videos=True,
-        vcodec="h264",
+        rgb_encoder=RGBEncoderConfig(vcodec="h264"),
     )
     for episode_index, length in enumerate(lengths):
         for frame_index in range(length):

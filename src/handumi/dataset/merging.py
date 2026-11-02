@@ -219,6 +219,8 @@ def _build_merged_dataset(
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.datasets.utils import create_lerobot_dataset_card
 
+    from handumi.dataset.lerobot_compat import DatasetCardInfo
+
     datasets = [
         LeRobotDataset(repo_id=source.repo_id, root=source.root, download_videos=True)
         for source in plan.sources
@@ -307,7 +309,7 @@ def _build_merged_dataset(
     sources_text = ", ".join(source.repo_id for source in plan.sources)
     card = create_lerobot_dataset_card(
         tags=["HandUMI", "merged"],
-        dataset_info=output_info,
+        dataset_info=DatasetCardInfo(output_info),
         license=dataset_license(plan.sources[0].root),
         repo_id=plan.output_repo_id,
         dataset_description=(

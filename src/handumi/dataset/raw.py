@@ -90,7 +90,8 @@ def raw_tracking_features() -> dict[str, Any]:
     Workspace controller poses already live in ``observation.state``. The
     original device poses and the transform used to create that state remain
     available for later recalibration. Processed controller->TCP poses are
-    intentionally not part of the raw dataset schema.
+    not included in this common feature set. Vive recordings may add a
+    separate derived TCP pose feature while retaining the raw state semantics.
     """
     features: dict[str, Any] = {}
     for side in ("left", "right"):

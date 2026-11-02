@@ -2017,6 +2017,7 @@ def _run_record() -> None:
         )
         space_listener.start()
 
+        from lerobot.configs.video import RGBEncoderConfig
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         layout = canonical_joint_layout(runtime)
@@ -2061,7 +2062,7 @@ def _run_record() -> None:
             "root": args.output_dir,
             "image_writer_processes": 0,
             "image_writer_threads": 0 if use_videos else max(1, 4 * len(camera_names)),
-            "vcodec": dataset_vcodec,
+            "rgb_encoder": RGBEncoderConfig(vcodec=dataset_vcodec) if use_videos else None,
             "streaming_encoding": use_videos,
             "encoder_queue_maxsize": max(1, args.fps),
             "encoder_threads": (
@@ -2078,6 +2079,9 @@ def _run_record() -> None:
                 features=features,
                 use_videos=use_videos,
             )
+        from handumi.dataset.lerobot_compat import preserve_dataset_info
+
+        preserve_dataset_info(dataset)
         if use_videos:
             _install_strict_streaming_encoder(dataset)
         dataset_writer = AsyncLeRobotWriter(
@@ -2466,7 +2470,7 @@ def _run_record() -> None:
                 ],
             },
         )
-        dataset.meta.info = updated_info
+        preserve_dataset_info(dataset, updated_info)
         _write_dataset_readme(
             Path(dataset.root),
             repo_id=args.repo_id,

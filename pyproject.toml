@@ -7,9 +7,9 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "lerobot[feetech]==0.5.1",
+    "lerobot[dataset,feetech]==0.6.1",
     "huggingface-hub>=1.0.0,<2.0.0",
-    "rerun-sdk>=0.24.0,<0.27.0",
+    "rerun-sdk==0.39.0",
     # Build tools for xrobotoolkit-sdk (CMake-based). Listed here so uv sync
     # tracks them in the lockfile and they are available when building the SDK.
     "cmake>=3.29",

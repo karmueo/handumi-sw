@@ -139,7 +139,7 @@ class RerunCameraViewer:
                 if item is _STOP:
                     break
                 capture_time_ns, images = item
-                rr.set_time_nanos("capture_time", int(capture_time_ns))
+                rr.set_time("capture_time", timestamp=np.datetime64(int(capture_time_ns), "ns"))
                 for key, image in images.items():
                     rr.log(
                         key,

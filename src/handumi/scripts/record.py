@@ -28,16 +28,14 @@ import os
 import select
 import signal
 import sys
-import tempfile
 import termios
 import threading
 import time
 import tty
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
-from fractions import Fraction
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 import numpy as np
 
@@ -94,6 +92,38 @@ from handumi.feetech import (
 )
 from handumi.feetech.bus import FeetechUnavailableError
 from handumi.robots.utils import IDENTITY_POSE7
+from handumi.scripts._record_encoding import (
+    _HARDWARE_VIDEO_CODECS as _HARDWARE_VIDEO_CODECS,
+)
+from handumi.scripts._record_encoding import (
+    _SOFTWARE_VIDEO_CODEC,
+    StreamingEncodingError,
+    _install_strict_streaming_encoder,
+    _prepare_streaming_episode,
+    _select_video_encoder,
+    _VideoEncoderSelection,
+)
+from handumi.scripts._record_encoding import (
+    _VALID_VIDEO_CODECS as _VALID_VIDEO_CODECS,
+)
+from handumi.scripts._record_encoding import (
+    _available_hardware_vcodecs as _available_hardware_vcodecs,
+)
+from handumi.scripts._record_encoding import (
+    _probe_codec_options as _probe_codec_options,
+)
+from handumi.scripts._record_encoding import (
+    _probe_video_encoder as _probe_video_encoder,
+)
+from handumi.scripts._record_encoding import (
+    _recommended_encoder_threads as _recommended_encoder_threads,
+)
+from handumi.scripts._record_encoding import (
+    _StreamingEncoderProtocol as _StreamingEncoderProtocol,
+)
+from handumi.scripts._record_encoding import (
+    _StrictStreamingEncoder as _StrictStreamingEncoder,
+)
 from handumi.scripts._record_output import (
     _check_output_directory,
     _overwrite_arg,
@@ -148,21 +178,6 @@ except ImportError:  # Keep recording usable in minimal source checkouts.
 ROBOT_CONFIG_DIR = Path("configs/robots")
 _RERUN_TRAIL_SECONDS = 10.0
 _RERUN_CHART_WINDOW_S = 20.0
-_SOFTWARE_VIDEO_CODEC = "h264"
-_HARDWARE_VIDEO_CODECS = (
-    "h264_videotoolbox",
-    "hevc_videotoolbox",
-    "h264_nvenc",
-    "hevc_nvenc",
-    "h264_vaapi",
-    "h264_qsv",
-)
-_VALID_VIDEO_CODECS = {
-    _SOFTWARE_VIDEO_CODEC,
-    "hevc",
-    "libsvtav1",
-    *_HARDWARE_VIDEO_CODECS,
-}
 _RECORDING_DEFAULTS: dict[str, object] = {
     "device": "meta",
     "cameras": ["left_wrist", "right_wrist"],
@@ -374,319 +389,8 @@ class _RecordingDashboard:
         )
 
 
-class StreamingEncodingError(RuntimeError):
-    """The streaming encoder cannot produce a frame-aligned episode."""
-
-
 class CameraCaptureError(RuntimeError):
-    """A required recording camera stopped delivering usable frames."""
-
-
-@dataclass(frozen=True)
-class _VideoEncoderSelection:
-    vcodec: str
-    hardware: bool
-    threads: int | None
-
-
-class _StreamingEncoderProtocol(Protocol):
-    def start_episode(self, video_keys: list[str], temp_dir: Path) -> None: ...
-
-    def feed_frame(self, video_key: str, image: np.ndarray) -> None: ...
-
-    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]: ...
-
-    def cancel_episode(self) -> None: ...
-
-    def close(self) -> None: ...
-
-
-class _StrictStreamingEncoder:
-    """Make LeRobot streaming failures transactional at the episode boundary.
-
-    LeRobot normally finishes streaming after it starts writing episode data.
-    HandUMI prepares the videos first and stages the results so a failed encoder
-    can discard the episode without appending partial rows to Parquet.
-    """
-
-    def __init__(self, encoder: _StreamingEncoderProtocol) -> None:
-        self._encoder = encoder
-        self._video_keys: tuple[str, ...] = ()
-        self._frame_counts: dict[str, int] = {}
-        self._prepared_results: dict[str, tuple[Path, dict | None]] | None = None
-
-    def start_episode(self, video_keys: list[str], temp_dir: Path) -> None:
-        self._prepared_results = None
-        self._video_keys = tuple(video_keys)
-        self._frame_counts = dict.fromkeys(video_keys, 0)
-        self._encoder.start_episode(video_keys=video_keys, temp_dir=temp_dir)
-
-    def feed_frame(self, video_key: str, image: np.ndarray) -> None:
-        before = self._drop_count(video_key)
-        try:
-            self._encoder.feed_frame(video_key, image)
-        except RuntimeError as exc:
-            raise StreamingEncodingError(str(exc)) from exc
-        after = self._drop_count(video_key)
-        if after > before:
-            raise StreamingEncodingError(
-                f"encoder queue dropped a frame for {video_key}"
-            )
-        self._frame_counts[video_key] = self._frame_counts.get(video_key, 0) + 1
-
-    def prepare_episode(self, expected_frames: int) -> None:
-        if self._prepared_results is not None:
-            return
-        dropped = {
-            key: self._drop_count(key)
-            for key in self._video_keys
-            if self._drop_count(key) > 0
-        }
-        if dropped:
-            raise StreamingEncodingError(f"encoder dropped video frames: {dropped}")
-        mismatched = {
-            key: count
-            for key, count in self._frame_counts.items()
-            if count != expected_frames
-        }
-        if mismatched:
-            raise StreamingEncodingError(
-                f"streamed frame counts do not match {expected_frames}: {mismatched}"
-            )
-
-        try:
-            results = self._encoder.finish_episode()
-        except Exception as exc:
-            raise StreamingEncodingError(f"encoder failed while finishing: {exc}") from exc
-
-        try:
-            for key in self._video_keys:
-                if key not in results:
-                    raise StreamingEncodingError(f"encoder returned no video for {key}")
-                path, stats = results[key]
-                path = Path(path)
-                if not path.is_file() or path.stat().st_size <= 0:
-                    raise StreamingEncodingError(f"encoder produced an empty video for {key}")
-                if expected_frames >= 2 and stats is None:
-                    raise StreamingEncodingError(f"encoder returned no statistics for {key}")
-            self._prepared_results = results
-        except Exception:
-            self._remove_results(results)
-            raise
-
-    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
-        if self._prepared_results is None:
-            raise StreamingEncodingError(
-                "streaming video was not prepared before saving the episode"
-            )
-        results = self._prepared_results
-        self._prepared_results = None
-        return results
-
-    def cancel_episode(self) -> None:
-        if self._prepared_results is not None:
-            self._remove_results(self._prepared_results)
-            self._prepared_results = None
-        self._encoder.cancel_episode()
-        self._video_keys = ()
-        self._frame_counts.clear()
-
-    def close(self) -> None:
-        if self._prepared_results is not None:
-            self._remove_results(self._prepared_results)
-            self._prepared_results = None
-        self._encoder.close()
-
-    def _drop_count(self, video_key: str) -> int:
-        dropped = getattr(self._encoder, "_dropped_frames", {})
-        return int(dropped.get(video_key, 0)) if isinstance(dropped, dict) else 0
-
-    @staticmethod
-    def _remove_results(results: dict[str, tuple[Path, dict | None]]) -> None:
-        for path, _ in results.values():
-            video_path = Path(path)
-            try:
-                video_path.unlink(missing_ok=True)
-                video_path.parent.rmdir()
-            except OSError:
-                pass
-
-
-def _recommended_encoder_threads(camera_count: int) -> int:
-    """Reserve one logical CPU and avoid every camera claiming every core."""
-    usable_cpus = max(1, (os.cpu_count() or 1) - 1)
-    return max(1, min(4, usable_cpus // max(1, camera_count)))
-
-
-def _available_hardware_vcodecs() -> list[str]:
-    from av.codec import Codec
-
-    available: list[str] = []
-    for vcodec in _HARDWARE_VIDEO_CODECS:
-        try:
-            Codec(vcodec, "w")
-        except Exception:
-            continue
-        available.append(vcodec)
-    return available
-
-
-def _probe_codec_options(vcodec: str, encoder_threads: int | None) -> dict[str, str]:
-    options: dict[str, str] = {}
-    if vcodec in ("h264", "hevc"):
-        options.update({"g": "2", "crf": "30"})
-    elif vcodec == "libsvtav1":
-        options.update({"g": "2", "crf": "30", "preset": "12"})
-    elif vcodec in ("h264_videotoolbox", "hevc_videotoolbox"):
-        options.update({"g": "2", "q:v": "40"})
-    elif vcodec in ("h264_nvenc", "hevc_nvenc"):
-        options.update({"rc": "constqp", "qp": "30"})
-    elif vcodec == "h264_vaapi":
-        options["qp"] = "30"
-    elif vcodec == "h264_qsv":
-        options["global_quality"] = "30"
-
-    if encoder_threads is not None:
-        if vcodec == "libsvtav1":
-            options["svtav1-params"] = f"lp={encoder_threads}"
-        elif vcodec not in _HARDWARE_VIDEO_CODECS:
-            options["threads"] = str(encoder_threads)
-    return options
-
-
-def _probe_video_encoder(
-    vcodec: str,
-    *,
-    width: int,
-    height: int,
-    fps: int,
-    encoder_threads: int | None,
-) -> tuple[bool, str | None]:
-    """Encode real frames through the same PyAV/FFmpeg backend as LeRobot."""
-    import av
-    from av.video.stream import VideoStream
-
-    container = None
-    try:
-        with tempfile.TemporaryDirectory(prefix="handumi-encoder-probe-") as tmp:
-            path = Path(tmp) / "probe.mp4"
-            container = av.open(str(path), "w")
-            stream = cast(
-                VideoStream,
-                container.add_stream(
-                    vcodec,
-                    fps,
-                    options=_probe_codec_options(vcodec, encoder_threads),
-                ),
-            )
-            stream.pix_fmt = "yuv420p"
-            stream.width = width
-            stream.height = height
-            stream.time_base = Fraction(1, fps)
-            for value in (0, 64, 128):
-                frame = np.full((height, width, 3), value, dtype=np.uint8)
-                video_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
-                video_frame.pts = value // 64
-                video_frame.time_base = Fraction(1, fps)
-                for packet in stream.encode(video_frame):
-                    container.mux(packet)
-            for packet in stream.encode():
-                container.mux(packet)
-            container.close()
-            container = None
-            if not path.is_file() or path.stat().st_size <= 0:
-                raise RuntimeError("probe produced an empty MP4")
-        return True, None
-    except Exception as exc:
-        return False, str(exc)
-    finally:
-        if container is not None:
-            try:
-                container.close()
-            except Exception:
-                pass
-
-
-def _select_video_encoder(
-    *,
-    policy: str,
-    requested_vcodec: str | None,
-    width: int,
-    height: int,
-    fps: int,
-    camera_count: int,
-    requested_threads: int | None,
-) -> _VideoEncoderSelection:
-    """Resolve auto/cpu/gpu to a codec that passes a real encode probe."""
-    hardware_codecs = _available_hardware_vcodecs()
-    explicit_codec = requested_vcodec not in (None, "auto")
-    if explicit_codec:
-        if requested_vcodec not in _VALID_VIDEO_CODECS:
-            choices = ", ".join(sorted(_VALID_VIDEO_CODECS))
-            raise SystemExit(
-                f"Unsupported --vcodec {requested_vcodec!r}; choose one of: {choices}"
-            )
-        candidates = [str(requested_vcodec)]
-    elif policy == "cpu":
-        candidates = [_SOFTWARE_VIDEO_CODEC]
-    elif policy == "gpu":
-        candidates = hardware_codecs
-    else:
-        candidates = [*hardware_codecs, _SOFTWARE_VIDEO_CODEC]
-
-    if not candidates:
-        raise SystemExit(
-            "--encoder gpu requested, but PyAV/FFmpeg exposes no supported hardware encoder."
-        )
-
-    failures: list[str] = []
-    for candidate in candidates:
-        hardware = candidate in _HARDWARE_VIDEO_CODECS
-        threads = (
-            requested_threads
-            if requested_threads is not None
-            else None if hardware else _recommended_encoder_threads(camera_count)
-        )
-        ok, error = _probe_video_encoder(
-            candidate,
-            width=width,
-            height=height,
-            fps=fps,
-            encoder_threads=threads,
-        )
-        if ok:
-            return _VideoEncoderSelection(
-                vcodec=candidate,
-                hardware=hardware,
-                threads=threads,
-            )
-        failures.append(f"{candidate}: {error or 'unknown error'}")
-        if hardware:
-            log.warning("Hardware encoder %s failed its startup probe: %s", candidate, error)
-
-    requested = requested_vcodec if explicit_codec else policy
-    details = "; ".join(failures)
-    raise SystemExit(f"No usable video encoder for {requested!r}: {details}")
-
-
-def _install_strict_streaming_encoder(dataset: object) -> None:
-    writer = getattr(dataset, "writer", None)
-    encoder = getattr(writer, "_streaming_encoder", None)
-    if writer is None or encoder is None:
-        raise RuntimeError("LeRobot did not create the requested streaming encoder.")
-    writer._streaming_encoder = _StrictStreamingEncoder(encoder)
-
-
-def _prepare_streaming_episode(dataset: object, expected_frames: int) -> None:
-    writer = getattr(dataset, "writer", None)
-    encoder = getattr(writer, "_streaming_encoder", None)
-    if not isinstance(encoder, _StrictStreamingEncoder):
-        # RuntimeError on purpose: this guards an internal setup invariant
-        # (install_strict_streaming_encoder ran), not a caller-supplied type.
-        raise RuntimeError(  # noqa: TRY004
-            "HandUMI strict streaming encoder is not installed."
-        )
-    encoder.prepare_episode(expected_frames)
+    """相机无法持续提供有效录制帧。"""
 
 
 class _EscapeStopListener:
@@ -1983,6 +1687,7 @@ def main() -> None:
         grippers.start()
 
     log.info("--- Dataset setup ---")
+    from lerobot.configs.video import RGBEncoderConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     dataset_kwargs = {
@@ -1990,7 +1695,7 @@ def main() -> None:
         "root": args.output_dir,
         "image_writer_processes": 0,
         "image_writer_threads": 0 if use_videos else max(1, 4 * len(cam_names)),
-        "vcodec": dataset_vcodec,
+        "rgb_encoder": RGBEncoderConfig(vcodec=dataset_vcodec) if use_videos else None,
         "streaming_encoding": use_videos,
         "encoder_queue_maxsize": encoder_queue_size,
         "encoder_threads": (
@@ -2014,6 +1719,9 @@ def main() -> None:
             use_videos=use_videos,
         )
         log.info("Dataset created at: %s", dataset.root)
+    from handumi.dataset.lerobot_compat import preserve_dataset_info
+
+    preserve_dataset_info(dataset)
     if use_videos:
         _install_strict_streaming_encoder(dataset)
 
@@ -2365,7 +2073,7 @@ def main() -> None:
                 handumi_metadata,
             )
             if updated_info is not None:
-                dataset.meta.info = updated_info
+                preserve_dataset_info(dataset, updated_info)
             card_kwargs = _write_dataset_readme(
                 root,
                 repo_id=args.repo_id,
@@ -2977,12 +2685,14 @@ def _write_dataset_readme(
     """Create the same LeRobot dataset card locally that Hub upload uses."""
     from lerobot.datasets.utils import create_lerobot_dataset_card
 
+    from handumi.dataset.lerobot_compat import DatasetCardInfo
+
     info_path = root / "meta" / "info.json"
     info = json.loads(info_path.read_text())
     kwargs = _dataset_card_kwargs(task)
     card = create_lerobot_dataset_card(
         tags=["HandUMI"],
-        dataset_info=info,
+        dataset_info=DatasetCardInfo(info),
         license=license_id,
         repo_id=repo_id,
         **kwargs,

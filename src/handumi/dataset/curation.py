@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import json
 import shutil
 import subprocess
@@ -372,6 +371,8 @@ def _build_curated_dataset(
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.datasets.utils import create_lerobot_dataset_card
 
+    from handumi.dataset.lerobot_compat import DatasetCardInfo
+
     source_info = load_dataset_info(plan.source_root)
     source = LeRobotDataset(
         repo_id=plan.source_repo_id,
@@ -400,19 +401,9 @@ def _build_curated_dataset(
             source, build_root, episode_mapping, source_info
         )
     if source.meta.video_keys and video_metadata is None:
-        encoder, pixel_format = _source_video_encoding(plan.source_root, source_info)
-        copy_videos = dataset_tools._copy_and_reindex_videos
-        parameters = inspect.signature(copy_videos).parameters
-        if "vcodec" not in parameters or "pix_fmt" not in parameters:
-            raise RuntimeError(
-                "Installed LeRobot video curation API is incompatible with HandUMI"
-            )
-        video_metadata = copy_videos(
-            source,
-            new_meta,
-            episode_mapping,
-            vcodec=encoder,
-            pix_fmt=pixel_format,
+        _source_video_encoding(plan.source_root, source_info)
+        video_metadata = dataset_tools._copy_and_reindex_videos(
+            source, new_meta, episode_mapping,
         )
     data_metadata = dataset_tools._copy_and_reindex_data(
         source,
@@ -513,7 +504,7 @@ def _build_curated_dataset(
     task_summary = ", ".join(str(task) for task in task_names)
     card = create_lerobot_dataset_card(
         tags=["HandUMI", "curated"],
-        dataset_info=output_info,
+        dataset_info=DatasetCardInfo(output_info),
         license=dataset_license(plan.source_root),
         repo_id=plan.output_repo_id,
         dataset_description=(

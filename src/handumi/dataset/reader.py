@@ -180,8 +180,11 @@ def load_raw_episode(
         download_videos=download_videos,
     )
     info = getattr(getattr(dataset, "meta", None), "info", {})
-    validate_raw_state_metadata(info if isinstance(info, dict) else {})
-    metadata = handumi_metadata(info if isinstance(info, dict) else {})
+    if not isinstance(info, dict):
+        # LeRobot 0.6 解析为类型对象时会忽略扩展字段，应从原始文件读取。
+        info = load_info(Path(dataset.root))
+    validate_raw_state_metadata(info)
+    metadata = handumi_metadata(info)
     fps = float(getattr(dataset, "fps", 30) or 30)
     table = dataset.hf_dataset
     if source not in table.column_names:

@@ -1045,8 +1045,8 @@ def _log_camera_pose(rr, name: str, table_camera: np.ndarray, *, static: bool = 
             translation=table_camera[:3, 3],
             mat3x3=table_camera[:3, :3],
             relation=rr.TransformRelation.ParentFromChild,
-            axis_length=0.08,
         ),
+        rr.TransformAxes3D(axis_length=0.08),
         static=static,
     )
 
