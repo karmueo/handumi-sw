@@ -14,7 +14,12 @@ from handumi.dataset.gripper import read_normalized, require_physical_width
 from handumi.grippers.aruco import GripperOpennessEstimator
 from handumi.grippers.base import VisualGripperProvider
 from handumi.robots.utils import pose7_to_mat
-from handumi.scripts.umi_capture import NativeUmi, log_live_preview, transition
+from handumi.scripts.umi_capture import (
+    NativeUmi,
+    init_tracking_preview,
+    log_live_preview,
+    transition,
+)
 from handumi.tracking.base import ControllerPairSample
 from handumi.tracking.vive import ViveTrackingProvider
 
@@ -56,7 +61,7 @@ def test_live_preview_is_independent_of_timeline():
 
     log_live_preview(viewer, image, tracking, gripper, False, 0.15)
 
-    assert viewer.log.call_count == 6
+    assert viewer.log.call_count == 7
     assert viewer.log.call_args_list[0].kwargs == {"static": True}
     assert all(not call.kwargs for call in viewer.log.call_args_list[1:])
     assert [call.args[0] for call in viewer.log.call_args_list] == [
@@ -65,6 +70,7 @@ def test_live_preview_is_independent_of_timeline():
         "health/valid",
         "health/camera_sequence",
         "health/camera_age_s",
+        "tracking/tracker",
         "tracking/tcp",
     ]
     viewer.set_time.assert_called_once_with("capture", duration=100 / 1e9)
@@ -188,23 +194,142 @@ def test_workspace_after_raw_interpolation_and_tcp_once(table_setup):
         provider.set_workspace_from_device_pose(identity)
 
 
-def test_tcp_axes_loss_recovery_and_gripper_independence():
-    """XYZ 姿态跟随四元数；定位失效清除，夹爪失效仍显示，定位恢复重显。"""
+def _assert_axes(record, length, *, static):
+    """验证三色轴箭头的局部原点、方向、长度和记录方式。"""
     import rerun as rr
+
+    assert record.kwargs == ({"static": True} if static else {})
+    axes = record.args[1]
+    assert isinstance(axes, rr.Arrows3D)
+    np.testing.assert_allclose(axes.origins.as_arrow_array().to_pylist(), np.zeros((3, 3)))
+    np.testing.assert_allclose(axes.vectors.as_arrow_array().to_pylist(), np.eye(3) * length)
+    assert axes.radii.as_arrow_array().to_pylist() == pytest.approx(
+        [float(rr.Radius.ui_points(1.0))]
+    )
+    assert axes.colors.as_arrow_array().to_pylist() == [
+        int.from_bytes(bytes(color), "big")
+        for color in ([255, 0, 0, 255], [0, 128, 0, 255], [0, 0, 139, 255])
+    ]
+    assert axes.labels is None
+    assert axes.show_labels.as_arrow_array().to_pylist() == [False]
+
+
+def _assert_origin(record, label, color, *, static):
+    """验证原点标记使用原生名称标签和原有颜色。"""
+    import rerun as rr
+
+    assert record.kwargs == ({"static": True} if static else {})
+    point = record.args[1]
+    assert isinstance(point, rr.Points3D)
+    assert point.positions.as_arrow_array().to_pylist() == [[0, 0, 0]]
+    assert point.radii.as_arrow_array().to_pylist() == pytest.approx([0.005])
+    assert point.colors.as_arrow_array().to_pylist() == [
+        int.from_bytes(bytes([*color, 255]), "big")
+    ]
+    assert point.labels.as_arrow_array().to_pylist() == [label]
+    assert point.show_labels.as_arrow_array().to_pylist() == [True]
+
+
+@pytest.mark.parametrize("session", [{"table_from_device": []}, None])
+def test_preview_reference_axes_and_bounds(session):
+    """桌面和 OpenVR 使用原生名称与彩色坐标轴，保留原有初始取景范围。"""
+    import rerun as rr
+
+    viewer = Mock(wraps=rr)
+    viewer.log = Mock()
+    viewer.ViewCoordinates = rr.ViewCoordinates
+    init_tracking_preview(viewer, session)
+    records = {call.args[0]: call for call in viewer.log.call_args_list}
+    assert records["reference_frame"].kwargs == {"static": True}
+    assert isinstance(records["reference_frame"].args[1], rr.TextDocument)
+    assert "tracking/reference_grid" not in records
+    assert not any("axis_labels" in path for path in records)
+    assert not any(isinstance(call.args[1], rr.Mesh3D) for call in records.values())
+    bounds = records["tracking/bounds"].args[1]
+    assert bounds.labels is None
+    assert bounds.show_labels.as_arrow_array().to_pylist() == [False]
+    assert bounds.radii.as_arrow_array().to_pylist() == pytest.approx([0.004])
+    assert bounds.colors.as_arrow_array().to_pylist() == [
+        int.from_bytes(bytes([128, 100, 100, 90]), "big")
+    ] * 8
+    vertices = np.asarray(bounds.positions.as_arrow_array().to_pylist())
+    assert vertices.shape == (8, 3)
+    expected_max = [0.75, 0.75, 0.4] if session is not None else [0.75, 0.4, 0.75]
+    np.testing.assert_allclose(vertices.max(axis=0), expected_max)
+    np.testing.assert_allclose(vertices.min(axis=0), -np.asarray(expected_max))
+    assert isinstance(records["tracking/reference"].args[1], rr.Transform3D)
+    _assert_axes(records["tracking/reference/axes"], 0.12, static=True)
+    _assert_origin(records["tracking/reference/origin"],
+                   "Table" if session is not None else "OpenVR", [230, 230, 230], static=True)
+    coordinates = (rr.ViewCoordinates.RIGHT_HAND_Z_UP if session is not None
+                   else rr.ViewCoordinates.RIGHT_HAND_Y_UP)
+    assert records["tracking"].args[1] is coordinates
+
+
+@pytest.mark.parametrize("session", [{"table_from_device": []}, None])
+def test_tracker_and_tcp_axes_follow_tracking_validity(session):
+    """局部箭头跟随真实位姿，名称在失效时被递归清除并在恢复后重记。"""
+    import rerun as rr
+    from scipy.spatial.transform import Rotation
 
     viewer = Mock(wraps=rr)
     viewer.log = Mock()
     viewer.set_time = Mock()
     image = CameraSample(np.zeros((48, 64, 3), np.uint8), 100, 1)
+    tracker = np.array([1, 2, 3, 0, np.sqrt(0.5), 0, np.sqrt(0.5)])
+    tcp = np.array([2, 3, 4, 0, 0, np.sqrt(0.5), np.sqrt(0.5)])
     sample = replace(
         ControllerPairSample.empty("vive"), right_tracked=True, right_pose_valid=True,
-        right_tcp_pose=np.array([1, 2, 3, 0, 0, np.sqrt(0.5), np.sqrt(0.5)]),
+        right_controller_pose=tracker, right_tcp_pose=tcp,
     )
-    for tracked, expected in [(True, rr.Transform3D), (False, rr.Clear), (True, rr.Transform3D)]:
-        log_live_preview(viewer, image, replace(sample, right_tracked=tracked), SimpleNamespace(normalized=0.5, valid=False), False, 0.1, 0.11)
-        value = viewer.log.call_args.args[1]
-        assert isinstance(value, expected)
-        if tracked:
-            np.testing.assert_allclose(value.translation.as_arrow_array().to_pylist(), [[1, 2, 3]])
-            np.testing.assert_allclose(value.quaternion.as_arrow_array().to_pylist(), [sample.right_tcp_pose[3:]])
-            assert value.axis_length.as_arrow_array().to_pylist()[0] == pytest.approx(0.11)
+    for tracked in (True, False, True):
+        viewer.log.reset_mock()
+        log_live_preview(viewer, image, replace(sample, right_tracked=tracked),
+                         SimpleNamespace(normalized=0.5, valid=False), False, 0.1, 0.11,
+                         session=session)
+        records = {call.args[0]: call for call in viewer.log.call_args_list}
+        assert not any("axis_labels" in path for path in records)
+        assert not any(isinstance(call.args[1], rr.Mesh3D) for call in records.values())
+        for path, pose, length, label, color in (
+            ("tracking/tracker", tracker, 0.06, "Tracker", [255, 190, 50]),
+            ("tracking/tcp", tcp, 0.11, "TCP", [80, 220, 255]),
+        ):
+            value = records[path].args[1]
+            if not tracked:
+                assert isinstance(value, rr.Clear)
+                assert value.is_recursive.as_arrow_array().to_pylist() == [True]
+                assert not any(key.startswith(path + "/") for key in records)
+                continue
+            assert isinstance(value, rr.Transform3D)
+            np.testing.assert_allclose(value.translation.as_arrow_array().to_pylist(), [pose[:3]])
+            np.testing.assert_allclose(value.quaternion.as_arrow_array().to_pylist(), [pose[3:]])
+            _assert_axes(records[path + "/axes"], length, static=False)
+            _assert_origin(records[path + "/origin"], label, color, static=False)
+            vectors = records[path + "/axes"].args[1].vectors.as_arrow_array().to_pylist()
+            rotated = Rotation.from_quat(pose[3:]).apply(vectors)
+            np.testing.assert_allclose(rotated, Rotation.from_quat(pose[3:]).as_matrix().T * length, atol=1e-7)
+
+
+def test_native_axes_and_labels_serialize_with_real_recording():
+    """真实 Rerun 记录流能够序列化静态和动态箭头及原生标签。"""
+    import rerun as rr
+
+    from handumi.scripts.umi_capture import _RerunCaptureViewer
+
+    recording = rr.RecordingStream("native_axes_test", make_default=False)
+    memory = recording.memory_recording()
+    viewer = _RerunCaptureViewer(recording, rr)
+    try:
+        init_tracking_preview(viewer, {})
+        sample = replace(
+            ControllerPairSample.empty("vive"), right_tracked=True, right_pose_valid=True,
+        )
+        image = CameraSample(np.zeros((48, 64, 3), np.uint8), 100, 1)
+        log_live_preview(
+            viewer, image, sample, SimpleNamespace(normalized=0.5), True, 0.1,
+            session={},
+        )
+        recording.flush()
+        assert len(memory.drain_as_bytes()) > 0
+    finally:
+        recording.disconnect()

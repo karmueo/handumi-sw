@@ -164,7 +164,7 @@ def test_stable_resume_preserves_initial_verification(table_setup, tmp_path):
     (tmp_path / "meta/tasks.parquet").touch()
     (tmp_path / "meta/episodes/file-000.parquet").touch()
     info = tmp_path / "meta/info.json"
-    info.write_text(json.dumps({"total_episodes": 1, "handumi": original}))
+    info.write_text(json.dumps({"total_episodes": 1, "handumi": original, "features": {"observation.tracking.right_tcp_pose": umi_capture.pose7_feature()}}))
     changed = deepcopy(session)
     changed["verification"]["checked_at"] = "later"
     changed["path"] = "moved.yaml"
@@ -176,7 +176,7 @@ def test_stable_resume_preserves_initial_verification(table_setup, tmp_path):
     changed["core_digest"] = digest(session_core(changed))
     with pytest.raises(ValueError, match="不一致"):
         umi_capture.validate_resume_target(tmp_path, umi_capture.metadata(profile, changed))
-    info.write_text(json.dumps({"total_episodes": 1, "handumi": umi_capture.metadata(profile)}))
+    info.write_text(json.dumps({"total_episodes": 1, "handumi": umi_capture.metadata(profile), "features": {"observation.tracking.right_tcp_pose": umi_capture.pose7_feature()}}))
     with pytest.raises(ValueError, match="不一致"):
         umi_capture.validate_resume_target(tmp_path, original)
 

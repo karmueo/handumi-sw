@@ -5,15 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import select
+import signal
+import socket
 import sys
 import termios
+import threading
 import time
 import tty
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import yaml
@@ -24,22 +27,31 @@ from handumi.calibration.control_tcp import (
 )
 from handumi.calibration.umi import estimator, pose7, verify
 from handumi.calibration.umi_table import session_core
-from handumi.cameras.opencv import OpenCVCameraDevice
+from handumi.cameras.opencv import CameraFrameUnavailable, OpenCVCameraDevice
 from handumi.dataset.raw import (
     HANDUMI_STATE_SEMANTICS,
     HANDUMI_TRACKING_SCHEMA,
     camera_health_features,
     capture_timing_features,
+    pose7_feature,
     raw_state_feature,
     raw_tracking_features,
     scalar_feature,
 )
 from handumi.grippers.base import GripperObservation, VisualGripperProvider
+from handumi.robots.utils import pose7_to_mat
+from handumi.scripts._record_encoding import (
+    _install_strict_streaming_encoder,
+    _prepare_streaming_episode,
+    _select_video_encoder,
+    _vive_rgb_encoder_config,
+)
 from handumi.scripts._record_output import (
     _check_output_directory,
     _overwrite_arg,
     _prepare_output_directory,
 )
+from handumi.scripts._umi_preview import capture_blueprint
 from handumi.scripts._umi_session import (
     DEFAULT_CALIBRATION as DEFAULT_CALIBRATION,
 )
@@ -48,6 +60,41 @@ from handumi.scripts._umi_session import (
     load_session,
 )
 from handumi.tracking.vive import ViveTrackingProvider
+
+
+@dataclass(frozen=True)
+class CaptureHealth:
+    """保存严格健康判定所用的各项检查，供录制与预览共同使用。"""
+
+    tracker: bool
+    gripper: bool
+    camera_age_ns: int
+    synchronization_error_ns: int
+
+    @property
+    def camera_ok(self):
+        """相机帧龄在原有的有效范围内。"""
+        return 0 <= self.camera_age_ns <= 350_000_000
+
+    @property
+    def synchronization_ok(self):
+        """校正后的相机时间与目标时间之差未超过原有限制。"""
+        return abs(self.synchronization_error_ns) <= 60_000_000
+
+    @property
+    def healthy(self):
+        """返回原有的严格采集有效性，不额外检查位姿标志。"""
+        return bool(self.tracker and self.gripper and self.camera_ok and self.synchronization_ok)
+
+
+def capture_health(image, tracking, gripper, target, corrected, checked_now):
+    """按采样时刻计算健康检查，供录制判定和状态解释复用。"""
+    return CaptureHealth(
+        tracker=tracking.right_tracked,
+        gripper=gripper.valid,
+        camera_age_ns=checked_now - image.capture_time_ns,
+        synchronization_error_ns=corrected - target,
+    )
 
 
 @contextmanager
@@ -115,25 +162,25 @@ class NativeUmi:
         finally:
             self.tracker.stop()
 
-    def sample(self, now_ns=None):
-        """选取延迟 150 ms 的图像并在校正时刻插值定位，返回严格有效性。"""
+    def sample(self, now_ns=None, *, after_sequence=None):
+        """选取延迟 150 ms 的图像，在其校正时刻插值定位并检查有效性。"""
         if getattr(self.tracker, "error", None) is not None:
             raise RuntimeError("Vive 采集线程失败") from self.tracker.error
         now_ns = time.monotonic_ns() if now_ns is None else now_ns
         started = time.monotonic_ns()
         target = now_ns - 150_000_000
-        image = self.camera.sample_at(target - self.offset_ns)
+        if after_sequence is None:
+            image = self.camera.sample_at(target - self.offset_ns)
+        else:
+            image = self.camera.sample_at(target - self.offset_ns, after_sequence=after_sequence)
         corrected = image.capture_time_ns + self.offset_ns
         tracking = self.tracker.sample_at(corrected)
         gripper = self.gripper.observe(image, offset_ns=self.offset_ns)
         checked_now = now_ns + time.monotonic_ns() - started
-        healthy = bool(
-            tracking.right_tracked
-            and gripper.valid
-            and 0 <= checked_now - image.capture_time_ns <= 350_000_000
-            and abs(corrected - target) <= 60_000_000
+        self.last_health = capture_health(
+            image, tracking, gripper, target, corrected, checked_now,
         )
-        return image, tracking, gripper, target, healthy
+        return image, tracking, gripper, target, self.last_health.healthy
 
 
 def metadata(snapshot, session=None):
@@ -149,6 +196,11 @@ def metadata(snapshot, session=None):
         "capture_schema": "synchronized_sources_v2",
         "state_semantics": HANDUMI_STATE_SEMANTICS,
         "tracking_workspace": "table" if session is not None else "openvr_raw",
+        "tcp_pose": {
+            "feature": "observation.tracking.right_tcp_pose",
+            "frame": "table" if session is not None else "openvr_raw",
+            "sample_time_feature": "observation.tracking.aligned_time_ns",
+        },
         "controller_tcp_calibration": {
             "schema_version": 2,
             "applied_to_state": False,
@@ -189,6 +241,7 @@ def features(snapshot):
         "observation.state": raw_state_feature(),
         "action": raw_state_feature(),
         **raw_tracking_features(),
+        "observation.tracking.right_tcp_pose": pose7_feature(),
         **capture_timing_features(),
         **camera_health_features(["right_wrist"]),
     }
@@ -225,6 +278,7 @@ def assemble_frame(image, tracking, gripper, target, now, task):
         "task": task,
         "observation.images.right_wrist": image.image,
         **tracking.tracking_frame(),
+        "observation.tracking.right_tcp_pose": tracking.right_tcp_pose.copy(),
         **gripper.frame(),
         **GripperObservation(0, False, 0, 0).frame("left"),
         "observation.sync.target_time_ns": scalar(target),
@@ -267,6 +321,23 @@ def validate_resume_target(root: Path, expected_metadata: dict) -> dict:
         raise ValueError("无法续录：本地缺少 meta/tasks.parquet，请检查或恢复原数据集。")
     if not any((root / "meta/episodes").rglob("*.parquet")):
         raise ValueError("无法续录：本地缺少 meta/episodes 段元数据，请检查或恢复原数据集。")
+    tcp_name = "observation.tracking.right_tcp_pose"
+    available = info.get("features")
+    tcp_feature = available.get(tcp_name) if isinstance(available, dict) else None
+    if tcp_feature is None:
+        raise ValueError(
+            "旧数据集未保存 TCP 位姿，无法续录；请使用新的 --output-dir。"
+            "已有数据仍可读取和转换。"
+        )
+    expected_feature = pose7_feature()
+    if (
+        not isinstance(tcp_feature, dict)
+        or tcp_feature.get("dtype") != expected_feature["dtype"]
+        or tcp_feature.get("shape") not in ([7], (7,))
+        or tcp_feature.get("names") != expected_feature["names"]
+    ):
+        raise ValueError("无法续录：TCP 位姿字段的数据类型、形状或名称不匹配")
+
     def stable(value):
         """排除桌面复验报告变化，仍严格比较会话身份和其他数据契约。"""
         result = deepcopy(value)
@@ -279,8 +350,115 @@ def validate_resume_target(root: Path, expected_metadata: dict) -> dict:
     return info["handumi"]
 
 
-def log_live_preview(viewer, image, tracking, gripper, healthy, camera_age_s, axis_length=0.08):
-    """相机始终显示最新帧，其余曲线和 TCP 保留原有时间轴语义。"""
+def _coordinate_axes(viewer, length):
+    """在局部原点绘制 X 红、Y 深绿、Z 深蓝三根指定长度的箭头。"""
+    return viewer.Arrows3D(
+        origins=np.zeros((3, 3)), vectors=np.eye(3) * length,
+        radii=viewer.Radius.ui_points(1.0),
+        colors=[[255, 0, 0], [0, 128, 0], [0, 0, 139]], show_labels=False,
+    )
+
+
+def _capture_issues(health, duplicate_frame):
+    """列出严格录制判定和录制期重复帧所依据的异常。"""
+    issues = []
+    if not health.tracker:
+        issues.append("Tracker 未追踪")
+    if not health.gripper:
+        issues.append("夹爪检测无效")
+    if health.camera_age_ns < 0:
+        issues.append("相机时间异常")
+    elif not health.camera_ok:
+        issues.append("相机帧过旧")
+    if not health.synchronization_ok:
+        issues.append("相机同步超限")
+    if duplicate_frame:
+        issues.append("相机帧重复")
+    return issues
+
+
+def capture_status_text(
+    *, mode, health, tracking, gripper, healthy, duplicate_frame=False,
+    recording=False, saving=False, exit_requested=False, frame_count=0, fps=30, saved=0, last_result="",
+    camera_status=None,
+):
+    """生成当前采集状态的 Markdown；帧数和保存数由调用方维护。"""
+    issues = _capture_issues(health, duplicate_frame)
+    if not healthy and not issues:
+        issues.append("采集状态无效")
+    if mode == "record":
+        phase = "保存中" if saving else (
+            "录制中" if recording else ("可开始录制" if healthy else "等待设备就绪")
+        )
+        lines = [
+            f"## {phase}",
+            f"当前段：{frame_count} 帧 · 数据时长 {frame_count / fps:.1f} 秒  ",
+            f"本次已保存：{saved} 段",
+        ]
+        if last_result:
+            lines.extend(["", f"最近结果：{last_result}"])
+    else:
+        label = "设备诊断" if mode == "doctor" else "采集预览"
+        lines = [f"## {label} · {'设备就绪' if healthy else '等待设备就绪'}"]
+    camera = "正常" if health.camera_ok else (
+        "时间异常" if health.camera_age_ns < 0 else "帧过旧"
+    )
+    if camera_status == "reconnecting":
+        camera += "、正在自动重连"
+    elif camera_status == "waiting":
+        camera += "、等待新画面"
+    elif camera_status == "error":
+        camera += "、重连失败，请检查终端"
+    if duplicate_frame:
+        camera += "、帧重复"
+    tracker = "追踪正常" if tracking.right_tracked else "未追踪"
+    pose = "位姿有效" if tracking.right_pose_valid else "位姿无效"
+    gripper_status = (
+        getattr(gripper, "reason", "") or ("检测正常" if gripper.valid else "检测无效")
+    )
+    sync = "正常" if health.synchronization_ok else "超限"
+    lines.extend([
+        "",
+        f"相机：{camera} · 帧龄 {health.camera_age_ns / 1e6:.0f} ms  ",
+        "采集包含约 150 ms 同步缓冲  ",
+        f"Tracker：{tracker} · {pose}  ",
+        f"夹爪：{gripper_status}  ",
+        f"同步：{sync} · 偏差 {health.synchronization_error_ns / 1e6:+.0f} ms",
+    ])
+    if issues:
+        lines.extend(["", "不可录制原因：" + "；".join(issues)])
+    if mode == "record" and saving:
+        lines.extend(["", "保存完成后退出" if exit_requested else "正在保存，请稍候"])
+    elif mode == "record":
+        lines.extend([
+            "",
+            "空格：保存当前段" if recording else "空格：开始录制",
+            "  ",
+            "Esc：丢弃当前段" if recording else "Esc：退出",
+            "  ",
+            "请在启动命令的终端中使用按键",
+        ])
+    return "\n".join(lines)
+
+
+def log_capture_status(viewer, **status):
+    """静态更新状态文档，使其不受时间游标位置影响。"""
+    viewer.log(
+        "capture_status", viewer.TextDocument(capture_status_text(**status),
+                                              media_type="text/markdown"),
+        static=True,
+    )
+
+
+def log_live_preview(
+    viewer, image, tracking, gripper, healthy, camera_age_s, axis_length=0.08,
+    *, session=None, tracker_from_camera=None,
+):
+    """记录最新图像与同一采集时间的 Tracker、TCP 和相机坐标。
+
+    tracker_from_camera 是 T_Tracker_Camera；None 保留旧内部调用的行为。
+    相机轴长固定为 0.06 米，其节点也是可选视锥与图像的父节点。
+    """
     viewer.set_time("capture", duration=image.capture_time_ns / 1e9)
     viewer.log(
         "camera/right_wrist",
@@ -292,13 +470,39 @@ def log_live_preview(viewer, image, tracking, gripper, healthy, camera_age_s, ax
     viewer.log("health/camera_sequence", viewer.Scalars(image.sequence))
     viewer.log("health/camera_age_s", viewer.Scalars(camera_age_s))
     if tracking.right_tracked and tracking.right_pose_valid:
-        viewer.log("tracking/tcp", viewer.Transform3D(
-            translation=tracking.right_tcp_pose[:3],
-            rotation=viewer.Quaternion(xyzw=tracking.right_tcp_pose[3:]),
-            axis_length=axis_length,
-        ))
+        for name, pose, length, color, label in (
+            ("tracker", tracking.right_controller_pose, 0.06, [255, 190, 50], "Tracker"),
+            ("tcp", tracking.right_tcp_pose, axis_length, [80, 220, 255], "TCP"),
+        ):
+            viewer.log(f"tracking/{name}", viewer.Transform3D(
+                translation=pose[:3],
+                rotation=viewer.Quaternion(xyzw=pose[3:]),
+            ))
+            # 箭头和名称均使用父坐标系局部坐标，定位失效由父级递归清除。
+            viewer.log(f"tracking/{name}/axes", _coordinate_axes(viewer, length))
+            viewer.log(f"tracking/{name}/origin", viewer.Points3D(
+                [[0, 0, 0]], radii=0.005, colors=color,
+                labels=[label], show_labels=True,
+            ))
+        if tracker_from_camera is not None:
+            # Tracker 已位于桌面或 OpenVR 参考系；外参将相机坐标映射至 Tracker。
+            reference_from_camera = (
+                pose7_to_mat(tracking.right_controller_pose) @ tracker_from_camera
+            )
+            viewer.log("tracking/camera", viewer.Transform3D(
+                translation=reference_from_camera[:3, 3],
+                mat3x3=reference_from_camera[:3, :3],
+            ))
+            viewer.log("tracking/camera/axes", _coordinate_axes(viewer, 0.06))
+            viewer.log("tracking/camera/origin", viewer.Points3D(
+                [[0, 0, 0]], radii=0.005, colors=[110, 180, 255],
+                labels=["Camera"], show_labels=True,
+            ))
     else:
+        viewer.log("tracking/tracker", viewer.Clear(recursive=True))
         viewer.log("tracking/tcp", viewer.Clear(recursive=True))
+        if tracker_from_camera is not None:
+            viewer.log("tracking/camera", viewer.Clear(recursive=True))
 
 
 def init_tracking_preview(viewer, session):
@@ -307,10 +511,33 @@ def init_tracking_preview(viewer, session):
         viewer.ViewCoordinates.RIGHT_HAND_Z_UP if session is not None
         else viewer.ViewCoordinates.RIGHT_HAND_Y_UP
     ), static=True)
-    viewer.log("tracking/reference", viewer.Transform3D(axis_length=0.12), static=True)
+    viewer.log("tracking/reference", viewer.Transform3D(translation=[0, 0, 0]), static=True)
+    viewer.log("tracking/reference/axes", _coordinate_axes(viewer, 0.12), static=True)
+    viewer.log(
+        "tracking/reference/origin",
+        viewer.Points3D(
+            [[0, 0, 0]], radii=0.005, colors=[230, 230, 230],
+            labels=["Table" if session is not None else "OpenVR"], show_labels=True,
+        ),
+        static=True,
+    )
+    # 低调角点稳定初始自动取景范围，不表示真实桌面边界。
+    if session is not None:
+        bounds = [[x * 0.75, y * 0.75, z * 0.4]
+                  for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+    else:
+        bounds = [[x * 0.75, y * 0.4, z * 0.75]
+                  for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+    viewer.log(
+        "tracking/bounds",
+        viewer.Points3D(
+            bounds, colors=[[128, 100, 100, 90]] * 8, radii=0.004, show_labels=False,
+        ),
+        static=True,
+    )
     reference = (
         "Desktop frame: X right, Y away from operator, Z up"
-        if session
+        if session is not None
         else "Raw OpenVR frame (desktop not calibrated)"
     )
     viewer.log("reference_frame", viewer.TextDocument(reference), static=True)
@@ -329,111 +556,11 @@ def _parse_gripper_hold_ms(value):
     return milliseconds
 
 
-def _positive_finite_float(value):
-    """解析正的有限浮点参数； argparse 在硬件和目录处理前失败。"""
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as error:
-        raise argparse.ArgumentTypeError("必须是正的有限数值") from error
-    if not np.isfinite(number) or number <= 0:
-        raise argparse.ArgumentTypeError("必须是正的有限数值")
-    return number
-
-
-@dataclass(frozen=True)
-class _RobotPreviewSetup:
-    """机器人预览的重型运行前预检结果。"""
-
-    runtime: Any
-    tool: Any
-    thresholds: Any
-    live_controller: Any
-    view: Any
-    offline_solver: Any
-
-
-def _validate_robot_options(parser, args):
-    """校验机器人预览开关组合和阈值，并在解析阶段给出清晰错误。"""
-    if not args.robot_preview:
-        if (
-            args.robot_tool_calibration is not None
-            or args.robot_position_tolerance_m is not None
-            or args.robot_orientation_tolerance_deg is not None
-        ):
-            parser.error("--robot-* 参数仅能与 --robot-preview 一起使用")
-        args.robot_position_tolerance_m = 0.01
-        args.robot_orientation_tolerance_deg = 5.0
-        return
-    if args.no_preview:
-        parser.error("--robot-preview 与 --no-preview 不能同时指定")
-    if args.robot_tool_calibration is None:
-        parser.error("--robot-preview 需要 --robot-tool-calibration")
-    if args.robot_position_tolerance_m is None:
-        args.robot_position_tolerance_m = 0.01
-    if args.robot_orientation_tolerance_deg is None:
-        args.robot_orientation_tolerance_deg = 5.0
-
-
-def _validate_robot_calibration(args):
-    """读取并验证工具标定和阈值；不加载 JAX 模型或启动任何线程。"""
-    from handumi.robots.umi_ik import IkThresholds, ToolCalibration
-
-    try:
-        tool = ToolCalibration.from_yaml(args.robot_tool_calibration)
-        thresholds = IkThresholds(
-            args.robot_position_tolerance_m,
-            args.robot_orientation_tolerance_deg,
-        )
-    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
-        raise ValueError(f"机器人预览预检失败：{exc}") from exc
-    return tool, thresholds
-
-
-def _prepare_robot_preview(args, tool, thresholds):
-    """删除输出目录前完成模型加载、完整网格加载和两套 solver 预热。"""
-    from handumi.robots.registry import load_embodiment
-    from handumi.robots.umi_ik import RelativeToolIk
-    from handumi.visualize.robot import RerunRobotView, validate_rerun_api
-
-    # 在覆盖输出目录之前确认实际安装的 Rerun API 可用，而不是等到
-    # preview.start() 才发现缺包或版本不兼容。
-    validate_rerun_api()
-    runtime = load_embodiment(args.robot)
-    offline_solver = runtime.solver_cls(config=runtime.config.ik_weights)
-    live_controller = RelativeToolIk.from_runtime(
-        runtime,
-        tool_calibration=tool,
-        thresholds=thresholds,
-    )
-    live_controller.warmup()
-    offline_probe = RelativeToolIk.from_runtime(
-        runtime,
-        tool_calibration=tool,
-        thresholds=thresholds,
-        solver=offline_solver,
-    )
-    offline_probe.warmup()
-    view = RerunRobotView(runtime, axis_length=args.tcp_axis_length_m)
-    view.load()
-    return _RobotPreviewSetup(
-        runtime=runtime,
-        tool=tool,
-        thresholds=thresholds,
-        live_controller=live_controller,
-        view=view,
-        offline_solver=offline_solver,
-    )
-
-
 class _RerunCaptureViewer:
-    """把显式 RecordingStream 适配为现有预览函数使用的 rr 模块接口。
-
-    相机和机器人共用一个记录流，但 Rerun 的时间戳是线程本地的：主线程
-    记录 capture 时间轴，后台求解线程记录 robot_ik 时间轴，互不污染。
-    """
+    """将显式 RecordingStream 适配为采集预览使用的 rr 模块接口。"""
 
     def __init__(self, stream, rr) -> None:
-        """包装显式记录流；相机与机器人共享同一 Rerun 记录。"""
+        """包装相机与追踪预览共享的记录流。"""
         self.stream = stream
         self._rr = rr
 
@@ -449,6 +576,10 @@ class _RerunCaptureViewer:
         """设置当前线程的采集时间轴。"""
         self.stream.set_time(timeline, **kwargs)
 
+    def flush(self) -> None:
+        """在长时间保存前推送最新状态。"""
+        self.stream.flush()
+
     def disconnect(self) -> None:
         """刷新并关闭共享记录流。"""
         try:
@@ -457,52 +588,31 @@ class _RerunCaptureViewer:
             self.stream.disconnect()
 
 
-def _start_robot_preview(setup, viewer):
-    """在现有采集窗口中绑定机器人 3D 场景并启动后台求解线程。"""
-    from handumi.scripts._umi_robot_preview import RobotIkPreview
-
-    if viewer is None or not hasattr(viewer, "stream"):
-        raise RuntimeError("机器人预览需要现有采集 Rerun 窗口")
-    setup.view.bind_stream(viewer.stream, send_blueprint=False)
-    preview = RobotIkPreview(setup.live_controller, setup.view)
-    preview.start()
-    return preview
-
-
-def _create_robot_ik_recorder(root: Path, setup):
-    """构造逐帧补算记录器；每集新控制器共享已预热的离线 solver。"""
-    from handumi.dataset.robot_ik import RobotIkEpisodeRecorder
-    from handumi.robots.umi_ik import RelativeToolIk
-
-    def factory():
-        return RelativeToolIk.from_runtime(
-            setup.runtime,
-            tool_calibration=setup.tool,
-            thresholds=setup.thresholds,
-            solver=setup.offline_solver,
-        )
-
-    return RobotIkEpisodeRecorder(root, factory)
-
-
 def _start_camera_viewer(args, session):
-    """启动采集 Rerun 窗口；机器人预览共享同一显式记录流。"""
+    """启动相机、追踪、夹爪与健康状态共享的 Rerun 窗口。"""
     if args.no_preview:
         return None
     import rerun as rr
     import rerun.blueprint as rrb
+    import rerun_cli
 
+    # 避免连接已有的旧版 Viewer，使用当前 SDK 自带的二进制及独立端口。
+    viewer_dir = Path(rerun_cli.__file__).parent
+    if sys.platform == "darwin" and (viewer_dir / "Rerun.app").exists():
+        executable = viewer_dir / "Rerun.app/Contents/MacOS/Rerun"
+    else:
+        executable = viewer_dir / ("rerun.exe" if sys.platform == "win32" else "rerun")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
     stream = rr.RecordingStream("handumi_umi")
-    stream.spawn()
+    rr.spawn(port=port, executable_path=str(executable), recording=stream)
     viewer = _RerunCaptureViewer(stream, rr)
-    if getattr(args, "robot_preview", False):
-        from handumi.visualize.robot import capture_blueprint
-
-        stream.send_blueprint(
-            capture_blueprint(rrb),
-            make_active=True,
-            make_default=True,
-        )
+    stream.send_blueprint(
+        capture_blueprint(rrb, table_frame=session is not None),
+        make_active=True,
+        make_default=True,
+    )
     init_tracking_preview(viewer, session)
     return viewer
 
@@ -511,8 +621,26 @@ def _open_recording_dataset(args, snapshot, recording_metadata):
     """创建或续录 LeRobot 数据集；测试可替换此函数。"""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    from handumi.dataset.lerobot_compat import preserve_dataset_info
+
+    width, height = snapshot["resolution"]
+    selection = _select_video_encoder(
+        policy=args.encoder, requested_vcodec=None, width=width, height=height,
+        fps=args.fps, camera_count=1, requested_threads=None, h264_only=True,
+        streaming_probe=True,
+    )
+    kind = "硬件" if selection.hardware else "软件"
+    print(f"视频编码：{selection.vcodec}（{kind}，流式）；策略：{args.encoder}。", flush=True)
+    options = dict(
+        rgb_encoder=_vive_rgb_encoder_config(selection.vcodec),
+        streaming_encoding=True, encoder_queue_maxsize=30,
+        encoder_threads=selection.threads, image_writer_threads=0,
+    )
     if args.resume:
-        dataset = LeRobotDataset.resume(repo_id=args.repo_id, root=args.output_dir)
+        dataset = LeRobotDataset.resume(
+            repo_id=args.repo_id, root=args.output_dir,
+            **options,
+        )
     else:
         dataset = LeRobotDataset.create(
             repo_id=args.repo_id,
@@ -521,30 +649,45 @@ def _open_recording_dataset(args, snapshot, recording_metadata):
             robot_type="handumi_raw",
             features=features(snapshot),
             use_videos=True,
-            image_writer_threads=4,
-            vcodec="h264",
+            **options,
         )
-    dataset.meta.info["handumi"] = recording_metadata
+    _install_strict_streaming_encoder(
+        dataset, verify_video_frames=True, isolate_process=True, rgb_vcodec=selection.vcodec,
+    )
+    dataset._handumi_encoding = {"codec": selection.vcodec, "hardware": selection.hardware}
+    preserve_dataset_info(dataset, {"handumi": recording_metadata})
     return dataset
 
 
-def _print_robot_ik_progress(done: int, total: int) -> None:
-    """在终端显示逐帧补算进度，避免长时间保存看起来停住。"""
-    interval = max(1, total // 10)
-    if done == total or done % interval == 0:
-        print(f"  robot_ik 补算 {done}/{total}", end="\r", flush=True)
+def _save_streaming_episode(dataset, frame_count):
+    """先结束并校验流式视频，再提交数据；返回各阶段耗时（秒）。"""
+    start = time.monotonic()
+    timings = _prepare_streaming_episode(dataset, frame_count)
+    prepared = time.monotonic()
+    dataset.save_episode()
+    finished = time.monotonic()
+    return {"encode_finish_s": prepared - start, **timings, "commit_s": finished - prepared}
 
 
-def _warn_incomplete_robot_ik(root: Path) -> None:
-    """启动时报告遗留暂存/恢复文件；只读，不补算历史 episode。"""
-    from handumi.dataset.robot_ik import find_incomplete_records
+def _capture_metrics(frame_times, camera_times, add_durations, save_durations, total_s):
+    """汇总录制实测速度及保存阶段耗时，时间均来自单调时钟。"""
+    frame_intervals = np.diff(frame_times)
+    camera_intervals = np.diff(camera_times)
+    elapsed = frame_times[-1] - frame_times[0] if len(frame_times) > 1 else 0.0
+    return {
+        "frames": len(frame_times),
+        "capture_fps": (len(frame_times) - 1) / elapsed if elapsed > 0 else None,
+        "frame_interval_ms_p95": float(np.percentile(frame_intervals, 95) * 1000) if len(frame_intervals) else None,
+        "camera_interval_ms_p95": float(np.percentile(camera_intervals, 95) * 1000) if len(camera_intervals) else None,
+        "add_frame_ms_p95": float(np.percentile(add_durations, 95) * 1000) if add_durations else None,
+        **save_durations,
+        "save_total_s": total_s,
+    }
 
-    for record in find_incomplete_records(root):
-        print(
-            f"警告：发现未完成的 robot_ik 记录 ({record.kind}): "
-            f"{record.path} - {record.detail}",
-            flush=True,
-        )
+
+def _next_capture_deadline(deadline, now, fps):
+    """计算下一次采样节拍；超期时舍弃积压，避免快速补跑重复帧。"""
+    return max(deadline + 1 / fps, now)
 
 
 def main(argv=None, *, mode="record"):
@@ -555,7 +698,6 @@ def main(argv=None, *, mode="record"):
     parser.add_argument("--session-calibration", type=Path)
     parser.add_argument("--tcp-axis-length-m", type=float, default=0.08)
     parser.add_argument("--rig-config", type=Path, default=Path("configs/rig.yaml"))
-    parser.add_argument("--robot", choices=["rm75b"], default="rm75b")
     parser.add_argument("--side", choices=["right"], default="right")
     parser.add_argument("--fps", type=int, choices=[30], default=30)
     parser.add_argument(
@@ -567,40 +709,25 @@ def main(argv=None, *, mode="record"):
     parser.add_argument("--task", default="UMI demonstration")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--num-episodes", type=int, default=0)
-    parser.add_argument("--no-preview", action="store_true")
+    preview_options = parser.add_mutually_exclusive_group()
+    preview_options.add_argument("--no-preview", action="store_true")
+    preview_options.add_argument(
+        "--spatial-view", action="store_true",
+        help="在三维预览中显示相机视锥和去畸变画面（默认关闭）",
+    )
     if mode == "record":
+        parser.add_argument(
+            "--encoder", choices=("auto", "cpu", "gpu"), default="auto",
+            help="视频编码策略：自动优先硬件、CPU 或仅 GPU（默认 auto）",
+        )
         parser.add_argument(
             "--overwrite", type=_overwrite_arg, default=True, metavar="{true,false}",
             help="默认 true：删除整个已有输出目录；false：目录存在时报错。--resume 忽略此开关并追加。",
         )
         parser.add_argument("--dry-run", action="store_true", help="仅展示录制计划，不修改目录或连接硬件。")
-        parser.add_argument(
-            "--robot-preview",
-            action="store_true",
-            help="启用 RM75B IK 预览和逐帧附加记录；仅 Vive 录制可用。",
-        )
-        parser.add_argument(
-            "--robot-tool-calibration",
-            type=Path,
-            help="法兰 Link7 中的工具 TCP 标定 YAML（T_end_tcp）。",
-        )
-        parser.add_argument(
-            "--robot-position-tolerance-m",
-            type=_positive_finite_float,
-            default=None,
-            help="机器人 IK 有效位置误差上限（米，默认 0.01）。",
-        )
-        parser.add_argument(
-            "--robot-orientation-tolerance-deg",
-            type=_positive_finite_float,
-            default=None,
-            help="机器人 IK 有效姿态误差上限（度，默认 5）。",
-        )
     args = parser.parse_args(argv)
     if not np.isfinite(args.tcp_axis_length_m) or args.tcp_axis_length_m <= 0:
         parser.error("--tcp-axis-length-m 必须为正的有限数值")
-    if mode == "record":
-        _validate_robot_options(parser, args)
     explicit_session = args.session_calibration is not None
     args.calibration, args.session_calibration = calibration_paths(args)
     snapshot = verify(
@@ -622,73 +749,58 @@ def main(argv=None, *, mode="record"):
             recording_metadata = validate_resume_target(args.output_dir, recording_metadata)
         except ValueError as exc:
             parser.error(str(exc))
-    robot_tool = None
-    robot_thresholds = None
-    robot_setup = None
-    if mode == "record" and args.robot_preview:
-        try:
-            robot_tool, robot_thresholds = _validate_robot_calibration(args)
-            if not args.dry_run:
-                robot_setup = _prepare_robot_preview(
-                    args, robot_tool, robot_thresholds
-                )
-        except Exception as exc:
-            parser.error(f"机器人预览预检失败：{exc}")
     if mode == "record":
         _check_output_directory(args)
         operation = "resume" if args.resume else (
             "overwrite entire directory" if args.output_dir.exists() else "new dataset"
         )
         print(f"Recording plan: {args.output_dir} ({operation})")
-        if args.robot_preview:
-            print(
-                "Robot preview: "
-                f"tool={args.robot_tool_calibration}, "
-                f"pos<={robot_thresholds.max_position_error_m:.4f} m, "
-                f"rot<={robot_thresholds.max_orientation_error_deg:.3f} deg"
-            )
         if args.dry_run:
             return
         _prepare_output_directory(args)
-        if args.robot_preview:
-            _warn_incomplete_robot_ik(args.output_dir)
     dataset = None
     recording = False
-    previous_sequence = None
+    previous_recorded_sequence = None  # 仅跟踪本段成功写入的真实相机帧。
     camera_stalled = False  # 仅在停帧和恢复时提示，避免终端刷屏。
+    camera_waiting_first_frame = False  # 首帧尚不可用时只提示一次。
     saved = 0
+    frame_count = 0
+    frame_times = []  # 每个成功录制帧的主机单调时间。
+    camera_times = []  # 对应相机采集时间，用于计算原始帧间隔。
+    add_durations = []  # 每帧添加至数据集所花时间。
+    save_requested_at = 0.0  # 保存请求时刻，含等待后台线程的时间。
+    encoding_info = {}  # 数据集创建时记录编码器，不在后台保存时读取。
+    last_result = ""
     viewer = None
-    preview = None
-    robot_ik_recorder = None
-    current_episode_index = None
-    robot_ik_cache_failed = False
-    robot_ik_publish_failed = False
-    robot_ik_complete = 0
-    robot_ik_incomplete = 0
     next_preview = 0.0  # 限制显示频率，降低预览传输压力。
+    save_executor = None  # 唯一后台写入线程；仅保存片段时创建。
+    save_future = None  # 未完成或尚未收取结果的保存任务。
+    save_failure = None  # 保存失败优先于清理期间的其他异常。
+    exit_requested = False  # 保存完成后退出，避免中断写入。
+    interrupted = False  # 信号处理器只置位，由采集循环处理。
+    previous_sigint = None
+    if mode == "record" and threading.current_thread() is threading.main_thread():
+        previous_sigint = signal.getsignal(signal.SIGINT)
 
-    def stop_robot_preview(reason):
-        """预览失败只停止显示，不中断原始录制。"""
-        nonlocal preview
-        if preview is None:
-            return
-        print(f"警告：机器人预览已停止（{reason}）；原始录制继续。", flush=True)
-        try:
-            preview.close()
-        except Exception as exc:
-            print(f"警告：机器人预览关闭失败：{exc}", flush=True)
-        preview = None
+        def request_interrupt(signum, frame):
+            """延迟处理中断，确保提交任务及清理期间不会打断数据集写入。"""
+            nonlocal interrupted
+            interrupted = True
+
+        signal.signal(signal.SIGINT, request_interrupt)
 
     try:
+        spatial_preview = None
+        if args.spatial_view:
+            from handumi.scripts._umi_spatial_preview import SpatialCameraPreview
+
+            spatial_preview = SpatialCameraPreview(snapshot)
         viewer = _start_camera_viewer(args, session)
-        if robot_setup is not None:
-            preview = _start_robot_preview(robot_setup, viewer)
-            if not preview.healthy:
-                raise RuntimeError("机器人预览线程未正常启动")
-            robot_ik_recorder = _create_robot_ik_recorder(
-                args.output_dir, robot_setup
-            )
-            print("机器人已就绪：按空格开始录制时启动实时 IK。")
+        # 相机外参在会话内固定，首次初始化后供每次预览复用。
+        tracker_from_camera = (
+            np.asarray(snapshot["tracker_camera"], dtype=float)
+            if viewer is not None else None
+        )
         with (
             NativeUmi(
                 snapshot, session=session,
@@ -700,287 +812,242 @@ def main(argv=None, *, mode="record"):
                 dataset = _open_recording_dataset(
                     args, snapshot, recording_metadata
                 )
+                info = getattr(dataset, "_handumi_encoding", None)
+                if isinstance(info, dict):
+                    encoding_info = info
             print("空格开始/保存；Esc 取消/退出；Ctrl+C 退出。无效帧立即丢弃当前段。")
             deadline = time.monotonic()
             readiness_deadline = deadline + 10
             while True:
-                now = time.monotonic_ns()
-                image, tracking, gripper, target, healthy = devices.sample(now)
-                tracked = bool(getattr(tracking, "right_tracked", False)) and bool(
-                    getattr(tracking, "right_pose_valid", True)
-                )
-                tcp_pose = getattr(tracking, "right_tcp_pose", None) if tracked else None
-                # 附加记录和预览必须使用实际保存图像的采集时间，而不是
-                # NativeUmi 的计划同步目标 target；二者允许存在同步偏差。
-                frame_time_ns = int(image.capture_time_ns)
-                camera_age_s = (time.monotonic_ns() - image.capture_time_ns) / 1e9
-                stalled = camera_age_s > 1.0
-                if stalled and not camera_stalled:
-                    print(
-                        f"相机画面已停更 {camera_age_s:.1f} 秒，当前显示缓存帧；"
-                        "请检查相机 USB 连接及采集线程错误。",
-                        flush=True,
-                    )
-                elif camera_stalled and not stalled:
-                    print("相机画面已恢复更新。", flush=True)
-                camera_stalled = stalled
-                if recording and image.sequence == previous_sequence:
-                    healthy = False
-                was_recording = recording
-                key = read_key()
-                recording, action = transition(recording, key, healthy)
-                if mode != "record":
-                    recording = False
-                if action == "exit":
-                    if dataset is not None and was_recording:
-                        dataset.clear_episode_buffer()
-                    if was_recording and robot_ik_recorder is not None:
-                        robot_ik_recorder.cancel_episode()
-                    if was_recording and preview is not None:
-                        preview.cancel_episode()
-                    break
-
-                if dataset is not None:
-                    if action == "discard":
-                        dataset.clear_episode_buffer()
-                        if robot_ik_recorder is not None:
-                            robot_ik_recorder.cancel_episode()
-                        if preview is not None:
-                            # 使在途结果失效，等待下次录制再建立起点。
-                            preview.cancel_episode()
-                            preview.resume()
-                        print("当前段已丢弃：取消或传感器/同步无效；按空格重新开始。")
-                    elif action == "save":
-                        if preview is not None:
-                            if not preview.pause(timeout_s=2.0):
-                                print(
-                                    "警告：机器人预览未在 2 秒内暂停；"
-                                    "保存仍使用独立 solver 继续。",
-                                    flush=True,
-                                )
-                        robot_ik_publish_failed = False
-                        episode_index = (
-                            current_episode_index
-                            if current_episode_index is not None
-                            else int(dataset.num_episodes)
-                        )
-                        prepared = None
-                        if robot_ik_recorder is not None and not robot_ik_cache_failed:
-                            try:
-                                prepared = robot_ik_recorder.prepare_episode(
-                                    episode_index,
-                                    progress=_print_robot_ik_progress,
-                                )
-                                print()
-                            except Exception as exc:
-                                print(
-                                    "警告：robot_ik 逐帧补算失败，仍保存原始 "
-                                    f"episode：{exc}",
-                                    flush=True,
-                                )
-                                try:
-                                    robot_ik_recorder.cancel_episode()
-                                except Exception:
-                                    pass
-                        elif robot_ik_recorder is not None:
-                            # 缓存期间就失败：本段没有完整逐帧数据，不能补算。
-                            try:
-                                robot_ik_recorder.cancel_episode()
-                            except Exception:
-                                pass
-
-                        try:
-                            dataset.save_episode()
-                        except BaseException:
-                            if prepared is not None and robot_ik_recorder is not None:
-                                robot_ik_recorder.discard_prepared()
-                            elif robot_ik_recorder is not None:
-                                robot_ik_recorder.cancel_episode()
-                            raise
-
-                        saved += 1
-                        published = False
-                        if prepared is not None and robot_ik_recorder is not None:
-                            from handumi.dataset.robot_ik import RobotIkPublishError
-
-                            try:
-                                published_paths = robot_ik_recorder.publish_episode()
-                                published = True
-                                print(
-                                    "robot_ik 附加记录已发布: "
-                                    f"{published_paths.npz_path.name}, "
-                                    f"{published_paths.json_path.name}",
-                                    flush=True,
-                                )
-                            except RobotIkPublishError as exc:
-                                robot_ik_publish_failed = True
-                                recovery = exc.recovery_path or exc.recovery.get(
-                                    "recovery_file"
-                                )
-                                print(
-                                    "警告：原始 episode 已保存，但 robot_ik 附加"
-                                    f"记录发布失败；恢复文件保留: {recovery or '暂存目录'}",
-                                    flush=True,
-                                )
-                                try:
-                                    robot_ik_recorder.release_prepared()
-                                except Exception:
-                                    pass
-                            except Exception as exc:
-                                robot_ik_publish_failed = True
-                                print(
-                                    "警告：原始 episode 已保存，但 robot_ik 附加"
-                                    f"记录发布异常：{exc}",
-                                    flush=True,
-                                )
-                                try:
-                                    robot_ik_recorder.release_prepared()
-                                except Exception:
-                                    pass
-                        elif prepared is not None:
-                            print(
-                                "警告：原始 episode 已保存，但缺少附加记录记录器。",
-                                flush=True,
-                            )
-
-                        record_complete = prepared is not None and published
-                        if args.robot_preview:
-                            if record_complete:
-                                robot_ik_complete += 1
-                            else:
-                                robot_ik_incomplete += 1
-                        if preview is not None:
-                            try:
-                                preview.cancel_episode()
-                                preview.resume()
-                            except Exception as exc:
-                                stop_robot_preview(str(exc))
-                        # 保存可能耗时数秒；重新对齐采集节拍，避免追赶忙循环。
-                        deadline = time.monotonic()
-                        next_preview = 0.0
-                        if args.robot_preview and not record_complete:
-                            print(
-                                f"已保存 {saved} 段（原始数据完整；本段 robot_ik "
-                                "附加记录未完成）"
-                            )
-                        elif robot_ik_publish_failed:
-                            print(
-                                f"已保存 {saved} 段（robot_ik 附加记录未完整发布）"
+                try:
+                    now = time.monotonic_ns()
+                    try:
+                        if recording and previous_recorded_sequence is not None:
+                            image, tracking, gripper, target, healthy = devices.sample(
+                                now, after_sequence=previous_recorded_sequence,
                             )
                         else:
-                            print(f"已保存 {saved} 段")
-                        if args.num_episodes > 0 and saved >= args.num_episodes:
+                            image, tracking, gripper, target, healthy = devices.sample(now)
+                    except CameraFrameUnavailable:
+                        if not camera_waiting_first_frame:
+                            print("相机尚无画面，正在等待并自动尝试恢复。", flush=True)
+                            camera_waiting_first_frame = True
+                        key = read_key()
+                        if interrupted or key in {"\x1b", "\x03"}:
                             break
-                    elif recording:
-                        frame = assemble_frame(
-                            image,
-                            tracking,
-                            gripper,
-                            target,
-                            time.monotonic_ns(),
-                            args.task,
+                        if mode == "doctor" and time.monotonic() > readiness_deadline:
+                            raise RuntimeError("10 秒内相机未提供画面，请检查 USB 连接")
+                        continue
+                    camera_waiting_first_frame = False
+                    camera_age_s = (time.monotonic_ns() - image.capture_time_ns) / 1e9
+                    # NativeUmi 留下与健康判定相同的一次检查结果；可注入设备按相同规则计算。
+                    health = getattr(devices, "last_health", None)
+                    if health is None:
+                        health = capture_health(
+                            image, tracking, gripper, target,
+                            gripper.sample_time_ns, image.capture_time_ns + round(camera_age_s * 1e9),
                         )
-                        dataset.add_frame(frame)
-                        current_episode_index = (
-                            int(dataset.num_episodes)
-                            if current_episode_index is None
-                            else current_episode_index
+                    stalled = camera_age_s > 1.0
+                    if stalled and not camera_stalled:
+                        print(
+                            f"相机画面已停更 {camera_age_s:.1f} 秒，当前显示缓存帧；"
+                            "正在尝试自动重连，请检查相机 USB 连接。",
+                            flush=True,
                         )
-                        if action == "start":
-                            current_episode_index = int(dataset.num_episodes)
-                            robot_ik_cache_failed = False
-                            if robot_ik_recorder is not None:
-                                try:
-                                    robot_ik_recorder.begin_episode()
-                                except Exception as exc:
-                                    print(
-                                        "警告：robot_ik 片段缓存未能开始，本段"
-                                        f"不生成附加记录：{exc}",
-                                        flush=True,
-                                    )
-                                    robot_ik_recorder = None
-                                    robot_ik_cache_failed = True
-                            if (
-                                preview is not None
-                                and preview.healthy
-                            ):
-                                try:
-                                    preview.begin_episode(tcp_pose, frame_time_ns)
-                                except Exception as exc:
-                                    stop_robot_preview(str(exc))
-                        if robot_ik_recorder is not None:
-                            try:
-                                robot_ik_recorder.add_frame(
-                                    frame_time_ns / 1e9,
-                                    tcp_pose,
-                                    tracked=tracked,
-                                )
-                            except Exception as exc:
-                                robot_ik_cache_failed = True
-                                print(
-                                    "警告：robot_ik 逐帧缓存失败，本段将只保存"
-                                    f"原始 episode：{exc}",
-                                    flush=True,
-                                )
-                        if (
-                            preview is not None
-                            and preview.healthy
-                            and action != "start"
-                        ):
-                            try:
-                                preview.submit(frame_time_ns, tcp_pose, tracked=tracked)
-                            except Exception as exc:
-                                stop_robot_preview(str(exc))
-                previous_sequence = image.sequence
-                if viewer is not None and time.monotonic() >= next_preview:
-                    log_live_preview(
-                        viewer, image, tracking, gripper, healthy, camera_age_s,
-                        args.tcp_axis_length_m,
+                    elif camera_stalled and not stalled:
+                        print("相机画面已恢复更新。", flush=True)
+                    camera_stalled = stalled
+                    duplicate_frame = (
+                        recording and previous_recorded_sequence is not None
+                        and image.sequence <= previous_recorded_sequence
                     )
-                    next_preview = time.monotonic() + 1 / 15
-                if mode == "doctor":
-                    print(
-                        f"Tracker={tracking.right_tracked}; ArUco={gripper.valid}; synchronized={healthy}"
-                    )
-                    if healthy:
+                    if duplicate_frame:
+                        healthy = False
+                    was_recording = recording
+                    key = read_key()
+                    if interrupted:
+                        key = "\x03"
+                        interrupted = False
+                    saving_at_key = save_future is not None
+                    if saving_at_key:
+                        # 保存开始后消费空格，完成当轮也不能把它当成下一段开始。
+                        if key in {"\x1b", "\x03"}:
+                            exit_requested = True
+                            next_preview = 0.0
+                            print("正在保存，完成后退出。", flush=True)
+                        action = "wait"
+                        recording = False
+                        if save_future.done():
+                            completed = save_future
+                            save_future = None
+                            try:
+                                save_durations = completed.result()
+                            except BaseException as exc:
+                                save_failure = exc
+                                raise RuntimeError(f"保存当前段失败：{exc}") from exc
+                            saved += 1
+                            metrics = _capture_metrics(
+                                frame_times, camera_times, add_durations, save_durations,
+                                time.monotonic() - save_requested_at,
+                            )
+                            metrics.update(encoding_info)
+                            print("录制性能：" + json.dumps(metrics, ensure_ascii=False), flush=True)
+                            last_result = f"已保存 {frame_count} 帧"
+                            frame_count = 0
+                            next_preview = 0.0
+                            print(f"已保存 {saved} 段")
+                            if args.num_episodes > 0 and saved >= args.num_episodes:
+                                exit_requested = True
+                    else:
+                        recording, action = transition(recording, key, healthy)
+                    if mode != "record":
+                        recording = False
+                    if action == "exit":
+                        if dataset is not None and was_recording:
+                            dataset.clear_episode_buffer()
                         break
-                    if time.monotonic() > readiness_deadline:
-                        raise RuntimeError(
-                            "10 秒内设备未达到可录制状态，请检查 Tracker、双标签和同步"
+
+                    status = dict(
+                        mode=mode, health=health, tracking=tracking, gripper=gripper,
+                        healthy=healthy, duplicate_frame=duplicate_frame,
+                        recording=recording, frame_count=frame_count, fps=args.fps,
+                        saved=saved, last_result=last_result,
+                        camera_status=getattr(getattr(devices, "camera", None), "status", None),
+                    )
+                    if dataset is not None:
+                        if action == "start":
+                            frame_count = 0
+                            previous_recorded_sequence = None
+                            frame_times.clear()
+                            camera_times.clear()
+                            add_durations.clear()
+                            last_result = ""
+                        if action == "discard":
+                            dataset.clear_episode_buffer()
+                            previous_recorded_sequence = None
+                            causes = _capture_issues(health, duplicate_frame)
+                            last_result = "当前段已丢弃：" + (
+                                "；".join(causes) if not healthy and causes
+                                else "采集状态无效" if not healthy else "用户取消"
+                            )
+                            frame_count = 0
+                            print(f"{last_result}；按空格重新开始。", flush=True)
+                        elif action == "save":
+                            previous_recorded_sequence = None
+                            save_requested_at = time.monotonic()
+                            if viewer is not None:
+                                status.update(recording=True, saving=True)
+                                log_capture_status(viewer, **status)
+                                viewer.flush()
+                            if save_executor is None:
+                                save_executor = ThreadPoolExecutor(max_workers=1)
+                            save_future = save_executor.submit(_save_streaming_episode, dataset, frame_count)
+                        elif recording:
+                            frame = assemble_frame(
+                                image, tracking, gripper, target,
+                                time.monotonic_ns(), args.task,
+                            )
+                            add_start = time.monotonic()
+                            dataset.add_frame(frame)
+                            add_end = time.monotonic()
+                            previous_recorded_sequence = image.sequence
+                            frame_times.append(now / 1e9)
+                            camera_times.append(image.capture_time_ns / 1e9)
+                            add_durations.append(add_end - add_start)
+                            frame_count += 1
+                    if viewer is not None and (
+                        time.monotonic() >= next_preview or action in {"start", "save", "discard"}
+                    ):
+                        status.update(
+                            recording=recording, saving=save_future is not None,
+                            exit_requested=exit_requested, frame_count=frame_count,
+                            saved=saved, last_result=last_result,
                         )
-                deadline += 1 / 30
-                time.sleep(max(0, deadline - time.monotonic()))
+                        log_capture_status(viewer, **status)
+                        log_live_preview(
+                            viewer, image, tracking, gripper, healthy, camera_age_s,
+                            args.tcp_axis_length_m, session=session,
+                            tracker_from_camera=tracker_from_camera,
+                        )
+                        if spatial_preview is not None:
+                            spatial_preview.log(viewer, image, tracking, camera_age_s)
+                        next_preview = time.monotonic() + 1 / 15
+                    if exit_requested and save_future is None:
+                        if viewer is not None:
+                            viewer.flush()
+                        break
+                    if mode == "doctor":
+                        print(
+                            f"Tracker={tracking.right_tracked}; ArUco={gripper.valid}; synchronized={healthy}"
+                        )
+                        if healthy:
+                            break
+                        if time.monotonic() > readiness_deadline:
+                            raise RuntimeError(
+                                "10 秒内设备未达到可录制状态，请检查 Tracker、双标签和同步"
+                            )
+                    loop_end = time.monotonic()
+                    deadline = _next_capture_deadline(deadline, loop_end, 30)
+                    time.sleep(max(0, deadline - loop_end))
+                except KeyboardInterrupt:
+                    # 兼容显式抛出的中断；真正的 SIGINT 由处理器置位。
+                    if save_future is not None:
+                        exit_requested = True
+                        next_preview = 0.0
+                        print("正在保存，完成后退出。", flush=True)
+                        continue
+                    if recording and dataset is not None:
+                        dataset.clear_episode_buffer()
+                        recording = False
+                    break
     finally:
-        if preview is not None:
-            try:
-                preview.close()
-            except Exception as exc:
-                print(f"警告：机器人预览关闭失败：{exc}", flush=True)
-            preview = None
-        if getattr(args, "robot_preview", False):
-            print(
-                "robot_ik 附加记录摘要："
-                f"完整 {robot_ik_complete} 段，未完成 {robot_ik_incomplete} 段",
-                flush=True,
-            )
-        if dataset is not None:
-            if recording:
-                dataset.clear_episode_buffer()
-            if robot_ik_recorder is not None:
+        # 保存完成前不得关闭或修改数据集；逐项收尾并保留首个异常。
+        active_error = sys.exception()
+        cleanup_error = None
+        try:
+            if save_future is not None:
+                while True:
+                    try:
+                        save_future.result()
+                        break
+                    except KeyboardInterrupt as exc:
+                        if save_future.done():
+                            save_failure = exc
+                            break
+                        continue
+                    except BaseException as exc:
+                        save_failure = exc
+                        break
+            if save_executor is not None:
+                try:
+                    save_executor.shutdown(wait=True)
+                except BaseException as exc:
+                    cleanup_error = exc
+            if dataset is not None:
                 if recording:
-                    robot_ik_recorder.cancel_episode()
-                elif robot_ik_recorder.prepared is not None:
-                    # 原始 episode 已经或可能已保存；保留暂存/恢复文件，
-                    # 让启动检查或人工恢复处理。finally 不得删除它们。
-                    robot_ik_recorder.release_prepared()
-            try:
-                dataset.finalize()
-                path = args.output_dir / "meta/info.json"
-                info = json.loads(path.read_text())
-                info["handumi"] = recording_metadata
-                path.write_text(json.dumps(info, indent=2) + "\n")
-            finally:
-                if viewer is not None:
+                    try:
+                        dataset.clear_episode_buffer()
+                    except BaseException as exc:
+                        cleanup_error = cleanup_error or exc
+                try:
+                    dataset.finalize()
+                    path = args.output_dir / "meta/info.json"
+                    info = json.loads(path.read_text())
+                    info["handumi"] = recording_metadata
+                    path.write_text(json.dumps(info, indent=2) + "\n")
+                except BaseException as exc:
+                    cleanup_error = cleanup_error or exc
+            if viewer is not None:
+                try:
                     viewer.disconnect()
-        elif viewer is not None:
-            viewer.disconnect()
+                except BaseException as exc:
+                    cleanup_error = cleanup_error or exc
+        finally:
+            if previous_sigint is not None:
+                signal.signal(signal.SIGINT, previous_sigint)
+        if save_failure is not None and not (
+            isinstance(active_error, RuntimeError) and active_error.__cause__ is save_failure
+        ):
+            raise RuntimeError(f"保存当前段失败：{save_failure}") from save_failure
+        if active_error is None and cleanup_error is not None:
+            raise cleanup_error

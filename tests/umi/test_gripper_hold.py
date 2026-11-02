@@ -2,6 +2,8 @@
 
 import json
 import time
+from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,6 +15,7 @@ from handumi.feetech import diagnostics
 from handumi.grippers.base import VisualGripperProvider
 from handumi.scripts import umi_capture
 from handumi.scripts.umi_capture import NativeUmi, transition
+from handumi.tracking.base import ControllerPairSample
 
 FRAME = np.zeros((2, 2, 3), dtype=np.uint8)
 T0 = 1_000_000_000
@@ -272,7 +275,7 @@ class _QueueCamera:
     def __init__(self, samples):
         self._samples = list(samples)
 
-    def sample_at(self, target_time_ns):
+    def sample_at(self, target_time_ns, *, after_sequence=None):
         """忽略目标时间，直接返回下一帧。"""
         return self._samples.pop(0)
 
@@ -449,3 +452,108 @@ def test_invalid_gripper_hold_rejected_before_startup(tmp_path, monkeypatch):
             ])
         assert error.value.code == 2
     assert not dataset.exists()
+
+
+@pytest.mark.parametrize("expired", [False, True], ids=["save-held", "discard-expired"])
+def test_record_loop_saves_held_frames_and_discards_expired(
+    tmp_path, monkeypatch, expired
+):
+    """真实录制循环写入保持值，期限边界可保存，超期时优先丢段。"""
+    calibration = tmp_path / "calibration.yaml"
+    calibration.write_text("{}")
+    output = tmp_path / "dataset"
+    snapshot = {
+        "serial": "synthetic", "camera_device": "synthetic",
+        "resolution": [2, 2], "fps": 30, "fourcc": "MJPG",
+        "tracker_tcp": np.eye(4).tolist(), "time": None,
+    }
+    estimator = Mock()
+    estimator.estimate.side_effect = [_estimate(0.6), None, None, _estimate(0.2)]
+    stamps = [T0, T0 + 100_000_000, T0 + HOLD_NS + int(expired), T0 + 600_000_000]
+    samples = [CameraSample(FRAME, stamp, i + 1) for i, stamp in enumerate(stamps)]
+    tracking = replace(
+        ControllerPairSample.empty("vive"), right_tracked=True, right_pose_valid=True
+    )
+    real_native = NativeUmi
+
+    class SyntheticUmi(real_native):
+        """仅替换硬件和采样时刻，保留开度估计及健康判断的完整调用链。"""
+
+        def __init__(self, snapshot, **kwargs):
+            """使用预置图像、有效 Tracker 和真实视觉开度提供者。"""
+            camera = _QueueCamera(samples)
+            camera.connect = lambda: None
+            camera.disconnect = lambda: None
+            tracker = SimpleNamespace(
+                error=None, start=lambda: None, stop=lambda: None,
+                sample_at=lambda _: tracking,
+            )
+            super().__init__(snapshot, tracker=tracker, camera=camera, **kwargs)
+
+        def sample(self, now_ns=None, *, after_sequence=None):
+            """将录制时刻固定到下一图像之后 150 毫秒，隔离测试运行速度。"""
+            now_ns = self.camera._samples[0].capture_time_ns + 150_000_000
+            return super().sample(now_ns, after_sequence=after_sequence)
+
+    dataset = Mock()
+    frames, added, saved, discarded = [], [], [], []
+
+    def add_frame(frame):
+        """同时记录已写入帧及当前缓冲，便于检查丢段前的保持值。"""
+        frames.append(frame)
+        added.append(frame)
+
+    def save_episode():
+        """保存当前片段并清空缓冲。"""
+        saved.append(frames.copy())
+        frames.clear()
+
+    def discard_episode():
+        """记录丢弃的帧，验证没有保存部分片段。"""
+        discarded.append(frames.copy())
+        frames.clear()
+
+    def open_dataset(*args):
+        """提供主循环最终写回元数据所需的文件。"""
+        (output / "meta").mkdir(parents=True)
+        (output / "meta/info.json").write_text("{}")
+        return dataset
+
+    @contextmanager
+    def keyboard():
+        """依次开始、继续、请求保存、退出；超时必须优先于保存。"""
+        keys = iter([" ", "", " ", "\x1b"])
+        yield lambda: next(keys)
+
+    dataset.add_frame.side_effect = add_frame
+    dataset.save_episode.side_effect = save_episode
+    dataset.clear_episode_buffer.side_effect = discard_episode
+    monkeypatch.setattr(umi_capture, "verify", lambda *a, **k: snapshot)
+    monkeypatch.setattr(umi_capture, "load_session", lambda *a, **k: None)
+    monkeypatch.setattr(umi_capture, "metadata", lambda *a: {})
+    monkeypatch.setattr(umi_capture, "estimator", lambda _: estimator)
+    monkeypatch.setattr(umi_capture, "NativeUmi", SyntheticUmi)
+    monkeypatch.setattr(umi_capture, "keyboard", keyboard)
+    monkeypatch.setattr(
+        umi_capture, "_prepare_streaming_episode",
+        lambda *_: {"encoder_flush_s": 0.0, "video_verify_s": 0.0},
+    )
+    monkeypatch.setattr(umi_capture, "_open_recording_dataset", open_dataset)
+    monkeypatch.setattr(umi_capture.time, "sleep", lambda _: None)
+    umi_capture.main([
+        "--calibration", str(calibration), "--output-dir", str(output),
+        "--rig-config", str(tmp_path / "missing-rig.yaml"), "--no-preview",
+    ])
+
+    assert len(added) == 2
+    held = added[1]
+    assert held["observation.gripper.right.normalized"].item() == pytest.approx(0.6)
+    assert held["observation.gripper.right.valid"].item() == 1
+    assert held["observation.gripper.right.sequence"].item() == 2
+    assert held["observation.gripper.right.sample_time_ns"].item() == stamps[1]
+    assert len(saved) == int(not expired)
+    assert len(discarded) == int(expired)
+    assert len((discarded if expired else saved)[0]) == 2
+    assert not frames
+    assert estimator.estimate.call_count == 4
+    dataset.finalize.assert_called_once()
