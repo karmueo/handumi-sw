@@ -18,7 +18,7 @@ from handumi.dataset.episode_solve_cache import (
 from handumi.scripts.replay.replay_progress import report
 
 # 变更求解语义或缓存身份规则时提高版本；桌面和机器人几何仍按内容摘要。
-SOLVE_CACHE_ALGORITHM = "replay-complete-v1"
+SOLVE_CACHE_ALGORITHM = "replay-complete-v3-mesh-collision"
 _SOURCE_META_KEYS = (
     "tracking_schema",
     "capture_schema",
@@ -202,6 +202,8 @@ def episode_identity(
     code_files = (
         "robots/kinematics.py",
         "robots/registry.py",
+        "robots/mesh_surface_audit.py",
+        "robots/self_collision.py",
         "robots/utils.py",
         "retargeting/handumi_to_robot.py",
         "retargeting/base_placement.py",
@@ -209,13 +211,34 @@ def episode_identity(
         "scripts/replay/replay_prepare.py",
     )
     dependencies = {}
-    for name in ("numpy", "scipy", "jax", "jaxlib", "pyroki", "jaxls", "yourdfpy"):
+    for name in ("numpy", "scipy", "jax", "jaxlib", "pyroki", "jaxls", "yourdfpy", "trimesh", "rtree"):
         try:
             dependencies[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             dependencies[name] = None
+    collision_meshes = None
+    if args.robot == "rm75b" and config.ik_weights.collision_enabled:
+        import yourdfpy
+
+        from handumi.robots.registry import yourdfpy_handler
+
+        resolver = yourdfpy_handler(config.pkg_root)
+        urdf = yourdfpy.URDF.load(str(config.urdf), filename_handler=resolver, load_meshes=False)
+        names = sorted({
+            collision.geometry.mesh.filename
+            for link in urdf.robot.links for collision in link.collisions
+            if collision.geometry is not None and collision.geometry.mesh is not None
+        })
+        collision_meshes = {name: digest_file(resolver(name)) for name in names}
+        if not collision_meshes or any(value is None for value in collision_meshes.values()):
+            raise SystemExit("RM75B collision mesh missing; cannot validate replay cache.")
+    settings = {name: getattr(args, name, None) for name in _SETTING_KEYS}
+    if args.robot == "rm75b" and config.ik_weights.collision_enabled:
+        # 接近段碰撞会改变摆放搜索结果及失败原因，必须区分缓存身份。
+        settings["approach_seconds"] = args.approach_seconds
     payload = {
         "algorithm": SOLVE_CACHE_ALGORITHM,
+        "collision_meshes": collision_meshes,
         "base_algorithm": ALGORITHM_VERSION,
         "code": {name: digest_file(code_root / name) for name in code_files},
         "dependencies": dependencies,
@@ -233,7 +256,7 @@ def episode_identity(
         ),
         "mode": mode,
         "device": device,
-        "settings": {name: getattr(args, name, None) for name in _SETTING_KEYS},
+        "settings": settings,
         "metadata": {name: metadata.get(name) for name in _SOURCE_META_KEYS},
         "source_calibration": source,
         "deployment": deployment,
@@ -313,6 +336,32 @@ def _strict_gate(
         print(f"[replay] warning: {message}")
 
 
+def _valid_collision_summary(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> bool:
+    """验证 RM75B 缓存的碰撞认证版本及关节序列摘要。"""
+    if args.robot != "rm75b":
+        return True
+    from handumi.robots.registry import load_robot_config
+    from handumi.robots.self_collision import (
+        COLLISION_VALIDATION_VERSION,
+        GRIPPER_BOX_VALIDATION_VERSION,
+    )
+
+    if not load_robot_config(args.robot).ik_weights.collision_enabled:
+        return True
+    try:
+        version = (GRIPPER_BOX_VALIDATION_VERSION if args.retarget_mode == "absolute-tcp"
+                   else COLLISION_VALIDATION_VERSION)
+        return (str(rollout["self_collision_validation"].item()) == version
+                and str(rollout["self_collision_qpos_sha256"].item())
+                == array_digest(rollout["qpos"])["sha256"]
+                and np.asarray(rollout["self_collision_min_links"]).shape == (2,)
+                and np.isfinite(rollout["self_collision_min_sampled_m"]).all()
+                and float(rollout["self_collision_min_sampled_m"].item())
+                >= load_robot_config(args.robot).ik_weights.self_collision_margin)
+    except (KeyError, ValueError, TypeError):
+        return False
+
+
 def _finish_rollout(
     args: argparse.Namespace, rollout: dict[str, np.ndarray], *, cached: bool = False
 ) -> dict[str, np.ndarray]:
@@ -328,6 +377,42 @@ def _finish_rollout(
         frames=int(round(float(rollout["fps"][0]) * args.approach_seconds)),
     )
     rollout["retarget_mode_requested"] = np.asarray([str(args.retarget_mode)])
+    if args.robot == "rm75b" and config.ik_weights.collision_enabled:
+        from handumi.robots.registry import load_embodiment
+        from handumi.robots.self_collision import (
+            CollisionChecker,
+            GripperBoxCollisionChecker,
+            require_clear,
+        )
+
+        if not _valid_collision_summary(args, rollout):
+            raise SystemExit("Missing or invalid RM75B self-collision validation summary.")
+        if str(rollout["retarget_mode"].item()) == "absolute-tcp":
+            runtime = load_embodiment(args.robot, collision_kind="gripper-box")
+        else:
+            runtime = load_embodiment(args.robot)
+        solver = runtime.solver_cls()
+        urdf = runtime.load_urdf()
+        if str(rollout["retarget_mode"].item()) == "absolute-tcp":
+            checker = GripperBoxCollisionChecker(
+                runtime.robot, solver.robot_collision, urdf,
+                config.ik_weights.self_collision_margin,
+            )
+        else:
+            checker = CollisionChecker(runtime.robot, solver.robot_collision,
+                                       urdf, config.ik_weights.self_collision_margin)
+        if args.approach_seconds > 0 or str(rollout["retarget_mode"].item()) != "absolute-tcp":
+            require_clear(checker.check_pose(config.home_q), phase="home", frame="home")
+        qpos = rollout["qpos"]
+        require_clear(checker.check_pose(qpos[0]), phase="cached pose", frame=int(rollout["frame_indices"][0]))
+        for index in range(1, len(qpos)):
+            require_clear(checker.check_segment(qpos[index - 1], qpos[index]),
+                          phase="cached motion", frame=int(rollout["frame_indices"][index]))
+        if len(rollout["approach_qpos"]):
+            path = [config.home_q, *rollout["approach_qpos"], qpos[0]]
+            for index in range(1, len(path)):
+                require_clear(checker.check_segment(path[index - 1], path[index]),
+                              phase="approach", frame=index)
     _strict_gate(args, rollout, warn=cached)
     return rollout
 
@@ -348,7 +433,7 @@ def load_prepared_episode(args: argparse.Namespace) -> dict[str, np.ndarray] | N
             f"[replay] cached deterministic failure episode={args.episode} key={key[:12]}"
         )
         raise SystemExit(failure)
-    if cached is None or not _valid_rollout(cached):
+    if cached is None or not _valid_rollout(cached) or not _valid_collision_summary(args, cached):
         return None
     print(f"[replay] cache hit episode={args.episode} key={key[:12]}")
     return _finish_rollout(args, cached, cached=True)
@@ -383,7 +468,8 @@ def prepare_episode(
             f"[replay] cached deterministic failure episode={args.episode} key={key[:12]}"
         )
         raise SystemExit(failure)
-    was_hit = cached is not None and _valid_rollout(cached)
+    was_hit = (cached is not None and _valid_rollout(cached)
+               and _valid_collision_summary(args, cached))
     if was_hit:
         report(args, "cache_hit")
         print(f"[replay] cache hit episode={args.episode} key={key[:12]}")
@@ -410,8 +496,8 @@ def prepare_episode(
                 except (Exception, SystemExit) as error:
                     print(f"[replay] cache write skipped: {error}")
             raise
-        if not _valid_rollout(rollout):
-            raise SystemExit("Solver returned an invalid or incomplete replay rollout.")
+        if not _valid_rollout(rollout) or not _valid_collision_summary(args, rollout):
+            raise SystemExit("Solver returned an invalid or incomplete replay rollout or collision validation summary.")
         # 求解结束后再次检查实际输入和标定，避免并发修改污染旧内容键。
         report(args, "缓存复验与写入")
         try:

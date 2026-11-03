@@ -13,7 +13,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any
 
-_RUNTIME_CACHE: dict[tuple[str, str, str], Any] = {}
+_RUNTIME_CACHE: dict[tuple[str, str, str, str], Any] = {}
 _PROGRESS_EVENTS = None
 
 
@@ -75,10 +75,14 @@ def _runtime_for(args, identity):
         args.robot,
         str(identity["robot_config_sha256"]),
         str(identity["urdf_sha256"]),
+        str(args.robot == "rm75b" and args.retarget_mode == "absolute-tcp"),
     )
     if key not in _RUNTIME_CACHE:
         _RUNTIME_CACHE.clear()
-        _RUNTIME_CACHE[key] = load_embodiment(args.robot)
+        if args.robot == "rm75b" and args.retarget_mode == "absolute-tcp":
+            _RUNTIME_CACHE[key] = load_embodiment(args.robot, collision_kind="gripper-box")
+        else:
+            _RUNTIME_CACHE[key] = load_embodiment(args.robot)
     return _RUNTIME_CACHE[key]
 
 

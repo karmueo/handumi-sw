@@ -40,6 +40,8 @@ class KinematicsConfig:
     # cost to left_*-vs-right_* pairs (intra-arm safety is the vendor's joint
     # limits' job) -- a large solve-time saving for bimanual robots.
     self_collision_pairs: str = "all"
+    # 启用时每次 IK 都纳入碰撞代价，不根据上一帧距离跳过。
+    self_collision_always: bool = False
     # Frames whose capsules all clear the margins by this distance skip the
     # collision costs entirely and use the legacy fast solve. Soft bound: a
     # commanded step could theoretically close more than this in one frame,
@@ -422,6 +424,8 @@ class BimanualKinematicsSolver:
         """
         if self.robot_collision is None or self._collision_gate is None:
             return False
+        if self.config.self_collision_always:
+            return True
         self_min = self._collision_gate(jnp.asarray(q_prev))
         return float(self_min) <= self.config.collision_activation_distance
 

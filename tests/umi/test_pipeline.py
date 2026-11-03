@@ -143,7 +143,23 @@ def test_record_reader_quality_roundtrip(capture, table_setup):
     assert validate_episode(episode.states, fps=30, signals=episode.signals).accepted
 
 
-def test_rm75_replay_and_conversion(capture, tmp_path):
+@pytest.fixture
+def no_collision_for_motion_tests(monkeypatch):
+    """仅对既有运动学及转换测试隔离 home 的保守碰撞包络。"""
+    from handumi.scripts.replay import replay_in_sim as replay
+
+    original = replay.load_embodiment
+
+    def load_for_test(name):
+        """禁用该测试运行时的碰撞代价与验收。"""
+        runtime = original(name)
+        weights = replace(runtime.config.ik_weights, self_collision_weight=0.0)
+        return replace(runtime, config=replace(runtime.config, ik_weights=weights))
+
+    monkeypatch.setattr(replay, "load_embodiment", load_for_test)
+
+
+def test_rm75_replay_and_conversion(capture, tmp_path, no_collision_for_motion_tests):
     """同一片段通过实际 IK 转换后仍保持七轴与独立开度。"""
     from handumi.dataset.canonical import canonicalize_joint_trajectory
     from handumi.dataset.writer import EpisodeResult, write_dataset
@@ -154,7 +170,8 @@ def test_rm75_replay_and_conversion(capture, tmp_path):
     runtime = load_embodiment("rm75b")
     assert runtime.active_sides == ("right",)
     assert len(runtime.joint_names) == 7
-    assert len(runtime.load_urdf(load_meshes=True).scene.geometry) == 8
+    urdf = runtime.load_urdf(load_meshes=True)
+    assert {"gripper_link", "gripper_left_finger_link", "gripper_right_finger_link"} <= set(urdf.link_map)
     args = replay.build_parser().parse_args(
         [str(capture), "--robot", "rm75b", "--retarget-mode", "local-relative"]
     )
@@ -199,7 +216,7 @@ def test_rm75_replay_and_conversion(capture, tmp_path):
     )
 
 
-def test_convert_command_uses_source_tool_calibration(capture, tmp_path, monkeypatch):
+def test_convert_command_uses_source_tool_calibration(capture, tmp_path, monkeypatch, no_collision_for_motion_tests):
     """真实转换入口读取 UMI 工具标定并保留相邻帧的夹爪开度。"""
     import pandas as pd
 
@@ -303,7 +320,7 @@ def test_table_record_preserves_raw_transform_and_auto_mode(capture):
     assert replay._resolved_retarget_mode(args, info) == "local-relative"
 
 
-def test_legacy_vive_dataset_without_tcp_column_reads_and_converts(capture, tmp_path):
+def test_legacy_vive_dataset_without_tcp_column_reads_and_converts(capture, tmp_path, no_collision_for_motion_tests):
     """旧 Vive 格式缺少 TCP 列及声明时仍可读取并经真实转换入口处理。"""
     import shutil
 
@@ -465,3 +482,31 @@ def test_real_streaming_new_cancel_and_rerecord(tmp_path, table_setup):
     with av.open(str(videos[0])) as container:
         assert sum(1 for _ in container.decode(video=0)) == 12
     assert not list(root.glob("tmp*/*_streaming.mp4"))
+
+
+def test_rm75_default_replay_certifies_home_and_checks_motion(capture, monkeypatch):
+    """真实 home 精细复核通过，后续不安全运动仍必须拒绝。"""
+    from handumi.robots.self_collision import CollisionChecker, CollisionResult
+    from handumi.scripts.replay import replay_in_sim as replay
+
+    checked_home = []
+    original = CollisionChecker.check_pose
+
+    def observe_pose(self, q):
+        """保留真实 home 检查并记录通过结果。"""
+        result = original(self, q)
+        if not checked_home:
+            checked_home.append(result.safe)
+        return result
+
+    monkeypatch.setattr(CollisionChecker, "check_pose", observe_pose)
+    monkeypatch.setattr(CollisionChecker, "check_segment", lambda self, a, b:
+                        CollisionResult(False, .009, ("Link2", "gripper_link"), "test motion"))
+    args = replay.build_parser().parse_args(
+        [str(capture), "--robot", "rm75b", "--retarget-mode", "local-relative",
+         "--max-frames", "2", "--approach-seconds", "0"]
+    )
+    args.repo_id, args.dataset_root = "local/umi-test", capture
+    with pytest.raises(SystemExit, match="interpolated motion.*Link2/gripper_link"):
+        replay.solve_episode(args)
+    assert checked_home == [True]

@@ -68,6 +68,14 @@ def test_vive_local_relative_preserves_world_motion(monkeypatch):
             "--strict-ik",
         ]
     )
+    # 设备坐标映射测试隔离真实 home 的保守碰撞包络。
+    from dataclasses import replace
+    runtime = replay.load_embodiment("rm75b")
+    args._episode_runtime = replace(
+        runtime, config=replace(runtime.config, ik_weights=replace(
+            runtime.config.ik_weights, self_collision_weight=0.0
+        ))
+    )
     automatic = replay.solve_episode(args)
     targets = automatic["target_right_pose7_robot_world"]
     np.testing.assert_allclose(

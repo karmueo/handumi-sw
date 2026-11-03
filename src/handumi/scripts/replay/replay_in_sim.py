@@ -236,7 +236,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     parser.add_argument(
         "--approach-seconds",
         type=float,
-        default=1.0,
+        default=None,
         help=advanced(
             "Playback lead-in that ramps the robot from its home pose to the "
             "episode start pose, mirroring how sim teleop parks at home. "
@@ -338,6 +338,9 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
 def resolve_replay_options(args: argparse.Namespace) -> None:
     """补全按模式区分的默认值，并拒绝与绝对 TCP 朝向冲突的设置。"""
     absolute_tcp = args.retarget_mode == "absolute-tcp"
+    if getattr(args, "approach_seconds", None) is None:
+        # RM75B 绝对 TCP 回放直接从首帧摆放，其他模式保留原接近轨迹。
+        args.approach_seconds = 0.0 if absolute_tcp and getattr(args, "robot", None) == "rm75b" else 1.0
     if getattr(args, "base_placement", "auto") == "episode-xy" and not absolute_tcp:
         raise SystemExit("--base-placement episode-xy requires --retarget-mode absolute-tcp.")
     orientation = getattr(args, "absolute_orientation", None)
@@ -351,7 +354,12 @@ def resolve_replay_options(args: argparse.Namespace) -> None:
         ("max_ik_rotation_error_deg", 5.0, 45.0),
     ):
         if getattr(args, name, None) is None:
-            setattr(args, name, new_default if absolute_tcp else old_default)
+            if absolute_tcp and getattr(args, "robot", None) == "rm75b":
+                # 快速回放允许更宽的 TCP 误差，显式参数仍优先。
+                value = 10.0 if name == "max_ik_rotation_error_deg" else 0.02
+            else:
+                value = new_default if absolute_tcp else old_default
+            setattr(args, name, value)
         if absolute_tcp and (not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0):
             raise SystemExit(f"{name} must be finite and greater than zero.")
 
@@ -836,6 +844,10 @@ class PlacementSearchError(SystemExit):
         self.attempts = attempts
 
 
+class _PlacementContextReady(Exception):
+    """首帧上下文已就绪，可以直接搜索仿真摆放。"""
+
+
 def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
     """按配置选择固定摆放或逐段搜索，再执行完整轨迹求解。"""
     import contextlib
@@ -848,6 +860,7 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
 
     attempt = argparse.Namespace(**vars(args))
     attempt._placement_context = {}
+    attempt._placement_context_only = args.robot == "rm75b"
     attempt.strict_ik = False
     placement_started = time.perf_counter()
     baseline = None
@@ -856,8 +869,11 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
     try:
         with contextlib.redirect_stdout(baseline_output):
             baseline = _solve_episode_fixed(attempt)
+    except _PlacementContextReady:
+        pass
     except SystemExit as exc:
         failure = exc
+    attempt._placement_context_only = False
     context = attempt._placement_context
     if not context:
         if failure is not None:
@@ -882,10 +898,11 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
         })
     print(f"[replay] episode {args.episode}: searching a fixed XY base placement")
     report(args, "生成首帧摆放候选")
-    candidates = first_frame_candidates(
-        context["runtime"], context["tool"], context["targets"],
-        table_from_base, context["locked"],
-    )
+    fast_search = args.robot == "rm75b"
+    candidate_args = (context["runtime"], context["tool"], context["targets"],
+                      table_from_base, context["locked"])
+    candidates = (first_frame_candidates(*candidate_args, max_seeds=1) if fast_search
+                  else first_frame_candidates(*candidate_args))
     if baseline is not None and _rollout_within_thresholds(baseline, args):
         from handumi.retargeting.base_placement import PlacementCandidate
         candidates.append(PlacementCandidate(table_from_base[:2].copy(), baseline["qpos"][0].copy()))
@@ -942,7 +959,18 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
         return None
 
     try:
-        candidate, result, diagnostics = search_feasible_placement(candidates, evaluate)
+        try:
+            candidate, result, diagnostics = search_feasible_placement(
+                candidates, evaluate, first_feasible=fast_search
+            )
+        except ValueError:
+            if not fast_search:
+                raise
+            # 快速种子无法覆盖全部 IK 分支，失败时恢复完整种子搜索。
+            candidates = first_frame_candidates(*candidate_args)
+            candidate, result, diagnostics = search_feasible_placement(
+                candidates, evaluate, first_feasible=True
+            )
     except ValueError as exc:
         raise PlacementSearchError(
             f"Unable to find strict episode XY placement: {exc}; best trajectory failure: {best_trajectory_failure}; last failure: {last_failure}",
@@ -986,7 +1014,10 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
     resolve_replay_options(args)
     runtime = getattr(args, "_episode_runtime", None)
     if runtime is None:
-        runtime = args._episode_runtime = load_embodiment(args.robot)
+        if args.robot == "rm75b" and args.retarget_mode == "absolute-tcp":
+            runtime = args._episode_runtime = load_embodiment(args.robot, collision_kind="gripper-box")
+        else:
+            runtime = args._episode_runtime = load_embodiment(args.robot)
     loaded = getattr(args, "_episode_loaded", None)
     if loaded is None:
         loaded = args._episode_loaded = load_episode_states(args)
@@ -1151,6 +1182,31 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
         config=cfg,
         locked_joint_indices=locked_joint_indices,
     )
+    collision_checker = None
+    if args.robot == "rm75b" and cfg.collision_enabled:
+        from handumi.robots.self_collision import CollisionChecker, require_clear
+
+        collision_checker = getattr(args, "_episode_collision_checker", None)
+        if collision_checker is None:
+            urdf = runtime.load_urdf()
+            if retarget_mode == "absolute-tcp":
+                from handumi.robots.self_collision import GripperBoxCollisionChecker
+                collision_checker = GripperBoxCollisionChecker(
+                    runtime.robot, solver.robot_collision, urdf,
+                    cfg.self_collision_margin,
+                )
+            else:
+                collision_checker = CollisionChecker(
+                    runtime.robot, solver.robot_collision, urdf, cfg.self_collision_margin,
+                )
+            # 单段基座搜索共用同一模型与配置，不重复建立网格索引。
+            args._episode_collision_checker = collision_checker
+        if args.approach_seconds > 0 or retarget_mode != "absolute-tcp":
+            require_clear(collision_checker.check_pose(q), phase="home", frame="home")
+        # 粗包络只引导重试；优先让无碰撞代价的候选经真实网格严格验收。
+        solver.config = replace(cfg, self_collision_weight=0.0)
+        if retarget_mode == "absolute-tcp":
+            solver.robot_collision = collision_checker.model
     qs: list[np.ndarray] = []
     raw_left_gt: list[np.ndarray] = []
     raw_right_gt: list[np.ndarray] = []
@@ -1237,6 +1293,13 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
                     "targets": {"left": source_left, "right": source_right},
                     "locked": locked_joint_indices,
                 })
+                if (getattr(args, "_placement_context_only", False)
+                        and getattr(args, "deployment_selection", None) is None
+                        and getattr(args, "deployment_calibration", None) is None
+                        and (getattr(args, "base_placement", "auto") == "episode-xy"
+                             or deployment_calibration.profile == "identity")
+                        and deployment_calibration.scope != "physical"):
+                    raise _PlacementContextReady
             if "left" in runtime.arms:
                 home_left_pose7 = robot_tcp.achieved_tcp("left", home_left_pose7)
             if "right" in runtime.arms:
@@ -1271,6 +1334,10 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
             config=replace(cfg, max_joint_delta=None),
             locked_joint_indices=locked_joint_indices,
         )
+        if collision_checker is not None:
+            initial_solver.config = replace(initial_solver.config, self_collision_weight=0.0)
+            if retarget_mode == "absolute-tcp":
+                initial_solver.robot_collision = collision_checker.model
         # 绝对 TCP 模式从 HOME 求首帧；旧模式保留原有工作姿态种子。
         initial_seed = getattr(args, "_initial_q_seed", None)
         q = (np.asarray(initial_seed, dtype=np.float32).copy() if initial_seed is not None
@@ -1278,11 +1345,23 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
              else posture_seed(runtime.config.posture_q, runtime.config.home_q))
         report(args, "首帧求解（可能含编译）", candidate=getattr(args, "_placement_candidate", None))
         for initial_solve_count in range(1, args.initial_solve_iterations + 1):
+            initial_previous_q = q.copy()
             if initial_seed is None or initial_solve_count > 1:
                 q = initial_solver.ik(
                     q,
                     left_pose=(first_left_ee[:3], first_left_ee[3:7]),
                     right_pose=(first_right_ee[:3], first_right_ee[3:7]),
+                )
+            if collision_checker is not None:
+                from handumi.robots.self_collision import retry_checked_candidate
+
+                q = retry_checked_candidate(
+                    solver=initial_solver, checker=collision_checker,
+                    previous=initial_previous_q, candidate=q,
+                    left_pose=(first_left_ee[:3], first_left_ee[3:7]),
+                    right_pose=(first_right_ee[:3], first_right_ee[3:7]),
+                    assess=lambda _q: None, frame=int(frame_indices[0]),
+                    check_motion=False,
                 )
             initial_left, initial_right = initial_solver.fk_pose7(q)
             if robot_tcp is not None:
@@ -1322,9 +1401,13 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
             )
 
     start = time.perf_counter()
+    # 关键帧之间保留每个原始帧，误差或碰撞不达标时重算局部轨迹。
+    keyframe_end = -1
+    keyframe_q = None
     for selected_index, frame_index in enumerate(frame_indices):
         report(args, "逐帧求解", current=selected_index, total=len(frame_indices),
                candidate=getattr(args, "_placement_candidate", None))
+        previous_q = q.copy()
         state = states_for_retarget[frame_index]
         raw_left, raw_right = raw_state_pose7_pair(state)
         if retarget_mode == "anchored":
@@ -1353,11 +1436,30 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
             if robot_tcp is not None:
                 _require_finite_frame(frame_index, "TCP target", left_pose7, right_pose7, left_ee, right_ee)
             if robot_tcp is None or selected_index != 0:
-                q = solver.ik(
-                    q,
-                    left_pose=(left_ee[:3], left_ee[3:7]),
-                    right_pose=(right_ee[:3], right_ee[3:7]),
-                )
+                if args.robot == "rm75b" and retarget_mode == "absolute-tcp":
+                    if selected_index > keyframe_end:
+                        keyframe_end = min(selected_index + 4, len(frame_indices) - 1)
+                        future_state = states_for_retarget[frame_indices[keyframe_end]]
+                        future_left, future_right = absolute_table_robot_target_pose7(
+                            future_state, robot_from_table,
+                            left_tool_adapter_pose7=left_tool_adapter,
+                            right_tool_adapter_pose7=right_tool_adapter,
+                        )
+                        if "left" in runtime.arms:
+                            future_left = robot_tcp.target_ee("left", future_left)
+                        if "right" in runtime.arms:
+                            future_right = robot_tcp.target_ee("right", future_right)
+                        keyframe_q = solver.ik(
+                            q, left_pose=(future_left[:3], future_left[3:7]),
+                            right_pose=(future_right[:3], future_right[3:7]),
+                        )
+                    q = q + (keyframe_q - q) / (keyframe_end - selected_index + 1)
+                else:
+                    q = solver.ik(
+                        q,
+                        left_pose=(left_ee[:3], left_ee[3:7]),
+                        right_pose=(right_ee[:3], right_ee[3:7]),
+                    )
             fk_left_pose7, fk_right_pose7 = solver.fk_pose7(q)
             if robot_tcp is not None:
                 _require_finite_frame(frame_index, "IK joint or FK", q, fk_left_pose7, fk_right_pose7)
@@ -1421,6 +1523,80 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 q,
                 {"left": float(opening[0]), "right": float(opening[1])},
             )
+        if collision_checker is not None:
+            from handumi.robots.self_collision import retry_checked_candidate
+
+            retry_left = (left_ee if retarget_mode in {"absolute-table", "absolute-tcp"}
+                          else left_pose7)
+            retry_right = (right_ee if retarget_mode in {"absolute-table", "absolute-tcp"}
+                           else right_pose7)
+
+            def assess_candidate(candidate):
+                """对最终关节角执行当前 TCP 精度阈值检查。"""
+                actual_left, actual_right = solver.fk_pose7(candidate)
+                if robot_tcp is not None:
+                    if "left" in runtime.arms:
+                        actual_left = robot_tcp.achieved_tcp("left", actual_left)
+                    if "right" in runtime.arms:
+                        actual_right = robot_tcp.achieved_tcp("right", actual_right)
+                values = pose_error_arrays(
+                    left_pose7[None], right_pose7[None],
+                    actual_left[None], actual_right[None],
+                )
+                _require_finite_frame(frame_index, "IK error", *values.values())
+                pos = max(float(values[f"{side}_pos_error_m"][0]) for side in runtime.arms)
+                rot = max(float(values[f"{side}_rot_error_deg"][0]) for side in runtime.arms)
+                if (not np.isfinite([pos, rot]).all()
+                        or pos > args.max_ik_position_error_m
+                        or rot > args.max_ik_rotation_error_deg):
+                    return f"position={pos * 1000:.2f}mm rotation={rot:.2f}deg"
+                return None
+
+            interpolated_q = q.copy()
+            q = retry_checked_candidate(
+                solver=solver, checker=collision_checker, previous=previous_q,
+                candidate=q, left_pose=(retry_left[:3], retry_left[3:7]),
+                right_pose=(retry_right[:3], retry_right[3:7]),
+                assess=assess_candidate, frame=int(frame_index),
+                check_motion=selected_index > 0,
+                strict_fidelity=args.strict_ik,
+            )
+            if not np.array_equal(interpolated_q, q):
+                keyframe_end = -1
+            if args.robot == "rm75b" and retarget_mode == "absolute-tcp":
+                lower = np.asarray(runtime.robot.joints.lower_limits)
+                upper = np.asarray(runtime.robot.joints.upper_limits)
+                if (np.any(q < lower - 1e-6) or np.any(q > upper + 1e-6)
+                        or (selected_index and cfg.max_joint_delta is not None
+                            and np.any(np.abs(q - previous_q) > cfg.max_joint_delta + 1e-6))):
+                    raise SystemExit(f"Joint constraint exceeded: frame {int(frame_index)}")
+            fk_left_pose7, fk_right_pose7 = solver.fk_pose7(q)
+            if robot_tcp is not None:
+                if "left" in runtime.arms:
+                    fk_left_pose7 = robot_tcp.achieved_tcp("left", fk_left_pose7)
+                if "right" in runtime.arms:
+                    fk_right_pose7 = robot_tcp.achieved_tcp("right", fk_right_pose7)
+            if "left" not in runtime.arms:
+                left_pose7 = fk_left_pose7.copy()
+            if "right" not in runtime.arms:
+                right_pose7 = fk_right_pose7.copy()
+            if selected_index == 0:
+                # 首帧已经最终确定，提前检查接近段以免对无效摆放求解完整 episode。
+                from handumi.robots.self_collision import require_clear
+
+                early_approach = joint_approach_ramp(
+                    runtime.config.home_q, q,
+                    frames=int(round(fps * args.approach_seconds)),
+                )
+                if len(early_approach):
+                    early_path = [runtime.config.home_q, *early_approach, q]
+                    for approach_index in range(1, len(early_path)):
+                        require_clear(
+                            collision_checker.check_segment(
+                                early_path[approach_index - 1], early_path[approach_index]
+                            ),
+                            phase="approach", frame=approach_index,
+                        )
         if robot_tcp is not None:
             _require_finite_frame(frame_index, "output joint", q)
         qs.append(q.copy())
@@ -1438,6 +1614,24 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
         qs[0],
         frames=int(round(fps * args.approach_seconds)),
     )
+    collision_minimum = None
+    if collision_checker is not None:
+        from handumi.robots.self_collision import require_clear
+
+        collision_minimum = collision_checker.check_pose(qs[0])
+        require_clear(collision_minimum, phase="output", frame=int(frame_indices[0]))
+        paths = [("output", qs)]
+        if len(approach_qs):
+            paths.append(("approach", [runtime.config.home_q, *approach_qs, qs[0]]))
+        for phase, path in paths:
+            for index in range(1, len(path)):
+                result = collision_checker.check_segment(path[index - 1], path[index])
+                frame = int(frame_indices[index]) if phase == "output" else index
+                require_clear(result, phase=phase, frame=frame)
+                if result.distance < collision_minimum.distance:
+                    collision_minimum = result
+        print(f"[replay] self-collision minimum certified pose lower bound={collision_minimum.distance * 1000:.2f}mm "
+              f"links={collision_minimum.links[0]}/{collision_minimum.links[1]}")
     target_left = np.asarray(left_targets, dtype=np.float32)
     target_right = np.asarray(right_targets, dtype=np.float32)
     achieved_left = np.asarray(left_achieved, dtype=np.float32)
@@ -1525,8 +1719,29 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
         if args.strict_ik:
             raise SystemExit(message)
         print(f"[replay] warning: {message}")
+    if collision_checker is not None:
+        from handumi.dataset.episode_solve_cache import array_digest
+        from handumi.robots.self_collision import (
+            COLLISION_VALIDATION_VERSION,
+            GRIPPER_BOX_VALIDATION_VERSION,
+        )
+
+        collision_summary = {
+            "self_collision_validation": np.asarray([
+                GRIPPER_BOX_VALIDATION_VERSION if retarget_mode == "absolute-tcp"
+                else COLLISION_VALIDATION_VERSION
+            ]),
+            "self_collision_qpos_sha256": np.asarray([
+                array_digest(np.asarray(qs, dtype=np.float32))["sha256"]
+            ]),
+            "self_collision_min_sampled_m": np.asarray([collision_minimum.distance]),
+            "self_collision_min_links": np.asarray(collision_minimum.links),
+        }
+    else:
+        collision_summary = {}
     return {
         "qpos": np.asarray(qs, dtype=np.float32),
+        **collision_summary,
         # Render-only lead-in; kept out of qpos so every per-frame array stays
         # index-aligned with the solved episode.
         "approach_qpos": approach_qs,

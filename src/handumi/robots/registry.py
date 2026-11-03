@@ -417,6 +417,7 @@ def load_robot_config(name: str) -> RobotConfig:
             self_collision_weight=float(weights.get("self_collision", 0.0)),
             self_collision_margin=float(weights.get("self_collision_margin", 0.01)),
             self_collision_pairs=str(weights.get("self_collision_pairs", "all")),
+            self_collision_always=bool(weights.get("self_collision_always", False)),
             collision_activation_distance=float(
                 weights.get("collision_activation_distance", 0.10)
             ),
@@ -531,7 +532,10 @@ def build_pruned_collision_model(
     )
 
 
-def load_embodiment(name: str) -> RobotRuntime:
+def load_embodiment(name: str, *, collision_kind: str = "full") -> RobotRuntime:
+    """加载机器人模型；回放可选用固定夹爪盒碰撞模型。"""
+    if collision_kind not in {"full", "gripper-box"} or (collision_kind == "gripper-box" and name != "rm75b"):
+        raise ValueError("Unsupported collision model selection")
     cfg = load_robot_config(name)
     urdf = yourdfpy.URDF.load(
         str(cfg.urdf),
@@ -574,18 +578,27 @@ def load_embodiment(name: str) -> RobotRuntime:
 
     robot_collision = None
     if cfg.ik_weights.collision_enabled:
-        robot_collision = build_pruned_collision_model(
-            urdf=urdf,
-            robot=robot,
-            home_q=home_q,
-            arms=arms,
-            gripper_joints={
-                side: tuple(g.name for g in cfg.arms[side].gripper_joints)
-                for side in arms
-            },
-            margin=cfg.ik_weights.self_collision_margin,
-            pairs_mode=cfg.ik_weights.self_collision_pairs,
-        )
+        if name == "rm75b":
+            from handumi.robots.self_collision import build_rm75b_collision_model
+
+            if collision_kind == "gripper-box":
+                from handumi.robots.self_collision import build_rm75b_gripper_box_model
+                robot_collision = build_rm75b_gripper_box_model(urdf)
+            else:
+                robot_collision = build_rm75b_collision_model(urdf)
+        else:
+            robot_collision = build_pruned_collision_model(
+                urdf=urdf,
+                robot=robot,
+                home_q=home_q,
+                arms=arms,
+                gripper_joints={
+                    side: tuple(g.name for g in cfg.arms[side].gripper_joints)
+                    for side in arms
+                },
+                margin=cfg.ik_weights.self_collision_margin,
+                pairs_mode=cfg.ik_weights.self_collision_pairs,
+            )
         if (
             cfg.ik_weights.self_collision_weight > 0.0
             and len(np.asarray(robot_collision.active_idx_i)) == 0

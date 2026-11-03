@@ -12,7 +12,7 @@ from scipy.spatial.transform import Rotation
 from handumi.robots.utils import pose7_to_mat
 
 # 确定性的有界数值搜索；版本进入求解缓存签名。
-ALGORITHM_VERSION = "episode-xy-v2"
+ALGORITHM_VERSION = "episode-xy-v4"
 START_SEEDS = 9
 SLSQP_MAX_ITERATIONS = 200
 MAX_ORACLE_CALLS = 112
@@ -28,7 +28,7 @@ class PlacementCandidate:
     q0: np.ndarray
 
 
-def first_frame_candidates(runtime, tool, targets, table_from_base, locked=()):
+def first_frame_candidates(runtime, tool, targets, table_from_base, locked=(), *, max_seeds=START_SEEDS):
     """联合求首帧关节与底座平移，按桌面原点距离排序。
 
     高度与完整姿态以等式约束保持；结果仅为局部候选，仍需全段 IK 验证。
@@ -87,7 +87,7 @@ def first_frame_candidates(runtime, tool, targets, table_from_base, locked=()):
     seeds = [home]
     sample_lower = np.where(np.isfinite(lower), lower, home - 2 * np.pi)
     sample_upper = np.where(np.isfinite(upper), upper, home + 2 * np.pi)
-    for _ in range(START_SEEDS - 1):
+    for _ in range(max_seeds - 1):
         seeds.append(
             np.where(lower == upper, lower, rng.uniform(sample_lower, sample_upper))
         )
@@ -118,6 +118,8 @@ def first_frame_candidates(runtime, tool, targets, table_from_base, locked=()):
 def search_feasible_placement(
     candidates: list[PlacementCandidate],
     evaluate: Callable[[PlacementCandidate], object | None],
+    *,
+    first_feasible: bool = False,
 ) -> tuple[PlacementCandidate, object, dict[str, float | int]]:
     """全段验证候选并沿邻近方向细化，返回搜索内最小通过结果。"""
     calls = 0
@@ -143,6 +145,9 @@ def search_feasible_placement(
 
     for candidate in candidates:
         probe(candidate)
+        if first_feasible and best is not None:
+            return best[0], best[1], {"oracle_calls": calls, "oracle_budget": MAX_ORACLE_CALLS,
+                                      "search_resolution_m": None, "start_candidates": len(candidates)}
     if not candidates:
         raise ValueError("首帧平面摆放优化未找到满足关节限制和完整姿态的候选。")
 
@@ -162,6 +167,9 @@ def search_feasible_placement(
                 key=lambda item: np.linalg.norm(item.xy - radius * direction),
             )
             probe(PlacementCandidate(radius * direction, seed.q0))
+            if first_feasible and best is not None:
+                return best[0], best[1], {"oracle_calls": calls, "oracle_budget": MAX_ORACLE_CALLS,
+                                          "search_resolution_m": None, "start_candidates": len(candidates)}
             if calls >= PRIMARY_ORACLE_CALLS:
                 break
         if best is not None or calls >= PRIMARY_ORACLE_CALLS:
@@ -174,6 +182,9 @@ def search_feasible_placement(
                 xy = radius * np.array([np.cos(angle), np.sin(angle)])
                 seed = min(candidates, key=lambda item: np.linalg.norm(item.xy - xy))
                 probe(PlacementCandidate(xy, seed.q0))
+                if first_feasible and best is not None:
+                    return best[0], best[1], {"oracle_calls": calls, "oracle_budget": MAX_ORACLE_CALLS,
+                                              "search_resolution_m": None, "start_candidates": len(candidates)}
                 if calls >= MAX_ORACLE_CALLS - 12:
                     break
             if best is not None or calls >= MAX_ORACLE_CALLS - 12:

@@ -16,8 +16,22 @@ from handumi.scripts.replay import replay_scheduler
 from handumi.scripts.replay.replay_scheduler import EpisodeScheduler
 
 
-def _args_and_loaded(tmp_path, monkeypatch):
+def _args_and_loaded(tmp_path, monkeypatch, *, collision_enabled=False):
     """构建不依赖真实数据的 RM75B 完整缓存输入。"""
+    # 此组测试缓存机制；独立关闭真实 RM75B 碰撞约束以使用合成轨迹。
+    from dataclasses import replace
+
+    import handumi.robots.registry as registry
+
+    original_load = registry.load_robot_config
+
+    def load_test_config(name):
+        """为缓存测试提供未启用碰撞的隔离配置。"""
+        config = original_load(name)
+        return replace(config, ik_weights=replace(config.ik_weights, self_collision_weight=0))
+
+    if not collision_enabled:
+        monkeypatch.setattr(registry, "load_robot_config", load_test_config)
     tool = tmp_path / "tool.yaml"
     tool.write_text(
         yaml.safe_dump(
@@ -118,11 +132,12 @@ def test_cache_hit_strict_gate_and_approach_are_independent(
 ):
     """严格检查在命中时重做，渲染过渡按当前设置恢复。"""
     args, _, _ = _args_and_loaded(tmp_path, monkeypatch)
+    args.approach_seconds = 1.0
     calls = []
     monkeypatch.setattr(
         replay,
         "solve_episode",
-        lambda args: calls.append(args.strict_ik) or _rollout(0.006),
+        lambda args: calls.append(args.strict_ik) or _rollout(0.021),
     )
     first = prepare.prepare_episode(args)
     assert calls == [False] and len(first["approach_qpos"]) > 0
@@ -530,3 +545,172 @@ def test_main_headless_batch_saves_selected_once_and_preserves_output(tmp_path, 
         saved.append((args.episode, args.output, rollout)))
     replay.main()
     assert saved == [(3, output, selected)]
+
+
+def test_rm75b_cache_rejects_missing_collision_summary(tmp_path, monkeypatch):
+    """未经碰撞认证的结果不得写入成功缓存。"""
+    args, _, _ = _args_and_loaded(tmp_path, monkeypatch, collision_enabled=True)
+    monkeypatch.setattr(replay, "solve_episode", lambda args: _rollout())
+    with pytest.raises(SystemExit, match="collision validation summary"):
+        prepare.prepare_episode(args)
+    assert not list(prepare.cache_directory(args).rglob("*.npz"))
+
+
+def test_rm75b_approach_failure_does_not_poison_direct_start_cache(tmp_path, monkeypatch):
+    """接近段搜索失败可复用，但关闭接近段后必须重新求解。"""
+    from handumi.dataset.episode_solve_cache import array_digest
+    from handumi.robots.self_collision import GRIPPER_BOX_VALIDATION_VERSION
+
+    args, _, _ = _args_and_loaded(tmp_path, monkeypatch, collision_enabled=True)
+    args.base_placement = "auto"
+    args.approach_seconds = 1.0
+    calls = []  # 记录实际求解使用的接近时长。
+    rollout = _rollout()
+    rollout["self_collision_validation"] = np.asarray([GRIPPER_BOX_VALIDATION_VERSION])
+    rollout["self_collision_qpos_sha256"] = np.asarray([
+        array_digest(rollout["qpos"])["sha256"]
+    ])
+    rollout["self_collision_min_sampled_m"] = np.asarray([0.1])
+    rollout["self_collision_min_links"] = np.asarray(["Link2", "gripper_link"])
+
+    def solve(run_args):
+        """模拟接近段碰撞导致搜索失败、直接首帧开始则成功。"""
+        calls.append(run_args.approach_seconds)
+        if run_args.approach_seconds > 0:
+            raise SystemExit("Unable to find strict episode XY placement: approach collision")
+        return rollout
+
+    monkeypatch.setattr(replay, "solve_episode", solve)
+    # 本测试仅隔离缓存路由，碰撞复验由独立测试覆盖。
+    monkeypatch.setattr(prepare, "_finish_rollout", lambda args, result, **kwargs: result)
+    for _ in range(2):
+        with pytest.raises(SystemExit, match="approach collision"):
+            prepare.prepare_episode(args)
+    assert calls == [1.0]
+
+    args.approach_seconds = 0.0
+    for _ in range(2):
+        np.testing.assert_array_equal(prepare.prepare_episode(args)["qpos"], rollout["qpos"])
+    assert calls == [1.0, 0.0]
+
+
+def test_rm75b_collision_mesh_changes_cache_identity(tmp_path, monkeypatch):
+    """仅更改碰撞网格摘要也会使 RM75B 缓存失效。"""
+    args, loaded, _ = _args_and_loaded(tmp_path, monkeypatch, collision_enabled=True)
+    original, payload = prepare.episode_identity(args, tuple(loaded))
+    assert any("rm75_gripper_base.stl" in name for name in payload["collision_meshes"])
+    digest = prepare.digest_file
+
+    def changed(path):
+        """模拟单个夹爪 STL 内容变更。"""
+        if path is not None and str(path).endswith("rm75_gripper_base.stl"):
+            return "changed"
+        return digest(path)
+
+    monkeypatch.setattr(prepare, "digest_file", changed)
+    assert prepare.episode_identity(args, tuple(loaded))[0] != original
+
+
+def test_rm75b_cached_approach_is_rechecked(tmp_path, monkeypatch):
+    """缓存结果每次使用时重新检查当前设置生成的接近轨迹。"""
+    import handumi.robots.registry as registry
+    import handumi.robots.self_collision as collision
+    from handumi.dataset.episode_solve_cache import array_digest
+    from handumi.robots.self_collision import (
+        GRIPPER_BOX_VALIDATION_VERSION,
+        CollisionResult,
+    )
+
+    args, _, _ = _args_and_loaded(tmp_path, monkeypatch, collision_enabled=True)
+    args.approach_seconds = 1.0
+    rollout = _rollout()
+    rollout["self_collision_validation"] = np.asarray([GRIPPER_BOX_VALIDATION_VERSION])
+    rollout["self_collision_qpos_sha256"] = np.asarray([array_digest(rollout["qpos"])["sha256"]])
+    rollout["self_collision_min_sampled_m"] = np.asarray([0.1])
+    rollout["self_collision_min_links"] = np.asarray(["Link2", "gripper_link"])
+
+    class Checker:
+        """合成安全轨迹及不安全的 home 接近段。"""
+        def __init__(self, *args):
+            """接受与真实碰撞检查器一致的参数。"""
+
+        def check_pose(self, q):
+            """所有端点姿态均安全。"""
+            return CollisionResult(True, 0.1, ("Link2", "gripper_link"), "clear")
+
+        def check_segment(self, start, end):
+            """只有 home 起始段判定为碰撞。"""
+            is_home = np.any(start)
+            return CollisionResult(not is_home, -0.01 if is_home else 0.1,
+                                   ("Link2", "gripper_link"), "collision")
+
+    fake_runtime = SimpleNamespace(robot=None, solver_cls=lambda: SimpleNamespace(robot_collision=None),
+                                   load_urdf=lambda: None)
+    monkeypatch.setattr(registry, "load_embodiment", lambda _, **kwargs: fake_runtime)
+    monkeypatch.setattr(collision, "GripperBoxCollisionChecker", Checker)
+    with pytest.raises(SystemExit, match="approach.*Link2/gripper_link"):
+        prepare._finish_rollout(args, rollout, cached=True)
+
+
+def test_collision_summary_rejects_other_model_version(tmp_path, monkeypatch):
+    """夹爪盒与完整机械臂模型的缓存认证不可混用。"""
+    from handumi.dataset.episode_solve_cache import array_digest
+    from handumi.robots.self_collision import (
+        COLLISION_VALIDATION_VERSION,
+        GRIPPER_BOX_VALIDATION_VERSION,
+    )
+
+    args, _, _ = _args_and_loaded(tmp_path, monkeypatch, collision_enabled=True)
+    rollout = _rollout()
+    rollout["self_collision_qpos_sha256"] = np.asarray([array_digest(rollout["qpos"])["sha256"]])
+    rollout["self_collision_min_sampled_m"] = np.asarray([0.1])
+    rollout["self_collision_min_links"] = np.asarray(["Link2", "gripper_link"])
+    rollout["self_collision_validation"] = np.asarray([COLLISION_VALIDATION_VERSION])
+    assert not prepare._valid_collision_summary(args, rollout)
+    rollout["self_collision_validation"] = np.asarray([GRIPPER_BOX_VALIDATION_VERSION])
+    assert prepare._valid_collision_summary(args, rollout)
+    args.retarget_mode = "anchored"
+    assert not prepare._valid_collision_summary(args, rollout)
+
+
+def test_rm75b_direct_start_checks_first_frame_without_home(tmp_path, monkeypatch):
+    """直接起始不依赖 home 安全性，仍验收首帧与帧间运动。"""
+    import handumi.robots.registry as registry
+    import handumi.robots.self_collision as collision
+    from handumi.dataset.episode_solve_cache import array_digest
+
+    args, _, _ = _args_and_loaded(tmp_path, monkeypatch, collision_enabled=True)
+    replay.resolve_replay_options(args)
+    args.approach_seconds = 0.0
+    rollout = _rollout()
+    rollout["self_collision_validation"] = np.asarray([collision.GRIPPER_BOX_VALIDATION_VERSION])
+    rollout["self_collision_qpos_sha256"] = np.asarray([array_digest(rollout["qpos"])["sha256"]])
+    rollout["self_collision_min_sampled_m"] = np.asarray([0.1])
+    rollout["self_collision_min_links"] = np.asarray(["Link2", "gripper_link"])
+    calls = []
+
+    class Checker:
+        """模拟不安全 home 和安全的首帧及运动段。"""
+
+        def __init__(self, *args):
+            """接受真实检查器的初始化参数。"""
+
+        def check_pose(self, q):
+            """记录姿态；仅非零 home 姿态不安全。"""
+            calls.append("pose")
+            safe = not np.any(q)
+            return collision.CollisionResult(safe, 0.1 if safe else 0.0, ("Link2", "gripper_link"), "test")
+
+        def check_segment(self, start, end):
+            """记录轨迹段检查。"""
+            calls.append("segment")
+            return collision.CollisionResult(True, 0.1, ("Link2", "gripper_link"), "clear")
+
+    runtime = SimpleNamespace(robot=None, solver_cls=lambda: SimpleNamespace(robot_collision=None), load_urdf=lambda: None)
+    monkeypatch.setattr(registry, "load_embodiment", lambda _, **kwargs: runtime)
+    monkeypatch.setattr(collision, "GripperBoxCollisionChecker", Checker)
+    prepare._finish_rollout(args, rollout, cached=True)
+    assert calls == ["pose", "segment"]
+    args.approach_seconds = 1.0
+    with pytest.raises(SystemExit, match="home.*Link2/gripper_link"):
+        prepare._finish_rollout(args, rollout, cached=True)

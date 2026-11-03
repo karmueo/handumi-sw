@@ -78,6 +78,11 @@ def test_first_frame_optimizer_has_verifiable_minimum_and_respects_lock():
     assert locked
     np.testing.assert_allclose(locked[0].xy, [0.2, 0.05], atol=1e-5)
     assert locked[0].q0[1] == pytest.approx(0)
+    fast = first_frame_candidates(
+        runtime, tool, {"right": target}, IDENTITY_POSE7, max_seeds=1
+    )
+    assert fast
+    np.testing.assert_allclose(fast[0].xy, [0.2, 0], atol=1e-5)
 
 
 def test_search_keeps_distinct_joint_branches_at_same_xy():
@@ -100,6 +105,23 @@ def test_search_keeps_distinct_joint_branches_at_same_xy():
     assert np.linalg.norm(best.xy) == pytest.approx(0.1, abs=0.002)
     assert {q[0] for xy, q in checked if np.allclose(xy, [0.1, 0])} == {0, 1}
     assert diagnostics["oracle_calls"] == len(checked)
+
+
+def test_search_first_feasible_stops_after_first_success():
+    """快速策略仍需完整评估，并在首个成功候选处停止。"""
+    candidates = [PlacementCandidate(np.array([x, 0.0]), np.array([0.0])) for x in (0.1, 0.2)]
+    seen = []
+
+    def evaluate(candidate):
+        """记录完整候选评估。"""
+        seen.append(candidate)
+        return "pass"
+
+    candidate, result, diagnostics = search_feasible_placement(
+        candidates, evaluate, first_feasible=True
+    )
+    assert result == "pass" and candidate is candidates[0]
+    assert len(seen) == diagnostics["oracle_calls"] == 1
 
 
 def test_search_rejects_failed_full_trajectory_and_refines_nearest_pass():
@@ -200,7 +222,7 @@ def _fixture_replay(
         solver_cls=Solver,
         set_finger_positions=lambda *args: None,
     )
-    monkeypatch.setattr(replay, "load_embodiment", lambda robot: runtime)
+    monkeypatch.setattr(replay, "load_embodiment", lambda robot, **kwargs: runtime)
     source_cal = ControllerTcpCalibration(left=home, right=home)
     selection = replay.TcpCalibrationSelection(
         calibration=source_cal,
@@ -250,6 +272,57 @@ def _fixture_replay(
         "rm75b", table, None, "assumed", "test", False, "identity", None
     )
     return args, states, table, tool_path
+
+
+def test_identity_auto_extracts_context_without_solving(monkeypatch, tmp_path):
+    """未显式标定的身份摆放只提取上下文，不启动基线逐帧求解。"""
+    args, _, _, _ = _fixture_replay(monkeypatch, tmp_path)
+    args.base_placement = "auto"
+    args.deployment_selection = None
+    args._placement_context = {}
+    args._placement_context_only = True
+    calibration = DeploymentCalibration(
+        "rm75b", IDENTITY_POSE7.copy(), None, "assumed", "identity", False, "identity", None
+    )
+    monkeypatch.setattr(replay, "resolve_deployment_calibration", lambda *a, **k: calibration)
+    with pytest.raises(replay._PlacementContextReady):
+        replay._solve_episode_fixed(args)
+    assert args._placement_context["deployment"] is calibration
+
+
+def test_fast_placement_falls_back_after_full_search_failure(monkeypatch, tmp_path):
+    """快速种子的完整搜索失败后，必须尝试完整种子集合。"""
+    args, _, _, _ = _fixture_replay(monkeypatch, tmp_path)
+    args.base_placement = "auto"
+    args.deployment_selection = None
+    candidate = PlacementCandidate(np.array([0.1, 0.0]), np.zeros(7))
+    calls = []
+    calibration = DeploymentCalibration(
+        "rm75b", IDENTITY_POSE7.copy(), None, "assumed", "identity", False, "identity", None
+    )
+
+    def fixed(attempt):
+        """提供首帧上下文，不求解真实 episode。"""
+        attempt._placement_context.update(runtime=None, tool=None, targets={},
+                                          deployment=calibration, locked=())
+        raise replay._PlacementContextReady
+
+    def candidates(*unused, **kwargs):
+        """记录首轮和回退的种子数量。"""
+        calls.append(kwargs.get("max_seeds"))
+        return [candidate]
+
+    def search(items, evaluate, *, first_feasible):
+        """模拟快速分支失败、完整分支成功。"""
+        if len(calls) == 1:
+            raise ValueError("无可行分支")
+        return items[0], {}, {"oracle_calls": 1}
+
+    monkeypatch.setattr(replay, "_solve_episode_fixed", fixed)
+    monkeypatch.setattr(replay, "first_frame_candidates", candidates)
+    monkeypatch.setattr(replay, "search_feasible_placement", search)
+    replay.solve_episode(args)
+    assert calls == [1, None]
 
 
 def test_auto_keeps_zero_placement_and_rejects_physical_override(monkeypatch, tmp_path):
@@ -341,11 +414,193 @@ def test_start_rotation_failure_and_strict_later_frame(monkeypatch, tmp_path):
     with pytest.raises(SystemExit, match="rotation errors"):
         replay.solve_episode(args)
     args, _, _, _ = _fixture_replay(monkeypatch, tmp_path, later_miss=True)
+    args.max_ik_position_error_m = 0.005
     result = replay.solve_episode(args)
     assert result["right_pos_error_m"][1] > 0.005
     args.strict_ik = True
     with pytest.raises(SystemExit, match=r"1: .*mm/.*deg"):
         replay.solve_episode(args)
+
+
+@pytest.mark.parametrize("mode", ["local-relative", "absolute-tcp"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("motion_safe", [False, True])
+def test_collision_checked_replay_respects_strict_ik(
+    monkeypatch, tmp_path, capsys, mode, strict, motion_safe
+):
+    """碰撞始终拒绝；安全但超差的轨迹按 strict 开关警告或失败。"""
+    from dataclasses import replace
+
+    import handumi.robots.self_collision as collision
+
+    args, _, _, _ = _fixture_replay(monkeypatch, tmp_path, later_miss=True)
+    args.retarget_mode = mode
+    args.strict_ik = strict
+    args.max_ik_position_error_m = 0.001
+    runtime = replay.load_embodiment("rm75b")
+    runtime.config.ik_weights = replace(
+        runtime.config.ik_weights, self_collision_weight=100.0
+    )
+    runtime.robot = SimpleNamespace(joints=SimpleNamespace(
+        lower_limits=np.full(7, -10.0), upper_limits=np.full(7, 10.0)
+    ))
+    runtime.load_urdf = lambda: None
+    original_solver = runtime.solver_cls  # 复用既有可控精度的虚拟求解器。
+    checked_segments = []  # 确认每种 strict 设置均执行运动碰撞检查。
+
+    class Solver(original_solver):
+        """补充碰撞重试需要的配置和模型接口。"""
+
+        def __init__(self, config=None, locked_joint_indices=()):
+            """保留虚拟运动学并暴露可替换的配置。"""
+            super().__init__(config, locked_joint_indices)
+            self.config = config
+            self.robot_collision = None
+
+    class Checker:
+        """姿态安全，运动段可模拟安全或碰撞。"""
+
+        def __init__(self, robot, model, urdf, margin):
+            """接受与真实检查器一致的构造参数。"""
+            self.model = model
+
+        def check_pose(self, q):
+            """允许 home 与首帧姿态。"""
+            return collision.CollisionResult(True, 0.1, ("arm", "gripper"), "clear")
+
+        def check_segment(self, start, end):
+            """记录连续检测，并返回本例设定的碰撞结果。"""
+            checked_segments.append(1)
+            return collision.CollisionResult(
+                motion_safe, 0.1 if motion_safe else -0.01,
+                ("arm", "gripper"), "test motion",
+            )
+
+    runtime.solver_cls = Solver
+    monkeypatch.setattr(collision, "CollisionChecker", Checker)
+    monkeypatch.setattr(collision, "GripperBoxCollisionChecker", Checker)
+    if not motion_safe:
+        with pytest.raises(SystemExit, match="Self-collision validation failed"):
+            replay.solve_episode(args)
+    elif strict:
+        with pytest.raises(SystemExit, match="IK fidelity threshold exceeded"):
+            replay.solve_episode(args)
+    else:
+        result = replay.solve_episode(args)
+        assert result["right_pos_error_m"][1] > args.max_ik_position_error_m
+        assert "warning: IK fidelity threshold exceeded" in capsys.readouterr().out
+    assert checked_segments
+
+
+def test_keyframe_interpolation_preserves_all_source_frames(monkeypatch, tmp_path):
+    """平滑轨迹减少 IK 调用，并保留每个原始帧的目标和误差。"""
+    args, states, _, _ = _fixture_replay(monkeypatch, tmp_path)
+    states = np.repeat(states[:1], 21, axis=0)
+    states[:, 7] += np.linspace(0, 0.01, len(states))
+    runtime = replay.load_embodiment("rm75b")
+    original_solver = runtime.solver_cls
+    calls = []
+
+    class CountingSolver(original_solver):
+        """统计逐帧限速求解器的 IK 调用。"""
+
+        def ik(self, q, **kwargs):
+            """记录求解并沿用原测试求解器。"""
+            if self.limited:
+                calls.append(1)
+            return super().ik(q, **kwargs)
+
+    runtime.solver_cls = CountingSolver
+    info = {"handumi": {"recording_device": "vive", "active_sides": ["right"],
+                         "tracking_workspace": "table"}}
+    monkeypatch.setattr(replay, "load_episode_states", lambda args: (states, 30., info, None))
+    args.strict_ik = True
+    result = replay.solve_episode(args)
+    assert len(result["qpos"]) == len(states)
+    assert len(calls) <= 5
+    assert max(result["right_pos_error_m"]) <= 0.02
+
+
+def test_keyframe_interpolation_rejects_missed_source_frame(monkeypatch, tmp_path):
+    """关键帧之间突变导致超差时，不能把插值结果当作成功轨迹。"""
+    args, states, _, _ = _fixture_replay(monkeypatch, tmp_path)
+    states = np.repeat(states[:1], 11, axis=0)
+    states[2, 7] += 0.10
+    info = {"handumi": {"recording_device": "vive", "active_sides": ["right"],
+                         "tracking_workspace": "table"}}
+    monkeypatch.setattr(replay, "load_episode_states", lambda args: (states, 30., info, None))
+    args.strict_ik = True
+    with pytest.raises(SystemExit, match=r"2: .*mm/.*deg"):
+        replay.solve_episode(args)
+
+
+def test_keyframe_collision_retries_and_replans(monkeypatch, tmp_path):
+    """非关键帧插值发生碰撞时重试该帧，并重新规划后续关键帧。"""
+    from dataclasses import replace
+
+    import handumi.robots.self_collision as collision
+
+    args, states, _, _ = _fixture_replay(monkeypatch, tmp_path)
+    states = np.repeat(states[:1], 11, axis=0)
+    states[:, 7] += np.linspace(0, 0.01, len(states))
+    info = {"handumi": {"recording_device": "vive", "active_sides": ["right"],
+                         "tracking_workspace": "table"}}
+    monkeypatch.setattr(replay, "load_episode_states", lambda args: (states, 30., info, None))
+    runtime = replay.load_embodiment("rm75b")
+    runtime.config.ik_weights = replace(runtime.config.ik_weights, self_collision_weight=100)
+    runtime.robot = SimpleNamespace(joints=SimpleNamespace(
+        lower_limits=np.full(7, -10.), upper_limits=np.full(7, 10.)))
+    runtime.load_urdf = lambda: None
+    old_solver = runtime.solver_cls
+    calls = []
+    attempts = []
+
+    class Solver(old_solver):
+        """统计关键帧与碰撞重试的目标。"""
+
+        def __init__(self, config=None, locked_joint_indices=()):
+            """保存碰撞重试所需配置。"""
+            super().__init__(config, locked_joint_indices)
+            self.config = config
+            self.robot_collision = object()
+
+        def ik(self, q, **kwargs):
+            """重试时略微改变关节角，迫使关键帧重新生成。"""
+            result = super().ik(q, **kwargs)
+            if self.limited:
+                calls.append((float(kwargs["right_pose"][0][0]), self.config.self_collision_weight))
+                if self.config.self_collision_weight:
+                    result[0] += 0.001
+            return result
+
+    class Checker:
+        """只让第一个非关键帧的插值运动失败一次。"""
+
+        def __init__(self, robot, model, urdf, margin):
+            """保存传入的碰撞模型。"""
+            self.model = model
+
+        def check_pose(self, q):
+            """允许首帧姿态。"""
+            return collision.CollisionResult(True, 0.1, ("Link2", "gripper_link"), "clear")
+
+        def check_segment(self, start, end):
+            """第一次连续运动失败，其后通过。"""
+            attempts.append(1)
+            safe = len(attempts) != 1
+            return collision.CollisionResult(safe, 0.1 if safe else 0.0,
+                                             ("Link2", "gripper_link"), "test")
+
+    runtime.solver_cls = Solver
+    monkeypatch.setattr(collision, "GripperBoxCollisionChecker", Checker)
+    args.strict_ik = True
+    result = replay.solve_episode(args)
+    assert len(result["qpos"]) == len(states)
+    assert len(attempts) >= len(states)
+    assert any(weight == 100 for _, weight in calls)
+    # 首次插值失败后会生成新的前瞻目标，而不是沿用原终点。
+    assert len([target for target, weight in calls if weight == 0]) >= 3
+    assert result["self_collision_validation"].item() == collision.GRIPPER_BOX_VALIDATION_VERSION
 
 
 def test_initial_solve_uses_home_and_only_active_arm(monkeypatch, tmp_path):
@@ -635,7 +890,8 @@ def test_default_controller_calibration_invalidates_screening(tmp_path, monkeypa
     assert solver_signature(args) != explicit_signature
 
 
-def test_real_rm75b_ik_on_reachable_tcp_trajectory(monkeypatch, tmp_path):
+@pytest.mark.parametrize("collision", [False, True])
+def test_real_rm75b_ik_on_reachable_tcp_trajectory(monkeypatch, tmp_path, collision):
     """用真实 RM75B FK 构造连续可达示教，要求 TCP 误差通过新门槛。"""
     runtime = load_embodiment("rm75b")
     solver = runtime.solver_cls()
@@ -648,8 +904,9 @@ def test_real_rm75b_ik_on_reachable_tcp_trajectory(monkeypatch, tmp_path):
     states[:, 6] = 1
     for i in range(3):
         q = runtime.config.home_q.copy()
-        q[0] += 0.01 * i
-        q[3] -= 0.005 * i
+        if not collision:
+            q[0] += 0.01 * i
+            q[3] -= 0.005 * i
         _, flange = solver.fk_pose7(q)
         states[i, 7:14] = pose_mul(flange, tool_pose)
     info = {
@@ -691,7 +948,51 @@ def test_real_rm75b_ik_on_reachable_tcp_trajectory(monkeypatch, tmp_path):
             "0",
         ]
     )
+    from dataclasses import replace
+
+    calls = []
+    if collision:
+        # 用合成安全距离验证整条回放分支，实际 RM75B home 不通过胶囊验收。
+        import handumi.robots.self_collision as module
+
+        class ClearChecker:
+            """记录 home、逐帧和接近段的碰撞验证。"""
+            def __init__(self, *args):
+                """初始化合成安全模型。"""
+                self.model = args[1]
+
+            def check_pose(self, q):
+                """返回安全姿态。"""
+                calls.append("pose")
+                return module.CollisionResult(True, 0.1, ("Link2", "gripper_link"), "clear")
+
+            def check_segment(self, a, b):
+                """返回安全运动段。"""
+                calls.append("segment")
+                return module.CollisionResult(True, 0.1, ("Link2", "gripper_link"), "clear")
+
+        class StationarySolver(runtime.solver_cls):
+            """固定 home 姿态以隔离真实碰撞模型的保守重叠。"""
+            def ik(self, q_current, **kwargs):
+                """保持当前可达姿态。"""
+                return q_current.copy()
+
+        monkeypatch.setattr(module, "GripperBoxCollisionChecker", ClearChecker)
+        args._episode_runtime = replace(runtime, solver_cls=StationarySolver)
+        args.approach_seconds = 0.1
+    else:
+        # 此分支验证运动学，关闭碰撞以隔离 home 保守包络。
+        args._episode_runtime = replace(
+            runtime,
+            config=replace(runtime.config, ik_weights=replace(
+                runtime.config.ik_weights, self_collision_weight=0.0
+            )),
+        )
     rollout = replay.solve_episode(args)
+    if collision:
+        assert len(calls) >= 5 and "pose" in calls and "segment" in calls
+        assert rollout["self_collision_validation"].item() == module.GRIPPER_BOX_VALIDATION_VERSION
+        assert rollout["self_collision_min_sampled_m"].item() == 0.1
     assert np.max(rollout["right_pos_error_m"]) < 0.005
     assert np.max(rollout["right_rot_error_deg"]) < 5
     np.testing.assert_allclose(

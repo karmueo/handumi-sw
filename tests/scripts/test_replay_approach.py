@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from handumi.scripts.replay import replay_in_sim as replay
 from handumi.scripts.replay.replay_in_sim import joint_approach_ramp
 
 HOME = np.array([0.0, -0.9, 0.6, 0.0], dtype=np.float32)
@@ -31,3 +32,20 @@ def test_ramp_is_monotonic_and_smooth() -> None:
 def test_ramp_is_skipped_when_disabled_or_already_home() -> None:
     assert joint_approach_ramp(HOME, START, frames=0).shape == (0, HOME.size)
     assert joint_approach_ramp(HOME, HOME.copy(), frames=30).shape == (0, HOME.size)
+
+
+def test_rm75_absolute_tcp_defaults_to_direct_start() -> None:
+    """RM75B 绝对 TCP 默认从首帧开始，显式接近时间及其他模式仍生效。"""
+    parser = replay.build_parser()
+    direct = parser.parse_args(["unused", "--robot", "rm75b", "--retarget-mode", "absolute-tcp"])
+    replay.resolve_replay_options(direct)
+    assert direct.approach_seconds == 0.0
+    assert direct.initial_position_tolerance_m == 0.02
+    assert direct.max_ik_position_error_m == 0.02
+    assert direct.max_ik_rotation_error_deg == 10.0
+    approach = parser.parse_args(["unused", "--robot", "rm75b", "--retarget-mode", "absolute-tcp", "--approach-seconds", "1"])
+    replay.resolve_replay_options(approach)
+    assert approach.approach_seconds == 1.0
+    other = parser.parse_args(["unused", "--robot", "rm75b", "--retarget-mode", "local-relative"])
+    replay.resolve_replay_options(other)
+    assert other.approach_seconds == 1.0
