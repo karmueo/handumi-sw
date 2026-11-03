@@ -142,6 +142,9 @@ class RobotConfig:
     real: RobotRealConfig
     real_options: dict[str, Any]
     manipulation_lock_joints: tuple[str, ...] = ()
+    # 规范训练向量是否为每侧包含一条逻辑夹爪宽度列。RM75B 保持既有
+    # 七轴布局，实际开度改由独立的 normalized 辅助列携带。
+    canonical_gripper_width_column: bool = True
 
 
 @dataclass(frozen=True)
@@ -452,6 +455,9 @@ def load_robot_config(name: str) -> RobotConfig:
         ),
         real_options={str(key): value for key, value in real.items()},
         manipulation_lock_joints=manipulation_lock_joints,
+        canonical_gripper_width_column=bool(
+            data.get("canonical_gripper_width_column", True)
+        ),
     )
 
 

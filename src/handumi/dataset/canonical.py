@@ -29,12 +29,13 @@ def is_canonical_state_layout(info: dict) -> bool:
 
 @dataclass(frozen=True)
 class CanonicalJointLayout:
-    """Robot command layout for IL datasets.
+    """IL 数据集使用的机器人命令布局。
 
-    The layout stores each non-gripper arm joint from the robot YAML plus one
-    logical gripper opening column per side when the embodiment declares
-    gripper joints. A parallel gripper with two URDF joints therefore becomes
-    one dataset dimension.
+    布局先写入机器人 YAML 声明的非夹指臂关节；当配置声明夹指且
+    ``canonical_gripper_width_column`` 为真时，再为每侧追加一条逻辑夹爪
+    宽度列。因此带两个 URDF 夹指关节的平行夹爪只占一个数据维度。
+    RM75B 关闭该宽度列以保持既有七轴契约，实际开度改由独立的
+    normalized 辅助列携带。
     """
 
     names: list[str]
@@ -64,7 +65,9 @@ def canonical_joint_layout(runtime) -> CanonicalJointLayout:
             names.append(f"{joint_name}.pos")
             indices.append(joint_index)
             gripper_sides.append(None)
-        if finger_indices[side]:
+        if finger_indices[side] and getattr(
+            runtime.config, "canonical_gripper_width_column", True
+        ):
             names.append(f"{side}_gripper.width_m")
             indices.append(None)
             gripper_sides.append(side)
@@ -180,17 +183,18 @@ def expand_canonical_trajectory(
     canonical: np.ndarray,
     *,
     runtime,
+    gripper_normalized: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Rebuild full URDF ``qpos`` from the canonical IL command vector.
+    """由规范 IL 命令向量重建完整 URDF ``qpos``。
 
-    Inverse of :func:`canonicalize_joint_trajectory`. Arm columns are copied
-    back to their actuated index and each logical gripper width is converted
-    to the 0-1 opening the finger joints interpolate, exactly as
-    :meth:`RobotRuntime.set_finger_positions` does during replay.
+    这是 :func:`canonicalize_joint_trajectory` 的逆操作：臂关节按列写回
+    实际关节索引；存在逻辑宽度列时，按与回放相同的插值写入夹指。
+    ``gripper_normalized`` 用于覆盖规范列中的默认开度，使带独立开度列的
+    数据集按录制值显示夹指。没有宽度列且没有独立开度时，保留
+    ``home_q`` 中的实际夹指位置，并据此报告归一化开度。
 
-    Conversion only stores the columns the layout declares, so any actuated
-    joint outside it (a torso the embodiment locks, say) is unrecoverable and
-    keeps its home value here. Returns ``(qpos, gripper_normalized)``.
+    转换只保存布局声明的列，因此布局之外的关节（例如被锁定的躯干）无法
+    恢复，保持 home 值。返回 ``(qpos, gripper_normalized)``。
     """
     canonical = np.asarray(canonical, dtype=np.float32)
     if canonical.ndim != 2:
@@ -219,7 +223,40 @@ def expand_canonical_trajectory(
                 canonical[:, column] / max_width, 0.0, 1.0
             )
 
+    # 没有宽度列时保留 home 的夹指值，并用它报告该侧默认开度。
+    preserved_sides: set[str] = set()
     for side_index, side in enumerate(SIDES):
+        if not runtime.finger_joints.get(side):
+            continue
+        if any(layout_side == side for layout_side in layout.gripper_sides):
+            continue
+        fractions = []
+        for finger in runtime.finger_joints[side]:
+            span = float(finger.open_value - finger.closed_value)
+            if abs(span) < 1e-9:
+                continue
+            fractions.append(
+                (qpos[:, finger.index] - finger.closed_value) / span
+            )
+        if fractions:
+            normalized[:, side_index] = np.clip(
+                np.mean(np.stack(fractions, axis=1), axis=1), 0.0, 1.0
+            )
+        preserved_sides.add(side)
+
+    if gripper_normalized is not None:
+        override = np.asarray(gripper_normalized, dtype=np.float32)
+        if override.shape != normalized.shape:
+            raise ValueError(
+                "gripper_normalized must have shape "
+                f"{normalized.shape}, got {override.shape}."
+            )
+        normalized = np.clip(override, 0.0, 1.0)
+        preserved_sides.clear()
+
+    for side_index, side in enumerate(SIDES):
+        if side in preserved_sides:
+            continue
         for finger in (runtime.finger_joints or {}).get(side, ()):
             span = np.float32(finger.open_value - finger.closed_value)
             qpos[:, finger.index] = (

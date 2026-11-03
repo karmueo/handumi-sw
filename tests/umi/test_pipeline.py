@@ -160,8 +160,11 @@ def no_collision_for_motion_tests(monkeypatch):
 
 
 def test_rm75_replay_and_conversion(capture, tmp_path, no_collision_for_motion_tests):
-    """同一片段通过实际 IK 转换后仍保持七轴与独立开度。"""
-    from handumi.dataset.canonical import canonicalize_joint_trajectory
+    """同一片段经 IK 转换后保持内部九维、规范七轴并逐帧恢复双指。"""
+    from handumi.dataset.canonical import (
+        canonical_joint_layout,
+        canonicalize_joint_trajectory,
+    )
     from handumi.dataset.writer import EpisodeResult, write_dataset
     from handumi.robots.registry import load_embodiment
     from handumi.scripts.replay import replay_in_sim as replay
@@ -169,7 +172,7 @@ def test_rm75_replay_and_conversion(capture, tmp_path, no_collision_for_motion_t
 
     runtime = load_embodiment("rm75b")
     assert runtime.active_sides == ("right",)
-    assert len(runtime.joint_names) == 7
+    assert len(runtime.joint_names) == 9
     urdf = runtime.load_urdf(load_meshes=True)
     assert {"gripper_link", "gripper_left_finger_link", "gripper_right_finger_link"} <= set(urdf.link_map)
     args = replay.build_parser().parse_args(
@@ -177,11 +180,12 @@ def test_rm75_replay_and_conversion(capture, tmp_path, no_collision_for_motion_t
     )
     args.repo_id, args.dataset_root = "local/umi-test", capture
     rollout = replay.solve_episode(args)
-    assert rollout["qpos"].shape == (32, 7)
+    assert rollout["qpos"].shape == (32, 9)
     np.testing.assert_allclose(
         rollout["gripper_normalized"][:, 1], np.linspace(0, 1, 32), atol=1e-6
     )
     canonical = canonicalize_joint_trajectory(rollout["qpos"], runtime=runtime)
+    assert canonical.shape == (32, 7)
     output = tmp_path / "converted"
     info = json.loads((capture / "meta/info.json").read_text())
     write_dataset(
@@ -199,7 +203,7 @@ def test_rm75_replay_and_conversion(capture, tmp_path, no_collision_for_motion_t
             )
         ],
         robot_type="rm75b",
-        joint_names=list(runtime.joint_names),
+        joint_names=canonical_joint_layout(runtime).names,
         fps=30,
         handumi_metadata={
             "state_layout": "yaml_arm_joints_plus_logical_gripper_width_m",
@@ -212,7 +216,23 @@ def test_rm75_replay_and_conversion(capture, tmp_path, no_collision_for_motion_t
     joint_args.external_layout = None
     result = joints.build_rollout(joint_args)
     np.testing.assert_allclose(
-        result["gripper_normalized"][:, 1], np.linspace(0, 1, 32)[:-1], atol=1e-6
+        result["gripper_normalized"][:, 1], rollout["gripper_normalized"][:-1, 1],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        result["qpos"][:, 7:], rollout["qpos"][:-1, 7:], atol=1e-6
+    )
+
+    # action[t] 是 t+1 的命令，验证独立开度列不会串到前一帧。
+    joint_args.source = "action"
+    action_result = joints.build_rollout(joint_args)
+    np.testing.assert_allclose(
+        action_result["gripper_normalized"][:, 1],
+        rollout["gripper_normalized"][1:, 1],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        action_result["qpos"][:, 7:], rollout["qpos"][1:, 7:], atol=1e-6
     )
 
 

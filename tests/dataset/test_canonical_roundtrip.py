@@ -7,6 +7,8 @@ as a robot that does not stand where the dataset says it does.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -17,7 +19,7 @@ from handumi.dataset.canonical import (
 )
 from handumi.robots.registry import load_embodiment
 
-EMBODIMENTS = ("piper", "openarmv1")
+EMBODIMENTS = ("piper", "openarmv1", "rm75b")
 
 
 @pytest.fixture(scope="module", params=EMBODIMENTS)
@@ -78,10 +80,115 @@ def test_gripper_survives_the_width_round_trip(runtime) -> None:
     _, fingers = _arm_and_finger_indices(runtime)
     if not fingers:
         pytest.skip(f"{runtime.name} declares no gripper joints")
+    if not any(side is not None for side in canonical_joint_layout(runtime).gripper_sides):
+        pytest.skip(f"{runtime.name} keeps gripper opening outside the canonical vector")
     # Conversion stores a physical width, so the opening passes through
     # normalized * max_width and back in float32 rather than being copied.
-    np.testing.assert_allclose(restored_normalized, normalized, atol=1e-6)
+    for side_index, side in enumerate(("left", "right")):
+        if not runtime.finger_joints.get(side):
+            continue
+        np.testing.assert_allclose(
+            restored_normalized[:, side_index], normalized[:, side_index], atol=1e-6
+        )
     np.testing.assert_allclose(restored[:, fingers], qpos[:, fingers], atol=1e-7)
+
+
+def test_independent_opening_override_restores_fingers(runtime) -> None:
+    """独立开度列覆盖规范列默认值时，展开结果同步更新双指。"""
+    qpos, normalized = _sample(runtime)
+    canonical = canonicalize_joint_trajectory(
+        qpos, runtime=runtime, gripper_normalized=normalized
+    )
+    override = np.clip(normalized[::-1] * 1.3 - 0.1, 0.0, 1.0)
+    restored, restored_normalized = expand_canonical_trajectory(
+        canonical, runtime=runtime, gripper_normalized=override
+    )
+    _, fingers = _arm_and_finger_indices(runtime)
+    np.testing.assert_allclose(restored_normalized, override, atol=1e-7)
+    if not fingers:
+        pytest.skip(f"{runtime.name} declares no gripper joints")
+    for side_index, side in enumerate(("left", "right")):
+        for finger in runtime.finger_joints.get(side, ()):
+            expected = finger.closed_value + override[:, side_index] * (
+                finger.open_value - finger.closed_value
+            )
+            np.testing.assert_allclose(
+                restored[:, finger.index], expected, atol=1e-7
+            )
+    default, default_normalized = expand_canonical_trajectory(
+        canonical, runtime=runtime
+    )
+    layout = canonical_joint_layout(runtime)
+    if any(side is not None for side in layout.gripper_sides):
+        np.testing.assert_allclose(default[:, fingers], qpos[:, fingers], atol=1e-7)
+    else:
+        # 没有宽度列时，未提供独立开度就沿用 home 的真实夹指姿态。
+        np.testing.assert_allclose(
+            default[:, fingers],
+            np.tile(runtime.home_q()[fingers], (len(default), 1)),
+            atol=1e-7,
+        )
+        for side_index, side in enumerate(("left", "right")):
+            if runtime.finger_joints.get(side):
+                np.testing.assert_allclose(default_normalized[:, side_index], 1.0)
+
+
+def test_rm75b_keeps_seven_axis_layout_and_uses_independent_openings() -> None:
+    """RM75B 规范列保持七轴，独立 normalized 列负责驱动模型双指。"""
+    runtime = load_embodiment("rm75b")
+    layout = canonical_joint_layout(runtime)
+    assert layout.size == 7
+    assert layout.names == [f"joint{index}.pos" for index in range(1, 8)]
+    assert all(side is None for side in layout.gripper_sides)
+    old = np.tile(runtime.home_q()[:7], (3, 1)).astype(np.float32)
+    qpos, normalized = expand_canonical_trajectory(old, runtime=runtime)
+    np.testing.assert_array_equal(qpos[:, :7], old)
+    np.testing.assert_allclose(
+        qpos[:, 7:], np.tile(runtime.home_q()[7:], (3, 1)), atol=1e-7
+    )
+    np.testing.assert_allclose(normalized[:, 1], 1.0, atol=1e-7)
+
+    openings = np.asarray([[1.0, 1.0], [0.5, 0.5], [0.0, 0.0]], dtype=np.float32)
+    restored, restored_normalized = expand_canonical_trajectory(
+        old, runtime=runtime, gripper_normalized=openings
+    )
+    np.testing.assert_allclose(restored_normalized, openings, atol=1e-7)
+    expected_travel = 0.018134 * (1.0 - openings[:, 1])
+    np.testing.assert_allclose(
+        restored[:, 7], expected_travel, atol=1e-7
+    )
+    np.testing.assert_allclose(
+        restored[:, 8], expected_travel, atol=1e-7
+    )
+    canonical = canonicalize_joint_trajectory(
+        restored, runtime=runtime, gripper_normalized=openings
+    )
+    assert canonical.shape == (3, 7)
+    np.testing.assert_array_equal(canonical, old)
+
+
+def test_no_width_layout_preserves_non_open_home() -> None:
+    """无宽度列时保留 home 的真实夹指位置，并如实报告其开度。"""
+    runtime = load_embodiment("rm75b")
+    home = runtime.config.home_q.copy()
+    home[7:] = [0.006, 0.003]
+    runtime = replace(
+        runtime,
+        config=replace(
+            runtime.config,
+            home_q=home,
+            home_poses={runtime.config.default_home_pose: home},
+        ),
+    )
+    canonical = np.tile(home[:7], (2, 1)).astype(np.float32)
+    qpos, normalized = expand_canonical_trajectory(canonical, runtime=runtime)
+    np.testing.assert_allclose(
+        qpos[:, 7:], np.tile(home[7:], (2, 1)), atol=1e-7
+    )
+    fractions = [
+        (home[index] - 0.018134) / (0.0 - 0.018134) for index in (7, 8)
+    ]
+    np.testing.assert_allclose(normalized[:, 1], np.mean(fractions), atol=1e-7)
 
 
 def test_expansion_rejects_a_foreign_layout(runtime) -> None:

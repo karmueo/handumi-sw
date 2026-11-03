@@ -300,8 +300,8 @@ def test_rm75b_ik_always_uses_collision_cost(rm75b_collision, monkeypatch):
     assert solver._collision_active(runtime.config.home_q)
 
 
-def test_gripper_box_covers_fixed_components_and_checks_arm():
-    """合并盒覆盖固定夹爪三个部件，且保留腕部等危险碰撞对。"""
+def test_gripper_box_covers_entire_opening_range_and_checks_arm():
+    """合并盒覆盖双指全行程，且保留腕部等危险碰撞对。"""
     from pyroki.collision import RobotCollision
 
     from handumi.robots.self_collision import (
@@ -317,11 +317,25 @@ def test_gripper_box_covers_fixed_components_and_checks_arm():
     assert len(geom) == 1
     center = np.asarray(model.centers)[geom[0]]
     extent = np.asarray(model.half_extents)[geom[0]]
-    for name in ("gripper_link", "gripper_left_finger_link", "gripper_right_finger_link"):
-        mesh = RobotCollision._get_trimesh_collision_geometries(urdf, name)
-        transform = urdf.get_transform(name, "gripper_link")
-        points = np.asarray(mesh.vertices) @ transform[:3, :3].T + transform[:3, 3]
-        assert np.all(np.abs(points - center) <= extent + 1e-7)
+    finger_joints = (
+        "gripper_left_finger_joint",
+        "gripper_right_finger_joint",
+    )
+    for travel in (0.0, 0.018134):
+        cfg = np.zeros(len(urdf.actuated_joint_names))
+        for name in finger_joints:
+            cfg[urdf.actuated_joint_names.index(name)] = travel
+        urdf.update_cfg(cfg)
+        for name in (
+            "gripper_link",
+            "gripper_left_finger_link",
+            "gripper_right_finger_link",
+        ):
+            mesh = RobotCollision._get_trimesh_collision_geometries(urdf, name)
+            transform = urdf.get_transform(name, "gripper_link")
+            points = np.asarray(mesh.vertices) @ transform[:3, :3].T + transform[:3, 3]
+            assert np.all(np.abs(points - center) <= extent + 1e-7), name
+    urdf.update_cfg(np.zeros(len(urdf.actuated_joint_names)))
     pairs = {(model.link_names[i], model.link_names[j]) for i, j in zip(model.active_idx_i, model.active_idx_j)}
     assert ("Link6", "gripper_link") in pairs
     assert ("Link7", "gripper_link") not in pairs
@@ -329,3 +343,87 @@ def test_gripper_box_covers_fixed_components_and_checks_arm():
     assert not checker._rotation_pairs
     assert not checker._check_pair(0, None, 0.0005, 0.001001).safe
     assert checker._check_pair(0, None, 0.002, 0.001001).safe
+
+
+def test_prismatic_fingers_use_displacement_motion_bound(rm75b_collision):
+    """平移关节按单位位移计，旋转专用扫掠认证不用于平移关节。"""
+    runtime, checker = rm75b_collision
+    finger_indices = [
+        index
+        for index, name in enumerate(runtime.joint_names)
+        if name in {
+            "gripper_left_finger_joint",
+            "gripper_right_finger_joint",
+        }
+    ]
+    assert finger_indices == [7, 8]
+    left_index, right_index = finger_indices
+    for pair_index, (i, j) in enumerate(zip(checker.indices_i, checker.indices_j)):
+        names = (checker.model.link_names[i], checker.model.link_names[j])
+        scales = checker._pair_motion_scales[pair_index]
+        if "gripper_left_finger_link" in names:
+            assert scales[left_index] == pytest.approx(1.0)
+        if "gripper_right_finger_link" in names:
+            assert scales[right_index] == pytest.approx(1.0)
+    for joint_index, _, _ in checker._rotation_pairs.values():
+        assert joint_index not in finger_indices
+    closed = runtime.home_q()
+    runtime.set_finger_positions(closed, {"right": 0.0})
+    result = checker.check_segment(runtime.home_q(), closed)
+    assert result.safe
+    assert np.max(np.abs(closed - runtime.home_q())) == pytest.approx(0.018134)
+
+
+def test_retry_preserves_explicit_finger_opening():
+    """碰撞重试期间求解器不得改写调用方指定的夹指开度。"""
+    from dataclasses import dataclass
+
+    checker = _synthetic_checker(lambda x: 0.1)
+    seen = []
+    original_pose = checker.check_pose
+
+    def record_pose(q):
+        """记录碰撞检查实际看到的完整候选。"""
+        seen.append(np.asarray(q, dtype=np.float32).copy())
+        return original_pose(q)
+
+    checker.check_pose = record_pose
+
+    @dataclass(frozen=True)
+    class Config:
+        """仅包含重试过程需要的权重。"""
+
+        self_collision_weight: float = 0.0
+
+    class Solver:
+        """模拟求解器把夹指重置为零，验证外部修正会被重新应用。"""
+
+        config = Config()
+
+        def ik(self, previous, **kwargs):
+            """返回错误开度，迫使重试流程重新应用指定值。"""
+            return np.asarray([previous[0], 0.0, 0.0], dtype=np.float32)
+
+    def preserve(candidate):
+        """恢复录制开度。"""
+        candidate = np.asarray(candidate, dtype=np.float32)
+        candidate[1:] = 0.018134
+        return candidate
+
+    attempts = []
+
+    def assess(candidate):
+        """首次超差以触发重试，之后接受。"""
+        attempts.append(candidate.copy())
+        return "pose error" if len(attempts) == 1 else None
+
+    accepted = retry_checked_candidate(
+        solver=Solver(), checker=checker, previous=np.asarray([0.05]),
+        candidate=np.asarray([0.05, 0.0, 0.0]), left_pose=None, right_pose=None,
+        assess=assess, frame=3, check_motion=False,
+        candidate_transform=preserve,
+    )
+    assert len(seen) == 2
+    for q in seen:
+        assert q[1] == pytest.approx(0.018134) and q[2] == pytest.approx(0.018134)
+    assert accepted[1] == pytest.approx(0.018134) and accepted[2] == pytest.approx(0.018134)

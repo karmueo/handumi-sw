@@ -16,8 +16,8 @@ import trimesh
 # 浮点运算及网格读取误差的保守余量，单位米。
 _GEOMETRY_PADDING = 1e-5
 _NUMERIC_PADDING = 1e-6
-COLLISION_VALIDATION_VERSION = "rm75b-mesh-swept-v3"
-GRIPPER_BOX_VALIDATION_VERSION = "rm75b-gripper-box-swept-v1"
+COLLISION_VALIDATION_VERSION = "rm75b-mesh-swept-v4-prismatic"
+GRIPPER_BOX_VALIDATION_VERSION = "rm75b-gripper-box-swept-v2-prismatic"
 
 
 @jdc.pytree_dataclass
@@ -127,17 +127,38 @@ def build_rm75b_collision_model(urdf):
 
 
 def build_rm75b_gripper_box_model(urdf):
-    """合并固定夹爪三个网格为一个盒，并与非邻接机械臂盒配对。"""
+    """合并夹爪完整开合行程的网格包络为一个盒，并与非邻接机械臂盒配对。"""
     from pyroki._robot_urdf_parser import RobotURDFParser
 
     _, info = RobotURDFParser.parse(urdf)
     names = info.names
     assembly = ("gripper_link", "gripper_left_finger_link", "gripper_right_finger_link")
+    original_cfg = np.asarray(urdf.cfg, dtype=np.float64).copy()
     vertices = []
-    for name in assembly:
-        mesh = pk.collision.RobotCollision._get_trimesh_collision_geometries(urdf, name)
-        transform = urdf.get_transform(name, "gripper_link")
-        vertices.append(np.asarray(mesh.vertices) @ transform[:3, :3].T + transform[:3, 3])
+    try:
+        for name in assembly:
+            mesh = pk.collision.RobotCollision._get_trimesh_collision_geometries(urdf, name)
+            joint = next((item for item in urdf.robot.joints if item.child == name), None)
+            values = [0.0]
+            if (
+                joint is not None
+                and joint.type == "prismatic"
+                and joint.limit is not None
+            ):
+                # 平移关节在两端之间线性运动，端点包络即可覆盖整个行程。
+                values = [float(joint.limit.lower), float(joint.limit.upper)]
+            for value in dict.fromkeys(values):
+                if joint is not None and joint.name in urdf.actuated_joint_names:
+                    cfg = original_cfg.copy()
+                    cfg[urdf.actuated_joint_names.index(joint.name)] = value
+                    urdf.update_cfg(cfg)
+                transform = urdf.get_transform(name, "gripper_link")
+                vertices.append(
+                    np.asarray(mesh.vertices) @ transform[:3, :3].T + transform[:3, 3]
+                )
+    finally:
+        # 构建只读包络，不改变调用方当前关节配置。
+        urdf.update_cfg(original_cfg)
     points = np.concatenate(vertices)
     if not np.isfinite(points).all() or not len(points):
         raise ValueError("RM75B gripper collision geometry is missing or invalid")
@@ -203,24 +224,8 @@ class CollisionChecker:
         if not len(self.indices_i):
             raise ValueError("Self-collision model contains no active link pairs")
         self._distances = jax.jit(lambda q: model.compute_self_collision_distance(robot, q))
-        # 任一盒体点到任一上游转轴的距离不超过全部关节平移长度之和
-        # 加该盒体相对连杆原点的最大长度。两连杆各自运动界相加。
-        chain_length = sum(
-            float(np.linalg.norm(j.origin[:3, 3]))
-            for j in urdf.robot.joints if j.origin is not None
-        )
-        origins = np.asarray(model.centers)
-        extents = np.asarray(model.half_extents)
-        max_extent = float(np.max(np.linalg.norm(origins, axis=1) + np.linalg.norm(extents, axis=1)))
-        self.pair_motion_scale = 2 * (chain_length + max_extent)
+        # 逐对运动界：旋转关节按连杆网格半径估算，平移关节按实际位移计。
         joint_by_name = {joint.name: joint for joint in urdf.robot.joints}
-        # 全链长上界适用于 RM75B 转动关节；平移关节会改变下游臂长，
-        # 不具备专门上界时禁止复用此认证器。
-        unsupported = [name for name in robot.joints.actuated_names
-                       if joint_by_name[name].type not in {"revolute", "continuous"}]
-        if unsupported:
-            raise ValueError(f"Unsupported joints in collision motion bound: {unsupported}")
-        self.motion_scales = np.full(len(robot.joints.actuated_names), self.pair_motion_scale)
         # 连杆对在共同祖先处的整体运动不改变其相对距离。
         by_child = {joint.child: joint for joint in urdf.robot.joints}
         joint_indices = {name: i for i, name in enumerate(robot.joints.actuated_names)}
@@ -253,8 +258,35 @@ class CollisionChecker:
             for name, path in zip(names, pair_paths):
                 radius = float(np.linalg.norm(self._meshes[name].vertices, axis=1).max())
                 for joint in path:
-                    if joint.name not in shared and joint.name in joint_indices:
-                        scales[joint_indices[joint.name]] = radius
+                    if joint.name in joint_indices:
+                        model_joint = joint_by_name[joint.name]
+                        is_prismatic = model_joint.type == "prismatic"
+                        axis_norm = 1.0
+                        travel = 0.0
+                        if is_prismatic:
+                            axis = (
+                                np.asarray([1.0, 0.0, 0.0])
+                                if model_joint.axis is None
+                                else np.asarray(model_joint.axis, dtype=np.float64)
+                            )
+                            axis_norm = float(np.linalg.norm(axis))
+                            if model_joint.limit is None:
+                                raise ValueError(
+                                    f"{joint.name}: prismatic collision motion bound "
+                                    "requires finite limits"
+                                )
+                            travel = axis_norm * max(
+                                abs(float(model_joint.limit.lower)),
+                                abs(float(model_joint.limit.upper)),
+                            )
+                        if joint.name not in shared:
+                            scales[joint_indices[joint.name]] = max(
+                                scales[joint_indices[joint.name]],
+                                axis_norm if is_prismatic else radius,
+                            )
+                        if is_prismatic:
+                            # 下游平移会增大上游转轴相对该连杆的工作半径。
+                            radius += travel
                     if joint.origin is not None:
                         radius += float(np.linalg.norm(joint.origin[:3, 3]))
             self._pair_motion_scales.append(scales)
@@ -264,7 +296,8 @@ class CollisionChecker:
             # 第二个连杆相对第一个连杆只绕该轴转动，可使用解析扫掠认证。
             if (len(exclusive) == 1 and not any(joint.name not in shared and joint.name in joint_indices
                                                  for joint in pair_paths[0])
-                    and exclusive[0].parent == names[0]):
+                    and exclusive[0].parent == names[0]
+                    and joint_by_name[exclusive[0].name].type in {"revolute", "continuous"}):
                 joint = exclusive[0]
                 origin = np.eye(4) if joint.origin is None else np.asarray(joint.origin)
                 joint_axis = (np.asarray([1.0, 0.0, 0.0]) if joint.axis is None
@@ -500,15 +533,23 @@ def require_clear(result: CollisionResult, *, phase: str, frame: int | str) -> N
 def retry_checked_candidate(
     *, solver, checker: CollisionChecker, previous, candidate, left_pose,
     right_pose, assess, frame, check_motion: bool = True,
-    strict_fidelity: bool = True,
+    strict_fidelity: bool = True, candidate_transform=None,
 ):
     """重试碰撞和精度检查；非严格精度模式可退回已认证安全的候选。
 
     assess 返回精度超限说明或 None；无效数值应由 assess 抛出异常拒绝。
     strict_fidelity 为假时，重试耗尽仍可返回首个安全候选，由调用方报告误差。
-    所有返回候选均须通过姿态或连续运动碰撞检查。
+    candidate_transform 在每次求解后强制恢复外部指定的关节值（例如录制
+    夹爪开度），使碰撞检查针对实际将执行的候选；所有返回候选均须通过
+    姿态或连续运动碰撞检查。
     """
     from dataclasses import replace
+
+    def enforce(value):
+        """应用调用方指定的候选修正，未提供时保持求解结果。"""
+        if candidate_transform is None:
+            return value
+        return candidate_transform(np.asarray(value, dtype=np.float32))
 
     original = solver.config
     result = None
@@ -519,6 +560,7 @@ def retry_checked_candidate(
             if weight is not None:
                 solver.config = replace(original, self_collision_weight=weight)
                 candidate = solver.ik(previous, left_pose=left_pose, right_pose=right_pose)
+            candidate = enforce(candidate)
             result = (checker.check_segment(previous, candidate) if check_motion
                       else checker.check_pose(candidate))
             error = assess(candidate)

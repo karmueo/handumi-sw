@@ -287,10 +287,52 @@ def resolved_robot(args: argparse.Namespace, info: dict[str, object]) -> str:
     )
 
 
+def _normalized_openings(table, prefix: str) -> np.ndarray | None:
+    """读取一组独立归一化开度列；列缺失时返回 None。"""
+    keys = [f"{prefix}.gripper.{side}.normalized" for side in ("left", "right")]
+    if not all(key in table.column_names for key in keys):
+        return None
+    openings = np.column_stack(
+        [_column_float32(table, key).reshape(-1) for key in keys]
+    )
+    if not np.isfinite(openings).all() or np.any((openings < 0) | (openings > 1)):
+        raise ValueError("转换数据开度无效")
+    return openings
+
+
+def _full_episode_openings(args: argparse.Namespace) -> np.ndarray | None:
+    """按 observation 状态与最后一帧 action 重建完整开度序列。
+
+    该重建不依赖 ``--source``：状态提供 t=0..T-2，action 的最后一帧提供
+    t=T-1。缺少任一侧独立开度列时返回 None，由调用方跳过夹指差异比较，
+    避免把 home 全开误报为转换误差。
+    """
+    observation = getattr(args, "observation_openings", None)
+    action = getattr(args, "action_openings", None)
+    if (
+        observation is None
+        or action is None
+        or len(observation) == 0
+        or len(action) == 0
+    ):
+        return None
+    return np.concatenate(
+        [
+            np.asarray(observation, dtype=np.float32),
+            np.asarray(action[-1:], dtype=np.float32),
+        ],
+        axis=0,
+    )
+
+
 def load_joint_episode(
     args: argparse.Namespace,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Return ``(states, actions, fps)`` for one converted episode."""
+    """读取单段转换数据，返回 ``(states, actions, fps)``。
+
+    同时缓存 observation 与 action 的独立开度列：回放按当前 ``source``
+    选择其一，验证流程则用两者重建完整状态序列。
+    """
     ref = DatasetRef.from_repo_id(
         args.repo_id,
         root=args.dataset_root,
@@ -309,16 +351,20 @@ def load_joint_episode(
     if len(states) == 0:
         raise SystemExit(f"Episode {args.episode} is empty.")
     prefix = "action" if getattr(args, "source", "observation.state") == "action" else "observation"
-    keys = [f"{prefix}.gripper.{side}.normalized" for side in ("left", "right")]
-    args.recorded_openings = None
+    observation_openings = _normalized_openings(table, "observation")
+    action_openings = _normalized_openings(table, "action")
+    args.observation_openings = observation_openings
+    args.action_openings = action_openings
+    args.recorded_openings = (
+        action_openings if prefix == "action" else observation_openings
+    )
     info = getattr(getattr(dataset, "meta", None), "info", {})
-    if info.get("handumi", {}).get("capture_schema") == "synchronized_sources_v2" and not all(key in table.column_names for key in keys):
+    if (
+        info.get("handumi", {}).get("capture_schema")
+        == "synchronized_sources_v2"
+        and args.recorded_openings is None
+    ):
         raise ValueError("转换后的 UMI 数据缺少独立开度列")
-    if all(key in table.column_names for key in keys):
-        openings = np.column_stack([_column_float32(table, key).reshape(-1) for key in keys])
-        if not np.isfinite(openings).all() or np.any((openings < 0) | (openings > 1)):
-            raise ValueError("转换数据开度无效")
-        args.recorded_openings = openings
     return states, actions, fps
 
 
@@ -367,10 +413,17 @@ def build_rollout(args: argparse.Namespace) -> dict[str, np.ndarray]:
     canonical = selected[frame_indices]
     if external is not None:
         canonical = to_canonical(canonical, layout=external, runtime=runtime)
-    qpos, gripper_normalized = expand_canonical_trajectory(canonical, runtime=runtime)
-
-    if getattr(args, "recorded_openings", None) is not None:
-        gripper_normalized = args.recorded_openings[frame_indices]
+    recorded_openings = getattr(args, "recorded_openings", None)
+    # 独立开度列优先于规范列中的物理宽度，确保双指与录制开度逐帧一致。
+    qpos, gripper_normalized = expand_canonical_trajectory(
+        canonical,
+        runtime=runtime,
+        gripper_normalized=(
+            recorded_openings[frame_indices]
+            if recorded_openings is not None
+            else None
+        ),
+    )
     solver = runtime.solver_cls()
     tool_poses = _recorded_tool_poses(meta, runtime)
     start = time.perf_counter()
@@ -554,21 +607,13 @@ def _ik_fidelity_entry(
 
 
 def verify_episode(args: argparse.Namespace) -> bool:
-    """Report whether the stored joints still match what replay produces.
+    """报告存储关节是否仍与回放结果一致。
 
-    Two checks with deliberately different standards.
-
-    Integrity is exact and offline: rebuilding the solved array from the
-    overlapping state/action views must reproduce the conversion hash byte for
-    byte. Nothing about it depends on re-running a solver.
-
-    Solver agreement re-solves the capture and compares in task space. It is
-    NOT a bit-exact check, because the IK solver is not reproducible run to
-    run: two consecutive solves of the same episode with identical arguments
-    on one machine differ by ~2e-3 rad. That is why conversion reuses the
-    trajectory replay already solved instead of solving again, and why the
-    honest question here is whether both land on the same motion, not on the
-    same bits.
+    包含两项标准不同的检查。完整性检查离线且精确：由重叠的 state/action
+    视图重建的轨迹必须逐字节复现转换哈希，不依赖重新求解。求解一致性会
+    重新求解采集数据并在任务空间比较；IK 不可逐位复现，因此只判断运动
+    是否一致。夹指差异使用 observation 状态加最后一帧 action 重建完整
+    独立开度序列，避免按当前 ``--source`` 取列造成错位。
     """
     info = args.dataset_info
     meta = handumi_metadata(info)
@@ -587,6 +632,18 @@ def verify_episode(args: argparse.Namespace) -> bool:
     # state[t] is the command at t and action[t] the command at t+1, so the
     # original array is the states plus the final action.
     joint_array = np.concatenate([states, actions[-1:]], axis=0).astype(np.float32)
+    verification_openings = _full_episode_openings(args)
+    if (
+        verification_openings is not None
+        and len(verification_openings) != len(joint_array)
+    ):
+        ok = False
+        print(
+            "[verify] FAIL openings: rebuilt "
+            f"{len(verification_openings)} from states/actions, expected "
+            f"{len(joint_array)}."
+        )
+        verification_openings = None
     report = _ik_fidelity_entry(meta, source_index)
     if report is None:
         print("[verify] conversion recorded no ik_fidelity entry; skipping hash check.")
@@ -631,7 +688,11 @@ def verify_episode(args: argparse.Namespace) -> bool:
         )
         return False
 
-    expanded, _ = expand_canonical_trajectory(joint_array, runtime=runtime)
+    expanded, _ = expand_canonical_trajectory(
+        joint_array,
+        runtime=runtime,
+        gripper_normalized=verification_openings,
+    )
     solver = runtime.solver_cls()
     left = np.empty((len(expanded), 7), dtype=np.float32)
     right = np.empty((len(expanded), 7), dtype=np.float32)
@@ -688,15 +749,25 @@ def verify_episode(args: argparse.Namespace) -> bool:
     )
     print(f"[verify] .... arm joints: max |diff| = {arm_diff:.3e} rad")
     if finger_indices:
-        finger_diff = float(
-            np.abs(expanded[:, finger_indices] - replay_qpos[:, finger_indices]).max()
+        has_width_column = any(
+            side is not None for side in layout.gripper_sides
         )
-        # Conversion stores a physical width, so the opening makes a round trip
-        # through normalized * max_width in float32 before coming back.
-        print(
-            f"[verify] .... gripper joints: max |diff| = {finger_diff:.3e} "
-            "(width round-trip)"
-        )
+        if verification_openings is None and not has_width_column:
+            print(
+                "[verify] .... gripper joints: independent openings "
+                "unavailable; skipped."
+            )
+        else:
+            finger_diff = float(
+                np.abs(
+                    expanded[:, finger_indices] - replay_qpos[:, finger_indices]
+                ).max()
+            )
+            # 宽度列经过归一化/宽度往返，独立开度列则按录制值直接恢复。
+            print(
+                f"[verify] .... gripper joints: max |diff| = {finger_diff:.3e} "
+                "(recorded opening)"
+            )
     digest = hashlib.sha256(replay_qpos.tobytes()).hexdigest()
     if report is not None:
         expected = str(report.get("qpos_sha256", ""))

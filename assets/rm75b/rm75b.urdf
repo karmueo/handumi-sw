@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<!-- 瑞尔曼七轴机械臂和固定姿态夹爪模型；Link7 为法兰。 -->
+<!-- 瑞尔曼七轴机械臂和可开合夹爪模型；Link7 为法兰，夹指零位为 CAD 全开姿态。 -->
 <robot name="rm_75_description">
   <link name="base_link">
     <inertial>
@@ -230,8 +230,10 @@
     夹爪源模型为用户提供的夹爪.stp，包含夹爪、底板和相机。
     STL 使用毫米和原装配坐标，按 0.001 缩放为米。
     夹指沿 +Z 伸出，底板接合面按 Link7 居中并沿 +Z 偏移 6 mm。
-    左右夹指固定在 CAD 姿态；此安装偏移不是实测 TCP 标定。
-    没有实测质量和惯量，夹爪未定义动力学参数。
+    左右夹指沿 X 平移；零位保留 CAD 全开姿态，向内最大各 18.134 mm，
+    闭合后两指整体 X 边界仍保留约 0.2 mm 间隙。该范围由 STL 实际边界
+    计算，用于避免网格边界相交，不代表实物净宽或抓取精度。
+    该安装偏移不是实测 TCP 标定；夹爪没有实测质量和惯量，未定义动力学参数。
   -->
   <link name="gripper_link">
     <visual>
@@ -268,10 +270,12 @@
       </geometry>
     </collision>
   </link>
-  <joint name="gripper_left_finger_joint" type="fixed">
+  <joint name="gripper_left_finger_joint" type="prismatic">
     <origin xyz="0 0 0" rpy="0 0 0" />
     <parent link="gripper_link" />
     <child link="gripper_left_finger_link" />
+    <axis xyz="-1 0 0" />
+    <limit lower="0" upper="0.018134" effort="50" velocity="0.1" />
   </joint>
   <link name="gripper_right_finger_link">
     <visual>
@@ -286,9 +290,11 @@
       </geometry>
     </collision>
   </link>
-  <joint name="gripper_right_finger_joint" type="fixed">
+  <joint name="gripper_right_finger_joint" type="prismatic">
     <origin xyz="0 0 0" rpy="0 0 0" />
     <parent link="gripper_link" />
     <child link="gripper_right_finger_link" />
+    <axis xyz="1 0 0" />
+    <limit lower="0" upper="0.018134" effort="50" velocity="0.1" />
   </joint>
 </robot>

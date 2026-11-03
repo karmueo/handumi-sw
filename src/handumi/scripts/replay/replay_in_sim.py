@@ -1517,6 +1517,7 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
             left_pose7 = fk_left_pose7.copy()
         if "right" not in runtime.arms:
             right_pose7 = fk_right_pose7.copy()
+        opening = None
         if gripper_openings is not None:
             opening = gripper_openings[frame_index]
             runtime.set_finger_positions(
@@ -1552,6 +1553,16 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
                     return f"position={pos * 1000:.2f}mm rotation={rot:.2f}deg"
                 return None
 
+            def preserve_gripper_opening(candidate):
+                """碰撞重试后恢复本帧录制开度，避免求解器改写夹指。"""
+                if opening is None:
+                    return candidate
+                runtime.set_finger_positions(
+                    candidate,
+                    {"left": float(opening[0]), "right": float(opening[1])},
+                )
+                return candidate
+
             interpolated_q = q.copy()
             q = retry_checked_candidate(
                 solver=solver, checker=collision_checker, previous=previous_q,
@@ -1560,6 +1571,9 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 assess=assess_candidate, frame=int(frame_index),
                 check_motion=selected_index > 0,
                 strict_fidelity=args.strict_ik,
+                candidate_transform=(
+                    preserve_gripper_opening if gripper_openings is not None else None
+                ),
             )
             if not np.array_equal(interpolated_q, q):
                 keyframe_end = -1

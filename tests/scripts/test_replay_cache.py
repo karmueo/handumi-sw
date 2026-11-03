@@ -89,7 +89,7 @@ def _rollout(error=0.0):
     """生成帧数一致的完整最小回放结果。"""
     poses = np.tile([0, 0, 0, 0, 0, 0, 1], (2, 1)).astype(np.float32)
     result = {
-        "qpos": np.zeros((2, 7), dtype=np.float32),
+        "qpos": np.zeros((2, 9), dtype=np.float32),
         "frame_indices": np.arange(2),
         "fps": np.asarray([30.0]),
         "gripper_normalized": np.zeros((2, 2)),
@@ -609,6 +609,24 @@ def test_rm75b_collision_mesh_changes_cache_identity(tmp_path, monkeypatch):
 
     monkeypatch.setattr(prepare, "digest_file", changed)
     assert prepare.episode_identity(args, tuple(loaded))[0] != original
+
+
+def test_rm75b_gripper_model_changes_cache_identity(tmp_path, monkeypatch):
+    """夹爪 URDF 或机器人配置变化都会使 RM75B 缓存失效。"""
+    args, loaded, _ = _args_and_loaded(tmp_path, monkeypatch)
+    original, payload = prepare.episode_identity(args, tuple(loaded))
+    assert payload["urdf_sha256"] and payload["robot_config_sha256"]
+    digest = prepare.digest_file
+    for suffix in ("rm75b.urdf", "rm75b.yaml"):
+        def changed(path, *, suffix=suffix):
+            """模拟单个模型或配置文件内容变更。"""
+            if path is not None and str(path).endswith(suffix):
+                return "changed"
+            return digest(path)
+
+        with monkeypatch.context() as context:
+            context.setattr(prepare, "digest_file", changed)
+            assert prepare.episode_identity(args, tuple(loaded))[0] != original
 
 
 def test_rm75b_cached_approach_is_rechecked(tmp_path, monkeypatch):

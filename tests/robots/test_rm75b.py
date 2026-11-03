@@ -1,4 +1,4 @@
-"""验证 RM75B 夹爪资源及其对七轴运动学的兼容性。"""
+"""验证 RM75B 双指开合资源及其对七轴运动学的兼容性。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import trimesh
 import yourdfpy
 
 from handumi.robots.registry import load_embodiment, yourdfpy_handler
+
+GRIPPER_TRAVEL_M = 0.018134
 
 
 @pytest.fixture(scope="module")
@@ -57,21 +59,63 @@ def test_gripper_meshes_are_loaded_with_meter_scale_and_follow_flange(runtime):
     )
 
 
-def test_fixed_gripper_preserves_seven_axis_and_opening_independence(runtime):
-    """夹指保持固定，开度输入不会改变七轴命令。"""
-    assert runtime.joint_names == tuple(f"joint{i}" for i in range(1, 8))
+def test_gripper_joints_use_bounded_prismatic_travel(runtime):
+    """两指为有界平移关节，七轴接口和法兰保持不变。"""
+    assert runtime.joint_names == tuple(f"joint{i}" for i in range(1, 8)) + (
+        "gripper_left_finger_joint",
+        "gripper_right_finger_joint",
+    )
+    assert runtime.home_q().shape == (9,)
     assert runtime.command_size == 7
-    assert runtime.arm_joint_names("right") == list(runtime.joint_names)
+    assert runtime.config.canonical_gripper_width_column is False
+    assert runtime.arm_joint_names("right") == [f"joint{i}" for i in range(1, 8)]
     assert runtime.arms["right"].ee_link == "Link7"
-    assert not runtime.finger_joints["right"]
+    assert len(runtime.finger_joints["right"]) == 2
     urdf = runtime.load_urdf()
-    for name in ("gripper_left_finger_joint", "gripper_right_finger_joint"):
-        assert urdf.joint_map[name].type == "fixed"
+    for name, direction in (
+        ("gripper_left_finger_joint", (-1.0, 0.0, 0.0)),
+        ("gripper_right_finger_joint", (1.0, 0.0, 0.0)),
+    ):
+        joint = urdf.joint_map[name]
+        assert joint.type == "prismatic"
+        np.testing.assert_allclose(joint.axis, direction)
+        assert joint.limit.lower == 0.0
+        assert joint.limit.upper == pytest.approx(GRIPPER_TRAVEL_M)
+
+
+@pytest.mark.parametrize(
+    ("opening", "travel"),
+    [(0.0, GRIPPER_TRAVEL_M), (0.5, GRIPPER_TRAVEL_M / 2), (1.0, 0.0)],
+)
+def test_gripper_mapping_is_linear_and_bidirectional(runtime, opening, travel):
+    """开度 0 为最大内移、1 为 CAD 姿态，左右指沿相反 X 方向线性移动。"""
     q = runtime.home_q()
-    original = q.copy()
-    for opening in (0.0, 0.5, 1.0):
+    runtime.set_finger_positions(q, {"right": opening})
+    np.testing.assert_allclose(q[-2:], [travel, travel], atol=1e-7)
+    urdf = runtime.load_urdf()
+    urdf.update_cfg(q)
+    left = urdf.get_transform("gripper_left_finger_link", "gripper_link")
+    right = urdf.get_transform("gripper_right_finger_link", "gripper_link")
+    np.testing.assert_allclose(left[:3, 3], [-travel, 0.0, 0.0], atol=1e-7)
+    np.testing.assert_allclose(right[:3, 3], [travel, 0.0, 0.0], atol=1e-7)
+
+
+def test_gripper_opening_is_clipped(runtime):
+    """越界开度被裁剪到 0 和 1，不改变七轴命令。"""
+    arm = runtime.home_q()[:7].copy()
+    for opening, expected in ((-0.5, GRIPPER_TRAVEL_M), (1.5, 0.0)):
+        q = runtime.home_q()
         runtime.set_finger_positions(q, {"right": opening})
-        np.testing.assert_array_equal(q, original)
+        np.testing.assert_allclose(q[-2:], [expected, expected], atol=1e-7)
+        np.testing.assert_array_equal(q[:7], arm)
+
+
+def test_viewer_joint_order_uses_full_state(runtime):
+    """查看器按九维实际关节构建，单臂命令仍保持七轴。"""
+    sim = runtime.make_sim(port=0)
+    assert sim._joint_names == list(runtime.joint_names)
+    assert len(sim._joint_names) == 9
+    assert sim._command_size == 7
 
 
 def test_gripper_does_not_change_flange_fk(runtime, tmp_path):
@@ -89,9 +133,14 @@ def test_gripper_does_not_change_flange_fk(runtime, tmp_path):
         load_meshes=False,
     )
     full = runtime.load_urdf()
-    for q in (np.zeros(7), runtime.home_q(), np.array([0.2, -0.3, 0.4, 0.5, -0.6, 0.7, -0.8])):
-        arm.update_cfg(q)
-        full.update_cfg(q)
+    for arm_q in (
+        np.zeros(7),
+        runtime.home_q()[:7],
+        np.array([0.2, -0.3, 0.4, 0.5, -0.6, 0.7, -0.8]),
+    ):
+        full_q = np.r_[arm_q, GRIPPER_TRAVEL_M, GRIPPER_TRAVEL_M]
+        arm.update_cfg(arm_q)
+        full.update_cfg(full_q)
         np.testing.assert_allclose(
             full.get_transform("Link7"), arm.get_transform("Link7"), atol=1e-9
         )

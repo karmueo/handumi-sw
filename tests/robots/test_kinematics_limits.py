@@ -24,8 +24,10 @@ def test_ik_enforces_limits_and_joint_step(rm75b, monkeypatch, bound, max_delta)
     )
     lower = np.asarray(rm75b.robot.joints.lower_limits)
     upper = np.asarray(rm75b.robot.joints.upper_limits)
-    # 从限位内 0.05 rad 出发，模拟迭代结束时残留 0.1 rad 的越界量。
-    current = lower + 0.05 if bound == "lower" else upper - 0.05
+    # 从限位内出发，模拟迭代结束时残留 0.1 rad 的越界量；夹指行程较短，
+    # 起始余量按各自行程缩小，避免测试输入本身越界。
+    margin = np.minimum(0.05, (upper - lower) / 4.0)
+    current = lower + margin if bound == "lower" else upper - margin
     unconverged = lower - 0.1 if bound == "lower" else upper + 0.1
     monkeypatch.setattr(
         kinematics, "solve_bimanual", lambda *args, **kwargs: unconverged.copy()

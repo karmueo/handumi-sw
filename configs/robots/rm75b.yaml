@@ -1,4 +1,4 @@
-# 瑞尔曼 RM75B 单臂运动学回放配置，Link7 表示法兰，夹爪固定于 CAD 姿态。
+# 瑞尔曼 RM75B 单臂运动学回放配置，Link7 表示法兰；夹指开度 1 为张开、0 为最闭合。
 kind: rm75b
 urdf: assets/rm75b/rm75b.urdf
 pkg_root: assets/rm75b
@@ -6,9 +6,20 @@ arms:
   right:
     ee_link: Link7
     joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, joint7]
-    gripper_joints: []
-# 参考设备的初始关节角，按弧度保存。
-home_q: [0.0, 0.3490658504, 0.0, 1.2217304764, 0.0, 1.5707963268, 1.5707963268]
+    gripper_joints:
+      - name: gripper_left_finger_joint
+        closed: 0.018134
+        open: 0.0
+      - name: gripper_right_finger_joint
+        closed: 0.018134
+        open: 0.0
+# 参考设备的初始关节角，按弧度保存；末两项为夹指，零位即完全张开。
+home_q:
+  [0.0, 0.3490658504, 0.0, 1.2217304764, 0.0, 1.5707963268, 1.5707963268, 0.0, 0.0]
+# CAD 全开时两指内侧 X 边界间距，按 STL 实际边界计算；闭合后约剩 0.2 mm。
+gripper_max_width_m: 0.036468
+# 训练数据保持既有七轴布局，夹爪开度只作为独立 normalized 辅助列。
+canonical_gripper_width_column: false
 ik_weights:
   pos: 100.0
   ori: 15.0
