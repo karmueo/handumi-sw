@@ -1,4 +1,4 @@
-"""Small pyroki bimanual IK wrapper driven by robot YAML configs."""
+"""根据机器人配置封装单臂与双臂 IK，约束关节输出并计算末端误差。"""
 
 from __future__ import annotations
 
@@ -457,6 +457,7 @@ class BimanualKinematicsSolver:
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
     ) -> np.ndarray:
+        """求解有效侧的末端目标，返回满足关节限位及每帧步长限制的关节角。"""
         del left_elbow_pos, right_elbow_pos
         if "left" not in self.active_sides:
             left_pose = None
@@ -466,10 +467,13 @@ class BimanualKinematicsSolver:
             return self._with_locked_joints(q_current)
 
         q_prev = self._with_locked_joints(q_current)
-        if left_pose is not None and right_pose is not None:
-            left_fk = right_fk = None
-        else:
+        if any(
+            side in self.active_sides and pose is None
+            for side, pose in (("left", left_pose), ("right", right_pose))
+        ):
             left_fk, right_fk = self.fk(q_prev)
+        else:
+            left_fk = right_fk = None
         tgt_pos = []
         tgt_wxyz = []
         target_indices = []
@@ -506,6 +510,13 @@ class BimanualKinematicsSolver:
             posture_q=self.posture_q,
             posture_weight=self.config.posture_weight,
             limit_margin=self.limit_margin,
+        )
+        # 迭代限位约束可能尚未完全收敛；先投影到模型限位，再限制每帧步长。
+        # 上一帧在限位内时，两步处理可同时保证限位与步长约束。
+        q_target = np.clip(
+            q_target,
+            np.asarray(self.robot.joints.lower_limits),
+            np.asarray(self.robot.joints.upper_limits),
         )
         q_limited = limit_joint_delta(q_prev, q_target, self.config.max_joint_delta)
         return self._with_locked_joints(q_limited)
