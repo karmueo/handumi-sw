@@ -22,7 +22,7 @@ class DeploymentCalibration:
 
     robot: str
     pose7: np.ndarray
-    path: Path
+    path: Path | None
     scope: str
     source: str
     verified: bool
@@ -138,6 +138,7 @@ def resolve_deployment_calibration(
     explicit_path: Path | None = None,
     profile: str = "auto",
     rig_config: Path = DEFAULT_RIG_CONFIG,
+    identity_fallback: bool = False,
 ) -> DeploymentCalibration:
     """Resolve explicit, lab-local, then canonical simulation placement."""
     if profile not in {"auto", "local", "sim"}:
@@ -183,6 +184,17 @@ def resolve_deployment_calibration(
                     f"{rig_config} selects {rig_lab!r}."
                 )
             return replace(calibration, lab=rig_lab)
+        if identity_fallback and profile == "auto":
+            return DeploymentCalibration(
+                robot=robot,
+                pose7=np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32),
+                path=None,
+                scope="assumed",
+                source="identity_assumed_table_equals_base",
+                verified=False,
+                profile="identity",
+                lab=None,
+            )
         if profile == "local":
             raise SystemExit(
                 f"No lab-local table calibration was found for {robot!r}. Create:\n"
@@ -214,6 +226,8 @@ def print_deployment_calibration(
             f"{prefix} warning: lab-local physical calibration is not verified; "
             "measure the real robot/table installation before hardware use."
         )
+    elif calibration.scope == "assumed":
+        print(f"{prefix} assumption: table and robot base frames coincide.")
     elif calibration.scope == "simulation":
         print(
             f"{prefix} note: simulation placement is not a physical lab calibration."
@@ -226,7 +240,7 @@ def deployment_calibration_metadata(calibration: DeploymentCalibration) -> dict[
 
     return {
         "robot": calibration.robot,
-        "path": portable_path(calibration.path),
+        "path": portable_path(calibration.path) if calibration.path is not None else None,
         "profile": calibration.profile,
         "scope": calibration.scope,
         "source": calibration.source,

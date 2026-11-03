@@ -280,6 +280,16 @@ handumi convert outputs/umi-demo --robot rm75b --retarget-mode local-relative --
 handumi replay-joints outputs/umi-joints --robot rm75b
 ```
 
+如需无窗口预先准备全部 episode，可运行：
+
+```bash
+handumi replay outputs/umi-demo --robot rm75b \
+  --retarget-mode absolute-tcp --strict-ik --headless --prepare-mode all
+```
+
+默认最多使用 8 个并行准备进程；可通过 `--prepare-workers` 根据 CPU 和内存调整。
+准备结果会写入缓存，相同输入和求解配置下再次运行时可复用。
+
 质量检查不通过时，先按报告重录或使用现有筛选流程。默认从 `[0,20,0,70,0,90,90]°` 开始，以 1∶1 相对运动映射至 Link7。查看目标/实际轨迹、IK 误差、开度百分比和曲线。目标机器人没有夹爪关节，转换结果仅有七轴，开度作为独立辅助列保存。
 
 原始数据仍是 16 维，未采集左侧中立填充，净宽槽位为零占位。新版 `synchronized_sources_v2` 和 `width_available=false` 表明没有米制净宽。读取器必须使用 `observation.gripper.right.normalized`，禁止将零占位解释为实测闭合；要求米制净宽的转换会拒绝该数据。

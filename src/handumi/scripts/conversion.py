@@ -276,7 +276,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     ik.add_argument("--max-reach", type=float, default=None, help=advanced("Workspace reach limit."))
     ik.add_argument(
         "--retarget-mode",
-        choices=("auto", "local-relative", "anchored", "absolute-table"),
+        choices=("auto", "local-relative", "anchored", "absolute-table", "absolute-tcp"),
         default="auto",
         help=advanced(
             "Retargeting mode shared with replay_in_sim.py. auto selects "
@@ -290,6 +290,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
         default="commanded",
         help=advanced("For local-relative mode, compose on previous target or achieved FK."),
     )
+    ik.add_argument("--base-placement", choices=("auto", "fixed", "episode-xy"), default="auto")
     ik.add_argument(
         "--translation-scale",
         type=float,
@@ -317,6 +318,10 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
         help=advanced("Use raw controller poses without Controller->TCP calibration."),
     )
     ik.add_argument(
+        "--robot-tcp-calibration", type=Path, default=None,
+        help=advanced("Robot end-link to TCP calibration snapshot."),
+    )
+    ik.add_argument(
         "--deployment-calibration",
         type=Path,
         default=None,
@@ -337,13 +342,13 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     ik.add_argument(
         "--absolute-orientation",
         choices=("relative-start", "table-absolute"),
-        default="relative-start",
+        default=None,
         help=advanced("Absolute-table tool orientation policy used by replay."),
     )
     ik.add_argument("--initial-solve-iterations", type=int, default=12, help=advanced("Initial unrestricted IK iterations."))
-    ik.add_argument("--initial-position-tolerance-m", type=float, default=0.01, help=advanced("Initial TCP tolerance."))
-    ik.add_argument("--max-ik-position-error-m", type=float, default=0.03, help=advanced("Maximum TCP position error."))
-    ik.add_argument("--max-ik-rotation-error-deg", type=float, default=45.0, help=advanced("Maximum TCP rotation error."))
+    ik.add_argument("--initial-position-tolerance-m", type=float, default=None, help=advanced("Initial TCP tolerance."))
+    ik.add_argument("--max-ik-position-error-m", type=float, default=None, help=advanced("Maximum TCP position error."))
+    ik.add_argument("--max-ik-rotation-error-deg", type=float, default=None, help=advanced("Maximum TCP rotation error."))
     ik.add_argument("--table-clearance-warning-m", type=float, default=0.10, help=advanced("Table-clearance warning threshold."))
     ik.add_argument(
         "--strict-ik",
@@ -370,6 +375,10 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
             "screening produced under identical solver settings."
         ),
     )
+    parser.add_argument("--cache-dir", type=Path, default=None,
+                        help="Directory for complete per-episode replay caches.")
+    parser.add_argument("--refresh-cache", action="store_true",
+                        help="Recompute complete per-episode caches.")
     parser.add_argument(
         "--allow-flagged-episodes",
         action="store_true",
@@ -482,6 +491,11 @@ def _resolve_cli_profile(
 ) -> None:
     """Resolve conversion defaults that do not require source dataset metadata."""
     args.piper = args.embodiment == "piper"
+    if getattr(args, "refresh_cache", False) and args.no_solve_cache:
+        parser.error("--refresh-cache and --no-solve-cache are mutually exclusive.")
+    from handumi.scripts.replay.replay_in_sim import resolve_replay_options
+
+    resolve_replay_options(args)
 
     if args.initial_solve_iterations < 1:
         parser.error("--initial-solve-iterations must be >= 1.")
@@ -514,19 +528,29 @@ def _resolve_retarget_mode(
             f"(tracking_workspace={workspace!r})"
         )
 
-    if args.retarget_mode == "absolute-table":
+    if args.retarget_mode in {"absolute-table", "absolute-tcp"}:
         try:
             selection = resolve_deployment_calibration(
                 args.embodiment,
                 explicit_path=args.deployment_calibration,
                 profile=args.deployment_profile,
                 rig_config=args.rig_config,
+                identity_fallback=args.retarget_mode == "absolute-tcp",
             )
         except SystemExit as exc:
             parser.error(str(exc))
         args.deployment_selection = selection
         args.deployment_calibration = selection.path
         print_deployment_calibration(selection, prefix="[convert]")
+        if args.retarget_mode == "absolute-tcp":
+            from handumi.calibration.robot_tcp import load_robot_tcp_calibration
+            from handumi.robots.registry import load_robot_config
+
+            config = load_robot_config(args.embodiment)
+            args.robot_tcp_selection = load_robot_tcp_calibration(
+                args.embodiment, config.arms,
+                explicit_path=args.robot_tcp_calibration,
+            )
 
 
 def _deployment_calibration_metadata(args: argparse.Namespace) -> dict[str, Any] | None:
@@ -534,7 +558,14 @@ def _deployment_calibration_metadata(args: argparse.Namespace) -> dict[str, Any]
     if selection is None:
         return None
     metadata = deployment_calibration_metadata(selection)
-    metadata["sha256"] = hashlib.sha256(selection.path.read_bytes()).hexdigest()
+    metadata["sha256"] = (
+        hashlib.sha256(selection.path.read_bytes()).hexdigest()
+        if selection.path is not None else None
+    )
+    metadata["robot_from_table_pose7"] = selection.pose7.tolist()
+    if args.retarget_mode == "absolute-tcp":
+        metadata["role"] = "reference"
+        metadata["per_episode"] = True
     return metadata
 
 
@@ -960,7 +991,7 @@ def _presolve_one(episode: int, _state: dict[str, object]) -> dict[str, object]:
     import contextlib
     import io
 
-    from handumi.scripts.replay.replay_in_sim import solve_episode as _solve
+    from handumi.scripts.replay.replay_prepare import prepare_episode as _solve
 
     args = _PRESOLVE_ARGS["args"]
     replay_args = _replay_args_for_episode(args, episode)
@@ -987,7 +1018,7 @@ def _cached_solve_for(
     args: argparse.Namespace, episode: int
 ) -> dict[str, np.ndarray] | None:
     """The screening solve for this episode, when it is still valid."""
-    if args.no_solve_cache:
+    if args.no_solve_cache or getattr(args, "refresh_cache", False):
         return None
     selection = getattr(args, "deployment_selection", None)
     return load_cached_solve(
@@ -1064,6 +1095,7 @@ def _replay_args_for_episode(
     replay_args.robot = args.embodiment
     replay_args.source = args.source
     replay_args.retarget_mode = args.retarget_mode
+    replay_args.base_placement = getattr(args, "base_placement", "auto")
     replay_args.compose_source = args.compose_source
     replay_args.translation_scale = args.translation_scale
     replay_args.controller_device = args.controller_device
@@ -1073,6 +1105,7 @@ def _replay_args_for_episode(
     replay_args.deployment_profile = args.deployment_profile
     replay_args.rig_config = args.rig_config
     replay_args.deployment_selection = getattr(args, "deployment_selection", None)
+    replay_args.robot_tcp_calibration = getattr(args, "robot_tcp_calibration", None)
     replay_args.absolute_orientation = args.absolute_orientation
     replay_args.initial_solve_iterations = args.initial_solve_iterations
     replay_args.initial_position_tolerance_m = args.initial_position_tolerance_m
@@ -1080,7 +1113,10 @@ def _replay_args_for_episode(
     replay_args.max_ik_position_error_m = args.max_ik_position_error_m
     replay_args.max_ik_rotation_error_deg = args.max_ik_rotation_error_deg
     replay_args.table_clearance_warning_m = args.table_clearance_warning_m
-    replay_args.strict_ik = args.strict_ik
+    replay_args.strict_ik = args.strict_ik or args.retarget_mode == "absolute-tcp"
+    replay_args.cache_dir = getattr(args, "cache_dir", None)
+    replay_args.no_cache = args.no_solve_cache
+    replay_args.refresh_cache = getattr(args, "refresh_cache", False)
     return replay_args
 
 
@@ -1090,8 +1126,9 @@ def _solve_with_replay_pipeline(
     source_episode_index: int,
 ) -> dict[str, np.ndarray]:
     """Run the replay solver so absolute-table conversion has exact qpos parity."""
-    from handumi.scripts.replay.replay_in_sim import (
-        solve_episode as solve_replay_episode,
+    from handumi.scripts.replay.replay_prepare import (
+        load_prepared_episode,
+        prepare_episode,
     )
 
     replay_args = _replay_args_for_episode(args, source_episode_index)
@@ -1099,7 +1136,12 @@ def _solve_with_replay_pipeline(
     # doubles the IK cost of the pipeline for an identical result. The cached
     # trajectory is only used when the solver settings match exactly, and the
     # gate has already refused a stale dataset or robot geometry.
-    if not args.no_solve_cache:
+    if not args.no_solve_cache and not getattr(args, "refresh_cache", False):
+        complete = load_prepared_episode(replay_args)
+        if complete is not None:
+            _require_absolute_tcp_fidelity(args, complete)
+            print(f"[convert] reusing complete replay cache for episode {source_episode_index}")
+            return complete
         selection = getattr(args, "deployment_selection", None)
         cached = load_cached_solve(
             args.root,
@@ -1111,6 +1153,7 @@ def _solve_with_replay_pipeline(
             ),
         )
         if cached is not None:
+            _require_absolute_tcp_fidelity(args, cached)
             print(
                 f"[convert] reusing the screened solve for episode "
                 f"{source_episode_index}"
@@ -1118,8 +1161,34 @@ def _solve_with_replay_pipeline(
             return cached
     presolved = getattr(args, "presolved", {}).get(source_episode_index)
     if presolved is not None:
+        _require_absolute_tcp_fidelity(args, presolved)
         return presolved
-    return solve_replay_episode(replay_args)
+    return prepare_episode(replay_args)
+
+
+def _require_absolute_tcp_fidelity(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> None:
+    """复核缓存和预求解的 TCP 误差，拒绝输出任何超差帧。"""
+    if args.retarget_mode != "absolute-tcp":
+        return
+    frames = rollout.get("frame_indices", np.arange(len(rollout["qpos"])))
+    if (len(frames) != len(rollout["qpos"]) or any(
+        len(rollout[f"{side}_{metric}"]) != len(frames)
+        for side in ("left", "right") for metric in ("pos_error_m", "rot_error_deg")
+    )):
+        raise SystemExit("Invalid cached TCP rollout: frame, joint and error lengths differ.")
+    failures = []
+    for i, frame in enumerate(frames):
+        values = [float(rollout[f"{side}_{metric}"][i])
+                  for side in ("left", "right")
+                  for metric in ("pos_error_m", "rot_error_deg")]
+        if not np.isfinite(rollout["qpos"][i]).all() or not np.isfinite(values).all():
+            raise SystemExit(f"Invalid non-finite cached joint or TCP error at frame {int(frame)}.")
+        pos = max(values[0], values[2])
+        rot = max(values[1], values[3])
+        if pos > args.max_ik_position_error_m or rot > args.max_ik_rotation_error_deg:
+            failures.append(f"{int(frame)}: {pos * 1000:.2f}mm/{rot:.2f}deg")
+    if failures:
+        raise SystemExit("IK fidelity threshold exceeded; frames (position/rotation): " + ", ".join(failures))
 
 
 def _canonical_command_states_from_rollout(
@@ -1215,7 +1284,7 @@ def process_episode(
             "cannot construct (state, action) pairs."
         )
 
-    if args.retarget_mode == "absolute-table" or getattr(args, "umi_v2", False):
+    if args.retarget_mode in {"absolute-table", "absolute-tcp"} or getattr(args, "umi_v2", False):
         try:
             rollout = _solve_with_replay_pipeline(
                 args=args,
@@ -1246,6 +1315,14 @@ def process_episode(
                 ).hexdigest(),
                 "frames": len(qpos),
                 "retarget_mode": str(rollout["retarget_mode"][0]),
+                "base_placement": {
+                    "policy": str(rollout["base_placement_policy"][0]),
+                    "scope": str(rollout["base_placement_scope"][0]),
+                    "verified": bool(rollout["base_placement_verified"][0]),
+                    "table_from_robot_pose7": rollout["table_from_robot_pose7"][0].tolist(),
+                    "robot_from_table_pose7": rollout["robot_from_table_pose7"][0].tolist(),
+                    "diagnostics": json.loads(str(rollout["base_placement_diagnostics_json"][0]) or "{}"),
+                } if args.retarget_mode == "absolute-tcp" else None,
                 "max_position_error_m": float(
                     max(
                         np.max(rollout["left_pos_error_m"]),
@@ -1495,6 +1572,16 @@ def main() -> None:
         source_root,
         robot=args.embodiment,
         episodes=episode_indices,
+        expected_solver_signature=(
+            solver_signature(
+                _replay_args_for_episode(args, episode_indices[0]),
+                deployment_path=args.deployment_selection.path,
+            ) if args.retarget_mode == "absolute-tcp" and episode_indices else None
+        ),
+        expected_deployment_path=(args.deployment_selection.path
+                                  if args.retarget_mode == "absolute-tcp" else None),
+        expected_robot_tcp_path=(args.robot_tcp_selection.path
+                                 if args.retarget_mode == "absolute-tcp" else None),
     )
     if gate.blocks:
         guidance = format_gate_guidance(
@@ -1543,7 +1630,7 @@ def main() -> None:
             parser.error(f"Could not load quality config: {exc}")
 
     args.presolved = {}
-    if args.retarget_mode == "absolute-table":
+    if args.retarget_mode in {"absolute-table", "absolute-tcp"}:
         args.presolved = presolve_episodes(args, list(episode_indices), jobs=args.jobs)
 
     for position, src_idx in enumerate(episode_indices, start=1):
@@ -1647,10 +1734,11 @@ def main() -> None:
             "capture_target_robot": _capture_target_robot(source_info),
             "conversion_source": args.source,
             "retarget_mode": args.retarget_mode,
+            "base_placement": getattr(args, "base_placement", "auto"),
             "compose_source": args.compose_source,
             "translation_scale": float(args.translation_scale),
             "replay_qpos_parity": False,
-            "replay_arm_qpos_parity": args.retarget_mode == "absolute-table",
+            "replay_arm_qpos_parity": args.retarget_mode in {"absolute-table", "absolute-tcp"},
             "state_layout": "yaml_arm_joints_plus_logical_gripper_width_m",
             "gripper_representation": {
                 "type": "opening_width",
@@ -1663,11 +1751,15 @@ def main() -> None:
                 ),
             },
             "deployment_calibration": _deployment_calibration_metadata(args),
+            "robot_tcp_calibration": (args.robot_tcp_selection.metadata()
+                                      if getattr(args, "robot_tcp_selection", None) is not None else None),
             "absolute_orientation": args.absolute_orientation,
             "initial_solve_iterations": int(args.initial_solve_iterations),
             "initial_position_tolerance_m": float(
                 args.initial_position_tolerance_m
             ),
+            "max_ik_position_error_m": float(args.max_ik_position_error_m),
+            "max_ik_rotation_error_deg": float(args.max_ik_rotation_error_deg),
             "ik_fidelity": args.ik_reports,
             "controller_device": args.controller_device,
             "raw_controller_debug": bool(args.raw_controller_debug),

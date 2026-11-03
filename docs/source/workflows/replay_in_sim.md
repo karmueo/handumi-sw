@@ -1,26 +1,18 @@
-# Replay a Local Recording in Simulation
+# 在仿真中回放本地录制数据
 
-`handumi replay` retargets one raw HandUMI episode to a configured
-bimanual robot and displays the target and achieved TCP trajectories in Viser.
-The source recording remains robot agnostic: the robot model, IK profile, and
-table placement are selected when replay starts.
+`handumi replay` 将一段原始 HandUMI episode 重定向到配置的双臂机器人，并在 Viser 中显示目标 TCP 轨迹和实际达到的 TCP 轨迹。源录制数据不绑定机器人；启动回放时选择机器人模型、逆运动学（IK）配置和桌面摆放位置。
 
-## Install Replay Dependencies
+## 安装回放依赖
 
-Install the Python simulation extra before the first replay:
+首次回放前，安装 Python 仿真扩展依赖：
 
 ```bash
 uv sync --extra sim
 ```
 
-On a PICO workstation, use `bash install.sh --sim` in place of the final
-`uv sync` command. This preserves the locally built XRoboToolkit package by
-reinstalling it after the dependency sync. XRoboToolkit is not needed when the
-workstation only replays existing datasets.
+在 PICO 工作站上，使用 `bash install.sh --sim` 替代最后的 `uv sync` 命令。该脚本会在同步依赖后重新安装本地构建的 XRoboToolkit 包，避免它被覆盖。如果工作站只回放已有数据集，则不需要 XRoboToolkit。
 
-Trajectory replay reads Parquet state columns directly and does not decode the
-dataset's MP4 camera features. FFmpeg is therefore not required for IK replay.
-Install and verify it when inspecting or curating camera videos:
+轨迹回放直接读取 Parquet 状态列，不解码数据集中的 MP4 相机数据，因此 IK 回放不需要 FFmpeg。检查或整理相机视频时，请安装并验证 FFmpeg：
 
 ```bash
 sudo apt update
@@ -30,13 +22,11 @@ ffprobe -version
 uv run python -c "from torchcodec.decoders import VideoDecoder; print('TorchCodec OK')"
 ```
 
-If this reports `Could not load libtorchcodec`, see
-[Dataset Video Loading Fails in TorchCodec](../troubleshooting.md#dataset-video-loading-fails-in-torchcodec).
+如果出现 `Could not load libtorchcodec`，请参阅 [TorchCodec 加载数据集视频失败](../troubleshooting.md#dataset-video-loading-fails-in-torchcodec)。
 
-## Use a Local Dataset
+## 使用本地数据集
 
-Pass the recording directory as `DATASET`. A local replay does not download
-data:
+将录制目录作为 `DATASET` 传入。本地回放不会下载数据：
 
 ```bash
 JAX_PLATFORMS=cpu uv run handumi replay \
@@ -45,20 +35,59 @@ JAX_PLATFORMS=cpu uv run handumi replay \
   --episode 0
 ```
 
-Change `--episode` to select another episode. Add `--headless` when only the
-IK result and saved NPZ are needed. Without it, open the URL printed by Viser,
-normally <http://localhost:8080>.
+修改 `--episode` 可选择其他 episode。如果只需要 IK 结果和保存的 NPZ 文件，可添加 `--headless`。否则，请打开 Viser 输出的地址，通常是 <http://localhost:8080>。
 
-`JAX_PLATFORMS=cpu` is recommended on workstations that have the JAX CUDA
-plugin but not a working CUPTI installation. Without it, JAX can print an
-`Unable to load cuPTI` traceback and then continue on CPU; the message does not
-mean that replay or IK failed.
+### 逐段缓存与后台准备
 
-## Absolute-table Retargeting
+回放先准备当前 episode，再打开窗口；默认使用最多八个独立进程，在后台准备其余 episode。播放不会因后台求解暂停。选择尚未准备的 episode 时，选择项会排在尚未启动的后台任务之前；已有任务继续运行，结果准备完成后才切换画面。失败时界面保留当前 episode，并显示失败原因和后台进度。
 
-Recordings captured in the calibrated table workspace normally select
-`absolute-table` automatically. The explicit form is useful when auditing a
-new embodiment:
+```bash
+# 默认：显示当前段，并在后台准备其他段
+handumi replay outputs/umi-demo --robot rm75b --retarget-mode absolute-tcp --strict-ik
+
+# 只预计算全部段，不打开窗口；默认最多使用 8 个进程
+handumi replay outputs/umi-demo --robot rm75b --retarget-mode absolute-tcp \
+  --strict-ik --headless --prepare-mode all
+
+# 只在选择时准备；或临时关闭缓存；或强制重新计算
+handumi replay outputs/umi-demo --robot rm75b --retarget-mode absolute-tcp --prepare-mode off
+handumi replay outputs/umi-demo --robot rm75b --retarget-mode absolute-tcp --no-cache
+handumi replay outputs/umi-demo --robot rm75b --retarget-mode absolute-tcp --refresh-cache
+```
+
+普通 `--headless` 只处理所选 episode；显式 `--prepare-mode all` 才准备全部段。全部预计算会逐段报告失败，初始段失败时仍继续其他段；headless 全量运行存在失败时返回非零状态。关闭窗口时不再提交任务，停止仍在执行的后台进程；缓存采用临时文件和原子替换，未完成的结果不会成为可用缓存。
+
+无窗口全量准备会从选中段开始并行处理，最多同时运行 `--prepare-workers` 个任务，默认值为 8；并行数应结合 CPU 和内存调整。进度显示已完成、成功、失败、缓存命中数及每个活动任务的当前阶段和已完成帧数。基座搜索的候选数是已尝试的数量，搜索长度不固定。模型初始化及首帧求解可能包含 JAX 编译；汇总中的阶段时间是各工作进程耗时之和，墙钟时间单独列出。非交互终端定期输出纯文本，`--progress off` 可关闭进度显示。
+
+首次准备或使用 `--refresh-cache` 时会计算轨迹；后续在输入和求解配置不变时可读取缓存，并重新执行严格误差验收。求解相关源码变化也会使已有缓存失效。比较计算速度时应分别记录冷缓存和热缓存，避免将缓存读取时间当作求解加速。
+
+默认缓存目录为 `DATASET/.handumi/solve_cache/`，可用 `--cache-dir PATH` 指定。缓存文件不需要 pickle，也不进入 Git 或发布包。每段的内容键覆盖该段状态和开度、相关采集元数据、实际控制器/TCP/桌面标定、标定路径与内容、机器人配置和 URDF、求解参数、算法及数值库版本。追加其他 episode 不会使旧段失效；该段输入、实际标定、模型或参数改变时会重新求解。同内容的标定文件换了路径也会重新求解，以保证结果中记录的来源正确。
+
+单段处理时，控制台的 `cache hit` / `cache miss` 显示 episode 编号和内容键前 12 位；无窗口全量准备显示缓存命中总数。完整内容键是缓存 NPZ 的文件名。缓存损坏会自动视为未命中并重新写入。
+
+回放、筛选和转换在实际输入与参数一致时可复用完整结果；筛选仍执行碰撞检查，转换仍执行筛选门禁与精度检查。`--strict-ik` 即使命中缓存也重新检查误差；普通固定摆放回放命中超差缓存时保留警告。可确定的首帧不可达或摆放搜索失败可被缓存，`--refresh-cache` 可重新尝试；临时 I/O 和 worker 崩溃不作为永久不可达缓存。
+
+`--no-cache` 关闭磁盘读写，后台只保留少量最近结果，被淘汰后再选择可能重新求解；它不能与 `--prepare-mode all` 同时使用。打开窗口后修改机器人模型或配置时，后台生成缓存会按新模型刷新，当前窗口显示的机器人模型则需重启回放后更新。
+
+对于安装了 JAX CUDA 插件但没有可用 CUPTI 的工作站，建议设置 `JAX_PLATFORMS=cpu`。否则，JAX 可能输出 `Unable to load cuPTI` 堆栈信息，然后继续使用 CPU；该信息不代表回放或 IK 失败。
+
+### RM75B 摆放与关键帧诊断
+
+`absolute-tcp` 的自适应摆放先搜索靠近桌面原点的候选；近端搜索失败后，再用有限的宽半径候选寻找整段严格达标的摆放。实际结果和搜索预算记录在每段缓存中。搜索只检查有限个数值候选，未找到结果表示搜索未确定可行解；机器人模型、工具标定或输入改变后会生成新缓存键。
+
+下面的诊断命令使用可信的桌面控制器标定快照，检查腕心内外半径必要条件，并对指定关键帧执行不受帧间步长约束的独立多初值 IK。它还复用正式回放完整轨迹，保存 JSON 报告与 NPZ。该诊断当前限定 RM75B 的 base 高度为零，且 base 朝向与桌面相同：
+
+```bash
+.venv/bin/python -m handumi.scripts.replay.diagnose_placement outputs/umi-demo \
+  --episode 7 --frames 0,91,135 --seeds 24 --max-nfev 200 \
+  --output outputs/replay_diagnostics/umi-demo/episode_7.json
+```
+
+环域检查考虑了 TCP 的位置和旋转误差对腕心的保守影响。关键帧在固定底座下独立求解，完整轨迹还必须通过原有的关节限位、帧间步长与 TCP 误差检查。独立 IK 搜索失败或整个有限摆放搜索失败，均不能单独证明几何不可达。
+
+## 基于绝对桌面坐标的重定向
+
+在已标定桌面工作空间中采集的录制数据通常会自动选择 `absolute-table`。检查新的机器人形态时，可以显式指定：
 
 ```bash
 JAX_PLATFORMS=cpu uv run handumi replay \
@@ -69,48 +98,37 @@ JAX_PLATFORMS=cpu uv run handumi replay \
   --deployment-profile sim
 ```
 
-`robot_from_table` places the demonstrated table frame in the robot world. It
-does **not** move the robot base. For OpenArm v1, for example, the URDF pedestal
-remains fixed to world `Z=0`, the shoulder mounts are at `Z=0.698 m`, and the
-simulation calibration's `Z=0.28755 m` is the provisional table-plane height.
+`robot_from_table` 用于确定示教桌面坐标系在机器人世界坐标系中的位置，不会移动机器人底座。例如，OpenArm v1 的 URDF 基座固定在世界坐标系的 `Z=0`，肩部安装点位于 `Z=0.698 m`，仿真标定中的 `Z=0.28755 m` 是暂定的桌面高度。
 
-The deployment profiles intentionally have different ownership:
+各部署配置的用途和归属如下：
 
-| Profile | Location | Meaning |
+| 配置 | 位置 | 含义 |
 | --- | --- | --- |
-| `sim` | `configs/calibration/table/sim/<robot>.yaml` | Portable canonical simulation layout; committed, `scope: simulation`, never a claim about a lab |
-| `local` | ignored `configs/calibration/table/local/<robot>.yaml` | Measured placement of one laboratory's physical robot and table; `scope: physical` |
-| `auto` | local when configured, otherwise sim | Convenient default; the resolved profile and file are always printed and saved |
+| `sim` | `configs/calibration/table/sim/<robot>.yaml` | 可移植的标准仿真布局；纳入版本控制，`scope: simulation`，不代表实验室实际布局 |
+| `local` | 被 Git 忽略的 `configs/calibration/table/local/<robot>.yaml` | 某个实验室中实体机器人和桌面的实测摆放位置；`scope: physical` |
+| `auto` | 已配置时使用 local，否则使用 sim | 便捷的默认选项；始终输出并保存最终选用的配置及文件 |
 
-An explicit `--deployment-calibration FILE` overrides all profiles. Do not edit
-the canonical simulation file to match a physical lab and do not use
-`robot_from_table` to compensate for an incorrect Controller-to-TCP
-calibration.
+显式指定 `--deployment-calibration FILE` 会覆盖所有配置。请勿修改标准仿真文件以匹配实体实验室，也不要使用 `robot_from_table` 补偿错误的控制器到 TCP 标定。
 
-### Configure a Laboratory Placement
+### 配置实验室摆放位置
 
-Create one private calibration per installed robot. The destination is ignored
-by Git:
+为每台已安装的机器人创建一份私有标定文件。目标目录已被 Git 忽略：
 
 ```bash
 cp configs/calibration/table/local/example.yaml \
   configs/calibration/table/local/piper.yaml
 ```
 
-Set the copied file's `lab` to the same stable identifier used below, measure
-`T_robot_world_table`, and keep `verified: false` until the physical touch
-checks pass. Select it in `configs/rig.yaml`:
+将复制文件中的 `lab` 设置为下方使用的相同稳定标识，测量 `T_robot_world_table`，并在实体接触检查通过之前保持 `verified: false`。在 `configs/rig.yaml` 中选择该实验室：
 
 ```yaml
 deployment:
   lab: my_research_lab
 ```
 
-Replay discovers `local/piper.yaml` automatically. Use the optional
-`deployment.table_calibrations.piper` setting only when the lab stores its
-private file outside this conventional directory.
+回放会自动发现 `local/piper.yaml`。只有当实验室将私有文件存放在此惯用目录之外时，才需要使用可选的 `deployment.table_calibrations.piper` 设置。
 
-Then require it explicitly during a lab check:
+随后在实验室检查时显式要求使用该配置：
 
 ```bash
 JAX_PLATFORMS=cpu uv run handumi replay \
@@ -120,21 +138,13 @@ JAX_PLATFORMS=cpu uv run handumi replay \
   --deployment-profile local
 ```
 
-`handumi calibrate verify --robot piper --device pico` rejects a simulation
-file as a physical calibration and reports an unverified local file.
+`handumi calibrate verify --robot piper --device pico` 不接受仿真文件作为实体标定，并会报告尚未验证的本地文件。
 
-### Use a Dataset-Specific Placement for Visualization
+### 使用数据集专用摆放位置进行可视化
 
-The canonical placement assumes the session board sat at the near edge of the
-task scene, so the demonstrations happen on the table's `+Y` side. When a
-recording placed the board beyond the task zone instead (the demos then sit at
-negative table `Y`), the mapped targets land on the robot bases and the strict
-start check fails. Diagnose this with the printed
-`source TCP workspace bounds` line: a mostly negative `Y` range means the
-board placement, not the calibration files, is the problem.
+标准摆放位置假定采集时标定板位于任务场景的近侧边缘，因此示教发生在桌面坐标系的 `+Y` 侧。如果录制时标定板位于任务区域远侧，示教位置就会落在桌面坐标系的负 `Y` 侧，映射后的目标会落到机器人底座上，导致严格的起始检查失败。可通过输出的 `source TCP workspace bounds` 诊断：如果 `Y` 范围大部分为负，问题出在标定板摆放位置。
 
-For such datasets, write a dataset-specific table YAML that shifts the scene
-back in front of the arms and pass it explicitly:
+对于此类数据集，编写专用的桌面 YAML 文件，将场景移回机械臂前方，并显式传入：
 
 ```bash
 JAX_PLATFORMS=cpu uv run handumi replay \
@@ -146,60 +156,34 @@ JAX_PLATFORMS=cpu uv run handumi replay \
   --initial-position-tolerance-m 0.05
 ```
 
-This preserves the demonstrated world-space motion for inspection. It is not a
-fidelity claim: on the session this correction was derived from, episode 0 has
-a median tracking error of `2.4 cm` while its final segment still exceeds
-`10 cm`, because the demonstration leaves the BiPiper's bimanual workspace
-under any rigid placement. Keep such YAMLs
-under `outputs/calibration/table/` rather than the canonical `sim/` directory,
-and prevent the root cause during collection by placing the ChArUco board so
-the manipulation happens in front of it (`+Y`, away from the operator).
+这样可以保留示教在世界坐标系中的运动，供检查使用，但不表示回放精度得到保证。在推导此修正的采集数据中，episode 0 的跟踪误差中位数为 `2.4 cm`，末段仍超过 `10 cm`，因为无论采用何种刚性摆放，示教都会超出 BiPiper 的双臂工作空间。请将此类 YAML 文件保存在 `outputs/calibration/table/` 下。采集时应摆放好 ChArUco 板，使操作发生在板的前方（`+Y` 方向，远离操作者），从源头避免此问题。
 
-Deriving the correction is pure post-processing; the raw dataset never needs
-to change. Frame reminder: in the table frame `+Z` is up and `+Y` is the
-horizontal depth away from the operator (unlike the headset world, where `+Y`
-is up), so a mostly negative `Y` range is a horizontal offset, not a height
-problem. Read the demo volume from the printed
-`source TCP workspace bounds`, then shift the canonical placement's position
-until that volume sits centered in front of the arms, leaving the quaternion
-untouched. In the worked example above, bounds of `y = [-0.273, 0.045]`
-(centered near `-0.11 m`) turned the canonical `[0.30, 0.0, 0.0]` into
-`[0.5422, -0.1106, 0.0446]`: forward by roughly the demos' depth behind the
-origin, and re-centered laterally. The same recorded episodes replay unchanged
-on any robot once that robot's own placement is adjusted the same way.
+推导修正的过程完全属于后处理，无需修改原始数据集。请注意坐标系：桌面坐标系中 `+Z` 向上，`+Y` 沿水平方向远离操作者；头显世界坐标系则以 `+Y` 向上。因此，`Y` 范围大部分为负表示水平偏移。先从输出的 `source TCP workspace bounds` 读取示教范围，再平移标准摆放位置，使该范围居中位于机械臂前方，四元数保持不变。上述示例中的范围为 `y = [-0.273, 0.045]`（中心约为 `-0.11 m`），将标准位置 `[0.30, 0.0, 0.0]` 调整为 `[0.5422, -0.1106, 0.0446]`：向前移动约等于示教位于原点后方的深度，并在横向重新居中。对其他机器人以相同方式调整其摆放位置后，即可回放同一批录制数据，无需修改数据。
 
 ## OpenArm v1
 
-The current OpenArm profile uses a larger offline-only joint step than live
-teleoperation:
+当前 OpenArm 配置在离线回放中使用比实时遥操作更大的关节步长：
 
 ```yaml
 replay:
   max_joint_delta: 0.35
 ```
 
-This does not change the real OpenArm command rate, speed limits, watchdog, or
-following-error checks. The simulation URDF also keeps approximately `0.48 mm`
-of clearance between the finger collision meshes at the closed `0 mm`
-position. The real backend retains its native closed/open motor calibration.
+这不会改变实体 OpenArm 的指令频率、速度限制、看门狗或跟随误差检查。仿真 URDF 在夹爪闭合至 `0 mm` 时，手指碰撞网格之间还保留约 `0.48 mm` 的间隙。实体后端保留其原有的电机闭合和张开标定。
 
-For `outputs/20260714_224135`, the provisional rigid table transform produces:
+对于 `outputs/20260714_224135`，暂定的桌面刚体变换得到以下结果：
 
-| Episode | Maximum TCP position error | Result against 3 cm threshold |
+| Episode | 最大 TCP 位置误差 | 以 3 cm 为阈值的结果 |
 | --- | ---: | --- |
-| 0 | 2.92 cm | Pass |
-| 1 | 4.71 cm | Review unreachable segment |
-| 2 | 4.34 cm | Review unreachable segment |
+| 0 | 2.92 cm | 通过 |
+| 1 | 4.71 cm | 检查不可达片段 |
+| 2 | 4.34 cm | 检查不可达片段 |
 
-Do not simply reduce the table translation in X to hide those peaks. In the
-same recording, values at or below `X=0.168 m` make episode 0 cross a singular
-branch and create 17--20 cm errors. A future reach limiter or workspace scaling
-policy is preferable to distorting the measured table transform.
+请勿简单减小桌面在 X 方向的平移量来掩盖这些峰值。在同一录制数据中，`X` 小于或等于 `0.168 m` 会使 episode 0 跨越奇异分支，产生 17–20 cm 的误差。后续更适合采用可达范围限制或工作空间缩放策略，并保持实测桌面变换的准确性。
 
 ## TRLC-DK1
 
-TRLC-DK1 currently supports bimanual kinematic replay in simulation. It does
-not yet provide a HandUMI real-hardware backend.
+TRLC-DK1 目前支持在仿真中进行双臂运动学回放，暂未提供 HandUMI 实体硬件后端。
 
 ```bash
 JAX_PLATFORMS=cpu uv run handumi replay \
@@ -210,20 +194,13 @@ JAX_PLATFORMS=cpu uv run handumi replay \
   --deployment-profile sim
 ```
 
-The bimanual URDF uses two namespaced DK1 followers with a provisional `0.60 m`
-base separation. The table transform is also provisional. On episode 0 of the
-recording above, the current profile produced `0.22 cm` maximum position error
-and `22.19 degrees` maximum orientation error.
+双臂 URDF 使用两个带命名空间的 DK1 从臂，底座间距暂定为 `0.60 m`，桌面变换也为暂定值。对于上述录制数据的 episode 0，当前配置得到的最大位置误差为 `0.22 cm`，最大姿态误差为 `22.19 度`。
 
-TRLC meshes use paths such as `meshes/visual/base_link.glb`, resolved relative
-to `assets/trlc-dk1`. If Viser prints `Can't find meshes/...` and shows only
-trajectory lines, update the checkout and restart the replay process so the
-URDF is loaded again.
+TRLC 网格使用类似 `meshes/visual/base_link.glb` 的路径，相对于 `assets/trlc-dk1` 解析。如果 Viser 输出 `Can't find meshes/...` 且只显示轨迹线，请更新仓库并重启回放进程，以重新加载 URDF。
 
 ## Axol
 
-Axol supports bimanual kinematic replay in simulation with the same automatic
-absolute-table flow:
+Axol 支持使用相同的自动 absolute-table 流程，在仿真中进行双臂运动学回放：
 
 ```bash
 JAX_PLATFORMS=cpu uv run handumi replay \
@@ -232,34 +209,21 @@ JAX_PLATFORMS=cpu uv run handumi replay \
   --episode 0
 ```
 
-The Axol URDF uses `+X` toward its left arm, `+Y` toward the operator, and
-`+Z` upward. Its provisional simulation calibration therefore rotates the
-HandUMI table frame 180 degrees about Z and places the demonstrated workspace
-at `[0.05714, 0.12376, 0.25022]` m in Axol world. This placement is fitted to
-the complete three-episode validation recording and remains `verified: false`;
-it is not a physical table measurement.
+Axol URDF 的 `+X` 指向左臂，`+Y` 指向操作者，`+Z` 向上。因此，其暂定仿真标定将 HandUMI 桌面坐标系绕 Z 轴旋转 180 度，并将示教工作空间放在 Axol 世界坐标系中的 `[0.05714, 0.12376, 0.25022]` m。该位置根据包含三个 episode 的完整验证录制数据拟合，仍为 `verified: false`，并非实体桌面的实测结果。
 
-With the configured offline replay joint step, all three episodes pass the
-default strict IK thresholds:
+使用配置的离线回放关节步长时，三个 episode 均通过默认的严格 IK 阈值检查：
 
-| Episode | Mean position error | Maximum position error | Maximum orientation error |
+| Episode | 平均位置误差 | 最大位置误差 | 最大姿态误差 |
 | --- | ---: | ---: | ---: |
-| 0 | 0.04 cm | 2.72 cm | 9.30 degrees |
-| 1 | 0.03 cm | 1.52 cm | 5.26 degrees |
-| 2 | 0.03 cm | 0.38 cm | 7.05 degrees |
+| 0 | 0.04 cm | 2.72 cm | 9.30 度 |
+| 1 | 0.03 cm | 1.52 cm | 5.26 度 |
+| 2 | 0.03 cm | 0.38 cm | 7.05 度 |
 
-The supplied Axol model represents `left_gripper` and `right_gripper` as fixed
-links. Recorded gripper openings remain in the rollout metadata, but the mesh
-cannot visibly open or close until an Axol URDF with actuated finger joints is
-available. Axol does not currently provide a real-hardware backend.
+提供的 Axol 模型将 `left_gripper` 和 `right_gripper` 表示为固定连杆。录制的夹爪开度仍保留在轨迹元数据中，但需要带可驱动手指关节的 Axol URDF 才能在网格上显示开合。Axol 目前没有实体硬件后端。
 
-## Replay a Joint-Level Dataset
+## 回放关节级数据集
 
-`handumi replay` solves IK from the robot-agnostic capture. `handumi
-replay-joints` starts from a dataset that already holds joints, so no IK runs:
-the viewer shows exactly the values the dataset stores, and forward kinematics
-only reports where those joints put the TCPs. It is the way to look at what a
-policy will actually train on.
+`handumi replay` 从不绑定机器人的采集数据求解 IK。`handumi replay-joints` 则使用已经包含关节数据的数据集，无需运行 IK：查看器准确显示数据集中存储的数值，正向运动学仅用于报告这些关节对应的 TCP 位置。通过它可以查看策略实际使用的训练数据。
 
 ```bash
 JAX_PLATFORMS=cpu handumi replay-joints \
@@ -267,30 +231,12 @@ JAX_PLATFORMS=cpu handumi replay-joints \
   --episode 0
 ```
 
-The command reads the dataset's own encoding. A canonical conversion
-(`handumi.state_layout` of radians and meters) is expanded to URDF joints
-directly; a dataset in a LeRobot follower layout, whether HandUMI exported it
-or the plugin recorded it (`robot_type: bi_piper_follower`,
-`bi_openarm_follower`), is decoded through the same layout definition the
-exporter uses, so the reference capture and the HandUMI export play in the
-same viewer. Pass `--state-layout` when the metadata does not say, and
-`--use-degrees` when a plugin recorded with that option. Without this
-detection a plugin vector has the same 14 columns as the canonical one and
-would render `-99.8` as radians without any error.
+该命令读取数据集自身的编码。标准转换结果（`handumi.state_layout` 使用弧度和米）会直接展开为 URDF 关节；采用 LeRobot 从臂布局的数据集，无论由 HandUMI 导出还是由插件录制（`robot_type: bi_piper_follower`、`bi_openarm_follower`），都通过导出器使用的相同布局定义解码，因此参考采集数据和 HandUMI 导出数据可以在同一查看器中回放。如果元数据未指定布局，请传入 `--state-layout`；如果插件录制时使用了角度选项，请传入 `--use-degrees`。缺少此检测时，插件向量与标准向量同为 14 列，`-99.8` 会被直接当作弧度渲染，且不会报错。
 
-`--verify` checks a canonical conversion against its source capture in two
-deliberately different ways:
+`--verify` 通过两种不同方式，将标准转换结果与源采集数据进行比较：
 
-- **Integrity** is exact. Rebuilding the solved trajectory from the
-  overlapping `observation.state` and `action` views must reproduce the
-  `ik_fidelity.output_state_sha256` conversion recorded, byte for byte.
-- **Solver agreement** re-solves the capture and compares in task space
-  (default tolerance `1 mm`, `0.5 deg`). It is not a bit-exact check because
-  the IK solver is not reproducible run to run: two consecutive solves of the
-  same episode with identical arguments on one machine differ by about
-  `2e-3 rad`. That is why conversion reuses the trajectory replay already
-  solved instead of solving again, and why `qpos_sha256` only ever matches
-  the stored trajectory.
+- **完整性**要求精确一致。从相互重叠的 `observation.state` 和 `action` 视图重建求解轨迹后，其结果必须与转换时记录的 `ik_fidelity.output_state_sha256` 逐字节匹配。
+- **求解器一致性**会重新求解采集数据并在任务空间比较（默认容差为 `1 mm`、`0.5 deg`）。这不是逐位精确检查，因为 IK 求解器的结果在不同运行之间无法完全复现：在同一台机器上，使用相同参数连续求解同一个 episode，两次结果相差约 `2e-3 rad`。因此转换会复用轨迹回放已经求解的结果，`qpos_sha256` 也只与存储的轨迹匹配。
 
 ```bash
 JAX_PLATFORMS=cpu handumi replay-joints \
@@ -298,36 +244,23 @@ JAX_PLATFORMS=cpu handumi replay-joints \
   --episode 0 --headless --verify --strict-verify
 ```
 
-To play the same dataset on the physical robot instead, use
-`handumi replay-real`; see
-[Physical Robot Teleoperation](../physical_robots/real_teleoperation.md).
+如需在实体机器人上回放同一数据集，请使用 `handumi replay-real`；参阅[实体机器人遥操作](../physical_robots/real_teleoperation.md)。
 
-## Reading the Diagnostics
+## 阅读诊断信息
 
-Replay prints the source tool identity and calibration hash before solving.
-Seeing `source tool: robot=piper` while replaying OpenArm, TRLC, or Axol is
-expected when Piper was the physical tool used to make the recording. The
-identity-bound Controller-to-TCP snapshot reconstructs the demonstrated Piper
-TCP; the target embodiment is applied afterward.
+回放在求解前会输出源工具标识和标定哈希值。如果录制时使用的实体工具是 Piper，那么回放到 OpenArm、TRLC 或 Axol 时看到 `source tool: robot=piper` 属于正常情况。与该标识绑定的控制器到 TCP 标定快照用于重建示教时的 Piper TCP，随后再应用目标机器人形态。
 
-Important output fields are:
+重要输出字段包括：
 
-- `deployment calibration`: resolved profile, scope, verification state, and
-  source file;
-- `source TCP workspace bounds`: robot-agnostic table-frame volume used by the
-  reachability check;
-- `start prepared`: initial solve iterations and first-frame error;
-- `approach`: the playback lead-in that ramps the robot from its home pose to
-  that prepared start pose, so the viewer opens at home exactly like sim
-  teleop. It is render-only, stored separately as `approach_qpos`, and never
-  enters `qpos` or the error metrics. Tune it with `--approach-seconds`
-  (`0` starts playback directly at frame 0);
-- `IK EE error`: mean and maximum position/orientation error over both arms;
-- `max_joint_delta`: the offline joint-step limit selected for the embodiment;
-- `saved`: the NPZ containing targets, achieved TCP poses, errors, and qpos.
+- `deployment calibration`：最终选用的配置、范围、验证状态和源文件；
+- `source TCP workspace bounds`：可达性检查使用的、与机器人无关的桌面坐标系空间范围；
+- `start prepared`：初始求解迭代次数和首帧误差；
+- `approach`：回放前的过渡过程，使机器人从初始姿态逐渐移动到准备好的起始姿态，查看器因此与仿真遥操作一样从初始姿态打开。该过程仅用于渲染，单独存储为 `approach_qpos`，不进入 `qpos` 或误差指标。可通过 `--approach-seconds` 调整（`0` 表示直接从第 0 帧开始回放）；
+- `IK EE error`：双臂位置和姿态的平均及最大误差；
+- `max_joint_delta`：为机器人形态选用的离线关节步长限制；
+- `saved`：包含目标、实际达到的 TCP 位姿、误差和 qpos 的 NPZ 文件。
 
-Use `--strict-ik` in automated validation. It exits when the maximum position
-or orientation error exceeds the selected thresholds:
+自动验证时请使用 `--strict-ik`。当最大位置或姿态误差超过所选阈值时，程序会退出：
 
 ```bash
 JAX_PLATFORMS=cpu uv run handumi replay \

@@ -1,4 +1,4 @@
-"""Embodiment-specific retargeting screening for recorded HandUMI datasets.
+"""按机器人筛选录制数据，校验实际标定并缓存已验收的关节轨迹。
 
 ``handumi validate`` and ``handumi dataset analyze`` grade the *recording*:
 tracking dropouts, gripper freezes, duration outliers. None of that knows
@@ -52,7 +52,8 @@ def _file_digest(path: Path) -> str:
 
 
 def robot_fingerprint(
-    robot: str, *, deployment_path: str | Path | None = None
+    robot: str, *, deployment_path: str | Path | None = None,
+    robot_tcp_path: str | Path | None = None,
 ) -> dict[str, str]:
     """Hash everything that changes where the solver puts the robot.
 
@@ -72,6 +73,8 @@ def robot_fingerprint(
         entries["urdf"] = "unresolved"
     if deployment_path is not None:
         entries["deployment_calibration"] = _file_digest(Path(deployment_path))
+    if robot_tcp_path is not None:
+        entries["robot_tcp_calibration"] = _file_digest(Path(robot_tcp_path))
     return entries
 
 
@@ -86,6 +89,7 @@ def solve_cache_path(root: str | Path, robot: str) -> Path:
 _SOLVER_ARGS = (
     "source",
     "retarget_mode",
+    "base_placement",
     "compose_source",
     "translation_scale",
     "controller_device",
@@ -95,6 +99,9 @@ _SOLVER_ARGS = (
     "absolute_orientation",
     "initial_solve_iterations",
     "initial_position_tolerance_m",
+    "max_ik_position_error_m",
+    "max_ik_rotation_error_deg",
+    "robot_tcp_calibration",
     "gripper_max_width_m",
     "only_manipulation",
     "start_frame",
@@ -114,17 +121,65 @@ CACHED_ROLLOUT_FIELDS = (
     "initial_solve_iterations",
     "retarget_mode",
     "gripper_source",
+    "frame_indices",
+    "table_from_robot_pose7",
+    "robot_from_table_pose7",
+    "base_placement_policy",
+    "base_placement_scope",
+    "base_placement_verified",
+    "base_placement_diagnostics_json",
 )
 
 
-def solver_signature(args, *, deployment_path: str | Path | None = None) -> str:
-    """Digest the solver settings a cached trajectory was produced under."""
+def solver_signature(
+    args,
+    *,
+    deployment_path: str | Path | None = None,
+    source_info: dict[str, Any] | None = None,
+) -> str:
+    """摘要求解参数及实际标定；未提供源元数据时读取本地数据集信息。"""
     payload = {name: str(getattr(args, name, None)) for name in _SOLVER_ARGS}
     payload["deployment_calibration"] = str(
         deployment_path
         if deployment_path is not None
         else getattr(args, "deployment_calibration", None)
     )
+    if getattr(args, "retarget_mode", None) == "absolute-tcp":
+        from handumi.calibration.robot_tcp import LOCAL_ROBOT_TCP_DIR
+        from handumi.retargeting.base_placement import ALGORITHM_VERSION
+        from handumi.scripts.replay.replay_in_sim import _resolved_controller_device
+        from handumi.scripts.replay.replay_prepare import _source_calibration
+
+        payload["base_placement_algorithm"] = ALGORITHM_VERSION
+
+        path = getattr(args, "robot_tcp_calibration", None) or (
+            LOCAL_ROBOT_TCP_DIR / f"{args.robot}.yaml"
+        )
+        payload["robot_tcp_calibration"] = str(Path(path).resolve())
+        payload["robot_tcp_sha256"] = _file_digest(Path(path))
+        if source_info is None:
+            dataset_root = getattr(args, "dataset_root", None)
+            source_info = (
+                json.loads(
+                    (Path(dataset_root) / "meta" / "info.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                if dataset_root is not None
+                else {}
+            )
+        device = _resolved_controller_device(args, source_info)
+        # 与完整回放缓存共享解析优先级，默认文件变更也必须使筛选结果失效。
+        try:
+            payload["controller_tcp_selection"] = _source_calibration(
+                args, source_info, device
+            )
+        except SystemExit as exc:
+            # 标定缺失的全拒绝报告仍需签名；修复标定后自然生成不同签名。
+            payload["controller_tcp_selection"] = {"error": str(exc)}
+        payload["deployment_sha256"] = (
+            _file_digest(Path(deployment_path)) if deployment_path is not None else "identity"
+        )
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -177,8 +232,20 @@ def _replay_args(
     deployment_profile: str,
     rig_config: Path,
     controller_tcp_calibration: Path | None = None,
+    retarget_mode: str = "auto",
+    base_placement: str = "auto",
+    robot_tcp_calibration: Path | None = None,
+    deployment_calibration: Path | None = None,
+    max_position_error_m: float | None = None,
+    max_rotation_error_deg: float | None = None,
+    cache_dir: Path | None = None,
+    no_cache: bool = False,
+    refresh_cache: bool = False,
 ):
-    from handumi.scripts.replay.replay_in_sim import build_parser
+    from handumi.scripts.replay.replay_in_sim import (
+        build_parser,
+        resolve_replay_options,
+    )
 
     args = build_parser().parse_args([str(root)])
     args.repo_id = repo_id
@@ -189,12 +256,21 @@ def _replay_args(
     # same precedence convert applies; it is part of the solver signature.
     args.controller_tcp_calibration = controller_tcp_calibration
     args.robot = robot
-    args.retarget_mode = "auto"
+    args.retarget_mode = retarget_mode
+    args.base_placement = base_placement
+    args.robot_tcp_calibration = robot_tcp_calibration
+    args.deployment_calibration = deployment_calibration
+    args.max_ik_position_error_m = max_position_error_m
+    args.max_ik_rotation_error_deg = max_rotation_error_deg
+    args.cache_dir = cache_dir
+    args.no_cache = no_cache
+    args.refresh_cache = refresh_cache
+    resolve_replay_options(args)
     args.deployment_profile = deployment_profile
     args.rig_config = rig_config
     # Grade every episode instead of aborting on the first violation, and skip
     # the playback lead-in: it is render-only and not part of the trajectory.
-    args.strict_ik = False
+    args.strict_ik = retarget_mode == "absolute-tcp"
     args.approach_seconds = 0.0
     return args
 
@@ -419,6 +495,15 @@ def _build_screen_state(
     rig_config: Path,
     self_collision_margin_m: float,
     controller_tcp_calibration: Path | None = None,
+    retarget_mode: str = "auto",
+    base_placement: str = "auto",
+    robot_tcp_calibration: Path | None = None,
+    deployment_calibration: Path | None = None,
+    max_position_error_m: float | None = None,
+    max_rotation_error_deg: float | None = None,
+    cache_dir: Path | None = None,
+    no_cache: bool = False,
+    refresh_cache: bool = False,
 ) -> dict[str, Any]:
     """Build everything an episode solve reuses: robot model, compiled fns, meshes.
 
@@ -431,9 +516,10 @@ def _build_screen_state(
     runtime = load_embodiment(robot)
     deployment = resolve_deployment_calibration(
         robot,
-        explicit_path=None,
+        explicit_path=deployment_calibration,
         profile=deployment_profile,
         rig_config=rig_config,
+        identity_fallback=retarget_mode == "absolute-tcp",
     )
     coll = build_pruned_collision_model(
         urdf=runtime.load_urdf(load_meshes=True),
@@ -446,6 +532,7 @@ def _build_screen_state(
         },
         margin=self_collision_margin_m,
     )
+    # 逐段调整只沿桌面平面平移基座，不改变无限桌面半空间，故可复用碰撞平面。
     table_point, table_normal = _table_plane_geometry(deployment.pose7)
     plane = pk.collision.HalfSpace.from_point_and_normal(
         jnp.asarray(table_point), jnp.asarray(table_normal)
@@ -481,6 +568,15 @@ def _build_screen_state(
             "deployment_profile": deployment_profile,
             "rig_config": rig_config,
             "controller_tcp_calibration": controller_tcp_calibration,
+            "retarget_mode": retarget_mode,
+            "base_placement": base_placement,
+            "robot_tcp_calibration": robot_tcp_calibration,
+            "deployment_calibration": deployment_calibration,
+            "max_position_error_m": max_position_error_m,
+            "max_rotation_error_deg": max_rotation_error_deg,
+            "cache_dir": cache_dir,
+            "no_cache": no_cache,
+            "refresh_cache": refresh_cache,
         },
     }
 
@@ -570,13 +666,13 @@ def _screen_one_episode(episode: int, state: dict[str, Any]) -> dict[str, Any]:
     Returns plain arrays and floats: a compiled JAX function cannot cross a
     process boundary, and nothing here needs to.
     """
-    from handumi.scripts.replay.replay_in_sim import solve_episode
+    from handumi.scripts.replay.replay_prepare import prepare_episode
 
     args = _replay_args(episode=episode, **state["args_template"])
     captured = io.StringIO()
     try:
         with contextlib.redirect_stdout(captured):
-            rollout = solve_episode(args)
+            rollout = prepare_episode(args)
     except SystemExit as exc:
         # The solver could not reach the demonstrated start pose at all.
         return {
@@ -642,6 +738,14 @@ def _screen_one_episode(episode: int, state: dict[str, Any]) -> dict[str, Any]:
         "metrics": metrics,
         "solves": solves,
         "resolved": resolved,
+        "base_placement": ({
+            "policy": str(rollout["base_placement_policy"][0]),
+            "scope": str(rollout["base_placement_scope"][0]),
+            "verified": bool(rollout["base_placement_verified"][0]),
+            "robot_from_table_pose7": rollout["robot_from_table_pose7"][0].tolist(),
+            "table_from_robot_pose7": rollout["table_from_robot_pose7"][0].tolist(),
+            "diagnostics": json.loads(str(rollout["base_placement_diagnostics_json"][0]) or "{}"),
+        } if args.retarget_mode == "absolute-tcp" else None),
     }
 
 
@@ -658,6 +762,13 @@ def screen_dataset(
     progress: bool = True,
     jobs: int | None = 1,
     controller_tcp_calibration: Path | None = None,
+    retarget_mode: str = "auto",
+    base_placement: str = "auto",
+    robot_tcp_calibration: Path | None = None,
+    deployment_calibration: Path | None = None,
+    cache_dir: Path | None = None,
+    no_cache: bool = False,
+    refresh_cache: bool = False,
 ) -> dict[str, Any]:
     """Retarget every episode and grade it. Never modifies the dataset.
 
@@ -673,7 +784,8 @@ def screen_dataset(
     from handumi.calibration.deployment import resolve_deployment_calibration
     from handumi.config import DEFAULT_RIG_CONFIG
 
-    cfg = config or RetargetScreeningConfig()
+    cfg = config or (RetargetScreeningConfig(max_position_error_m=0.005, max_rotation_error_deg=5.0)
+                     if retarget_mode == "absolute-tcp" else RetargetScreeningConfig())
     dataset_root = Path(root).resolve()
     info_path = dataset_root / "meta" / "info.json"
     if not info_path.is_file():
@@ -691,14 +803,23 @@ def screen_dataset(
         raise ValueError(f"Episode indices out of range: {sorted(out_of_range)}")
 
     resolved_repo_id = repo_id or f"local/{dataset_root.name}"
-    deployment_path = str(
-        resolve_deployment_calibration(
+    deployment = resolve_deployment_calibration(
             robot,
-            explicit_path=None,
+            explicit_path=deployment_calibration,
             profile=deployment_profile,
             rig_config=rig_config or DEFAULT_RIG_CONFIG,
-        ).path
+            identity_fallback=retarget_mode == "absolute-tcp",
     )
+    deployment_path = deployment.path
+    robot_tcp = None
+    if retarget_mode == "absolute-tcp":
+        from handumi.calibration.robot_tcp import load_robot_tcp_calibration
+        from handumi.robots.registry import load_robot_config
+
+        robot_tcp = load_robot_tcp_calibration(
+            robot, load_robot_config(robot).arms, explicit_path=robot_tcp_calibration
+        )
+        robot_tcp_calibration = robot_tcp.path
     workers = resolve_jobs(jobs, len(selected))
     if progress:
         print(f"[screen] {describe_jobs(workers, len(selected))}")
@@ -707,7 +828,7 @@ def screen_dataset(
         if not progress:
             return
         if item["unreachable"] is not None:
-            print(f"  ep {episode:3d}  UNREACHABLE START POSE")
+            print(f"  ep {episode:3d}  IK REJECTED: {item['unreachable']}")
             return
         metrics = item["metrics"]
         print(
@@ -732,6 +853,15 @@ def screen_dataset(
             "rig_config": rig_config or DEFAULT_RIG_CONFIG,
             "self_collision_margin_m": cfg.self_collision_margin_m,
             "controller_tcp_calibration": controller_tcp_calibration,
+            "retarget_mode": retarget_mode,
+            "base_placement": base_placement,
+            "robot_tcp_calibration": robot_tcp_calibration,
+            "deployment_calibration": deployment_calibration,
+            "max_position_error_m": cfg.max_position_error_m if retarget_mode == "absolute-tcp" else None,
+            "max_rotation_error_deg": cfg.max_rotation_error_deg if retarget_mode == "absolute-tcp" else None,
+            "cache_dir": cache_dir,
+            "no_cache": no_cache,
+            "refresh_cache": refresh_cache,
         },
         task=_screen_one_episode,
         jobs=workers,
@@ -741,6 +871,30 @@ def screen_dataset(
     raw: list[dict[str, Any]] = []
     solves: dict[str, np.ndarray] = {}
     signature: str | None = None
+    if retarget_mode == "absolute-tcp":
+        # 即使全部轨迹未通过，也要签署本次参数，门禁才能显示真实拒绝原因。
+        from handumi.scripts.replay.replay_in_sim import _resolved_controller_device
+
+        resolved_args = _replay_args(
+            root=dataset_root,
+            repo_id=resolved_repo_id,
+            revision=revision,
+            robot=robot,
+            episode=selected[0] if selected else 0,
+            deployment_profile=deployment_profile,
+            rig_config=rig_config or DEFAULT_RIG_CONFIG,
+            controller_tcp_calibration=controller_tcp_calibration,
+            retarget_mode=retarget_mode,
+            base_placement=base_placement,
+            robot_tcp_calibration=robot_tcp_calibration,
+            deployment_calibration=deployment_calibration,
+            max_position_error_m=cfg.max_position_error_m,
+            max_rotation_error_deg=cfg.max_rotation_error_deg,
+        )
+        resolved_args.controller_device = _resolved_controller_device(resolved_args, info)
+        signature = solver_signature(
+            resolved_args, deployment_path=deployment_path, source_info=info
+        )
     for item in solved:
         episode = item["episode_index"]
         raw.append(
@@ -749,6 +903,7 @@ def screen_dataset(
                 "unreachable": item["unreachable"],
                 "frame_count": item["frame_count"],
                 "metrics": item["metrics"],
+                "base_placement": item.get("base_placement"),
             }
         )
         if item["unreachable"] is not None:
@@ -763,11 +918,17 @@ def screen_dataset(
                 deployment_profile=deployment_profile,
                 rig_config=rig_config or DEFAULT_RIG_CONFIG,
                 controller_tcp_calibration=controller_tcp_calibration,
+                retarget_mode=retarget_mode,
+                base_placement=base_placement,
+                robot_tcp_calibration=robot_tcp_calibration,
+                deployment_calibration=deployment_calibration,
+                max_position_error_m=cfg.max_position_error_m if retarget_mode == "absolute-tcp" else None,
+                max_rotation_error_deg=cfg.max_rotation_error_deg if retarget_mode == "absolute-tcp" else None,
             )
             for field, value in item["resolved"].items():
                 setattr(resolved_args, field, value)
             signature = solver_signature(
-                resolved_args, deployment_path=deployment_path
+                resolved_args, deployment_path=deployment_path, source_info=info
             )
         for field, value in item["solves"].items():
             solves[f"{episode}/{field}"] = value
@@ -795,7 +956,10 @@ def screen_dataset(
         "config": asdict(cfg),
         "rotation_fences_deg": fences,
         "payload_manifest": dataset_payload_manifest(dataset_root),
-        "deployment_calibration_path": portable_path(deployment_path),
+        "deployment_calibration_path": portable_path(deployment_path) if deployment_path is not None else None,
+        "deployment_calibration": {"source": deployment.source, "pose7": deployment.pose7.tolist()},
+        "robot_tcp_calibration_path": portable_path(robot_tcp.path) if robot_tcp is not None else None,
+        "robot_tcp_calibration": robot_tcp.metadata() if robot_tcp is not None else None,
         "controller_tcp_calibration_path": (
             None
             if controller_tcp_calibration is None
@@ -806,7 +970,8 @@ def screen_dataset(
         if solves
         else None,
         "robot_fingerprint": robot_fingerprint(
-            robot, deployment_path=deployment_path
+            robot, deployment_path=deployment_path,
+            robot_tcp_path=robot_tcp.path if robot_tcp is not None else None,
         ),
         "summary": {
             "total": len(reports),
@@ -815,7 +980,8 @@ def screen_dataset(
             "reject_episode_indices": flagged,
             "review_episode_indices": review,
         },
-        "episodes": [report.to_dict() for report in reports],
+        "episodes": [{**report.to_dict(), "base_placement": item.get("base_placement")}
+                     for report, item in zip(reports, raw, strict=True)],
         "_solves": solves,
     }
 
@@ -858,11 +1024,11 @@ def _grade(
     if item["unreachable"] is not None:
         findings.append(
             QualityFinding(
-                code="retarget_start_pose_unreachable",
+                code=("retarget_ik_fidelity" if str(item["unreachable"]).startswith(("IK fidelity", "Invalid non-finite"))
+                      else "retarget_start_pose_unreachable"),
                 severity="reject",
                 message=(
-                    "The robot cannot reach the demonstrated start pose; the "
-                    "episode cannot be retargeted at all."
+                    "The demonstrated trajectory did not meet the IK fidelity requirements."
                 ),
                 metrics={"solver_message": str(item["unreachable"])},
             )
@@ -1025,6 +1191,9 @@ def evaluate_screening_gate(
     *,
     robot: str,
     episodes: list[int] | tuple[int, ...] | None = None,
+    expected_solver_signature: str | None = None,
+    expected_deployment_path: str | Path | None = None,
+    expected_robot_tcp_path: str | Path | None = None,
 ) -> ScreeningGate:
     """Check the screening report before a dataset becomes joint targets.
 
@@ -1050,6 +1219,16 @@ def evaluate_screening_gate(
             flagged={},
             detail=f"Cannot read screening report {path}: {exc}",
         )
+    if (expected_solver_signature is not None
+            and payload.get("solver_signature") != expected_solver_signature):
+        return ScreeningGate(
+            report_path=path,
+            status="stale",
+            flagged={},
+            detail=(f"Screening report {path} used different retargeting settings or "
+                    "calibration; re-run handumi dataset screen with --retarget-mode absolute-tcp "
+                    "and matching TCP, table and error thresholds."),
+        )
     if payload.get("payload_manifest") != dataset_payload_manifest(dataset_root):
         return ScreeningGate(
             report_path=path,
@@ -1062,7 +1241,11 @@ def evaluate_screening_gate(
         )
     recorded = payload.get("robot_fingerprint")
     current = robot_fingerprint(
-        robot, deployment_path=repo_path(payload.get("deployment_calibration_path"))
+        robot,
+        deployment_path=(expected_deployment_path if expected_solver_signature is not None
+                         else repo_path(payload.get("deployment_calibration_path"))),
+        robot_tcp_path=(expected_robot_tcp_path if expected_solver_signature is not None
+                        else repo_path(payload.get("robot_tcp_calibration_path"))),
     )
     if recorded != current:
         changed = (

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Replay a HandUMI LeRobot episode in simulation with YAML robot configs."""
+"""根据机器人 YAML 配置与录制设备，将 HandUMI 数据集映射为关节轨迹并回放。"""
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from queue import Empty, SimpleQueue
 from typing import Any
 
 import numpy as np
@@ -29,6 +31,7 @@ from handumi.calibration.deployment import (
     print_deployment_calibration,
     resolve_deployment_calibration,
 )
+from handumi.calibration.robot_tcp import load_robot_tcp_calibration
 from handumi.config import DEFAULT_RIG_CONFIG
 from handumi.dataset import (
     DatasetRef,
@@ -45,6 +48,11 @@ from handumi.dataset.raw import (
     RIGHT_POSE_SLICE,
 )
 from handumi.dataset.selection import resolve_dataset_selection
+from handumi.retargeting.base_placement import (
+    ALGORITHM_VERSION,
+    first_frame_candidates,
+    search_feasible_placement,
+)
 from handumi.retargeting.handumi_to_robot import (
     VR_TO_ROBOT,
     absolute_table_robot_target_pose7,
@@ -61,7 +69,8 @@ from handumi.robots.kinematics import (
     posture_seed,
 )
 from handumi.robots.registry import EMBODIMENT_NAMES, load_embodiment, load_robot_config
-from handumi.robots.utils import pose_mul
+from handumi.robots.utils import pose7_to_mat, pose_inv, pose_mul
+from handumi.scripts.replay.replay_progress import report
 
 DEFAULT_OUT_DIR = Path("outputs/replay_in_sim")
 GRIPPER_NORMALIZED_KEYS = (
@@ -100,7 +109,10 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
         default=DEFAULT_RIG_CONFIG,
         help=advanced("Machine-local rig YAML used to select lab deployment calibration."),
     )
-    parser.add_argument("--episode", type=int, default=0)
+    parser.add_argument(
+        "--episode", type=int, default=0,
+        help="Initial episode index (0-based); selectable in the viewer.",
+    )
     parser.add_argument("--robot", choices=EMBODIMENT_NAMES, default="piper")
     parser.add_argument(
         "--source",
@@ -113,7 +125,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     parser.add_argument("--stride", type=int, default=1, help=advanced("Source frame stride."))
     parser.add_argument(
         "--retarget-mode",
-        choices=("auto", "local-relative", "anchored", "absolute-table"),
+        choices=("auto", "local-relative", "anchored", "absolute-table", "absolute-tcp"),
         default="auto",
         help=advanced(
             "auto selects absolute-table for datasets recorded in a calibrated table "
@@ -131,6 +143,10 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
             "For --retarget-mode local-relative, compose each adapted delta on "
             "the previous commanded target or previous achieved FK pose."
         ),
+    )
+    parser.add_argument(
+        "--base-placement", choices=("auto", "fixed", "episode-xy"), default="auto",
+        help="Select fixed placement or per-episode virtual XY placement for absolute-tcp.",
     )
     parser.add_argument(
         "--translation-scale",
@@ -170,6 +186,10 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
         help=advanced("Replay raw PICO controller poses without controller->TCP calibration."),
     )
     parser.add_argument(
+        "--robot-tcp-calibration", type=Path, default=None,
+        help=advanced("Robot end-link to TCP calibration snapshot for absolute-tcp."),
+    )
+    parser.add_argument(
         "--deployment-calibration",
         type=Path,
         default=None,
@@ -190,7 +210,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     parser.add_argument(
         "--absolute-orientation",
         choices=("relative-start", "table-absolute"),
-        default="relative-start",
+        default=None,
         help=advanced(
             "Orientation policy for absolute-table. relative-start aligns each "
             "HandUMI tool frame to the robot home TCP at frame 0 while preserving "
@@ -210,7 +230,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     parser.add_argument(
         "--initial-position-tolerance-m",
         type=float,
-        default=0.01,
+        default=None,
         help=advanced("Required maximum TCP position error before starting replay."),
     )
     parser.add_argument(
@@ -234,6 +254,19 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--prepare-mode", choices=("background", "all", "off"), default="background",
+        help="Prepare other episodes in background, all before viewing, or only on selection.",
+    )
+    parser.add_argument("--prepare-workers", type=int, default=8,
+                        help="Maximum concurrent episode preparation workers (default: 8).")
+    parser.add_argument("--progress", choices=("auto", "on", "off"), default="auto",
+                        help="Show batch progress (auto/on) or disable it (off).")
+    parser.add_argument("--cache-dir", type=Path, default=None,
+                        help="Directory for per-episode replay cache.")
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument("--no-cache", action="store_true", help="Do not read or write replay caches.")
+    cache_mode.add_argument("--refresh-cache", action="store_true", help="Recompute and replace each requested cache.")
     parser.add_argument(
         "--clean-view",
         action="store_true",
@@ -261,7 +294,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-ik-position-error-m",
         type=float,
-        default=0.03,
+        default=None,
         help=advanced("Maximum acceptable per-frame TCP position error."),
     )
     parser.add_argument(
@@ -276,7 +309,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-ik-rotation-error-deg",
         type=float,
-        default=45.0,
+        default=None,
         help=advanced("Maximum acceptable per-frame TCP rotation error."),
     )
     parser.add_argument(
@@ -300,6 +333,33 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
         help="Resolve and print the replay plan without loading the dataset.",
     )
     return parser
+
+
+def resolve_replay_options(args: argparse.Namespace) -> None:
+    """补全按模式区分的默认值，并拒绝与绝对 TCP 朝向冲突的设置。"""
+    absolute_tcp = args.retarget_mode == "absolute-tcp"
+    if getattr(args, "base_placement", "auto") == "episode-xy" and not absolute_tcp:
+        raise SystemExit("--base-placement episode-xy requires --retarget-mode absolute-tcp.")
+    orientation = getattr(args, "absolute_orientation", None)
+    if absolute_tcp and orientation == "relative-start":
+        raise SystemExit("absolute-tcp requires table-absolute orientation; relative-start conflicts.")
+    if orientation is None:
+        args.absolute_orientation = "table-absolute" if absolute_tcp else "relative-start"
+    for name, new_default, old_default in (
+        ("initial_position_tolerance_m", 0.005, 0.01),
+        ("max_ik_position_error_m", 0.005, 0.03),
+        ("max_ik_rotation_error_deg", 5.0, 45.0),
+    ):
+        if getattr(args, name, None) is None:
+            setattr(args, name, new_default if absolute_tcp else old_default)
+        if absolute_tcp and (not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0):
+            raise SystemExit(f"{name} must be finite and greater than zero.")
+
+
+def _require_finite_frame(frame: int, label: str, *values: np.ndarray) -> None:
+    """拒绝带非有限值的目标、关节或 FK，给出原始帧号。"""
+    if any(not np.isfinite(np.asarray(value)).all() for value in values):
+        raise SystemExit(f"Invalid non-finite {label} at frame {frame}.")
 
 
 def joint_approach_ramp(
@@ -425,6 +485,7 @@ def _resolved_controller_device(
     args: argparse.Namespace,
     source_info: dict[str, object],
 ) -> str:
+    """优先使用显式设备参数，其次读取录制设备，旧数据沿用默认设备。"""
     if args.controller_device is not None:
         snapshot = _metadata_tcp_snapshot(source_info)
         if snapshot is not None and _is_trusted_tcp_snapshot(snapshot):
@@ -436,7 +497,7 @@ def _resolved_controller_device(
                 )
         return str(args.controller_device)
     recorded = handumi_metadata(source_info).get("recording_device")
-    if recorded in ("pico", "meta"):
+    if recorded in ("pico", "meta", "vive"):
         return str(recorded)
     return DEFAULT_CONTROLLER_DEVICE
 
@@ -766,9 +827,170 @@ def _print_tcp_geometry_diagnostics(
     )
 
 
+class PlacementSearchError(SystemExit):
+    """保留候选明细，同时让普通回放错误保持简短。"""
+
+    def __init__(self, message, attempts):
+        """记录面向用户的摘要及供诊断工具使用的结构化候选。"""
+        super().__init__(message)
+        self.attempts = attempts
+
+
 def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
-    runtime = load_embodiment(args.robot)
-    states, fps, source_info, recorded_gripper_openings = load_episode_states(args)
+    """按配置选择固定摆放或逐段搜索，再执行完整轨迹求解。"""
+    import contextlib
+    import io
+
+    resolve_replay_options(args)
+    policy = getattr(args, "base_placement", "auto")
+    if args.retarget_mode != "absolute-tcp" or policy == "fixed":
+        return _solve_episode_fixed(argparse.Namespace(**vars(args)))
+
+    attempt = argparse.Namespace(**vars(args))
+    attempt._placement_context = {}
+    attempt.strict_ik = False
+    placement_started = time.perf_counter()
+    baseline = None
+    failure = None
+    baseline_output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(baseline_output):
+            baseline = _solve_episode_fixed(attempt)
+    except SystemExit as exc:
+        failure = exc
+    context = attempt._placement_context
+    if not context:
+        if failure is not None:
+            raise failure
+        return baseline
+    calibration = context["deployment"]
+    if policy == "auto" and calibration.profile != "identity":
+        # 明确或已登记的摆放保持固定，并保留原来的 strict 行为。
+        if baseline is None or (args.strict_ik and not _rollout_within_thresholds(baseline, args)):
+            return _solve_episode_fixed(argparse.Namespace(**vars(args)))
+        print(baseline_output.getvalue(), end="")
+        return baseline
+    if policy == "episode-xy" and calibration.scope == "physical":
+        raise SystemExit("--base-placement episode-xy cannot modify a physical table calibration; use fixed or a simulation placement.")
+
+    table_from_base = pose_inv(calibration.pose7)
+    if baseline is not None and _rollout_within_thresholds(baseline, args) and np.linalg.norm(table_from_base[:2]) < 1e-8:
+        print(baseline_output.getvalue(), end="")
+        return _record_base_placement(baseline, table_from_base, "episode-xy", {
+            "algorithm": ALGORITHM_VERSION, "oracle_calls": 1, "zero_preserved": True,
+            "elapsed_seconds": time.perf_counter() - placement_started,
+        })
+    print(f"[replay] episode {args.episode}: searching a fixed XY base placement")
+    report(args, "生成首帧摆放候选")
+    candidates = first_frame_candidates(
+        context["runtime"], context["tool"], context["targets"],
+        table_from_base, context["locked"],
+    )
+    if baseline is not None and _rollout_within_thresholds(baseline, args):
+        from handumi.retargeting.base_placement import PlacementCandidate
+        candidates.append(PlacementCandidate(table_from_base[:2].copy(), baseline["qpos"][0].copy()))
+        candidates.sort(key=lambda item: float(np.linalg.norm(item.xy)))
+
+    last_failure = None
+    attempts = []
+    best_trajectory_failure = None
+    candidate_count = 0
+
+    def evaluate(candidate):
+        """以候选固定 base 和相应首帧关节分支验证完整轨迹。"""
+        nonlocal last_failure, best_trajectory_failure, candidate_count
+        candidate_count += 1
+        report(args, "基座搜索", candidate=candidate_count)
+        base = table_from_base.copy()
+        base[:2] = candidate.xy
+        trial = argparse.Namespace(**vars(attempt))
+        trial._placement_candidate = candidate_count
+        trial._placement_override = replace(
+            calibration, pose7=pose_inv(base), path=None, scope="simulation",
+            source="episode_xy_search", verified=False, profile="episode-xy",
+        )
+        # 优先使用优化出的关节分支；该分支整段失败时再尝试 HOME 分支。
+        for seed in (candidate.q0, None):
+            trial._initial_q_seed = seed
+            record = {"xy_m": candidate.xy.tolist(),
+                      "seed_qpos": None if seed is None else seed.tolist()}
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rollout = _solve_episode_fixed(trial)
+            except SystemExit as exc:
+                last_failure = str(exc)
+                record.update({"passed": False, "error": last_failure})
+                attempts.append(record)
+                continue
+            pos = np.maximum(rollout["left_pos_error_m"], rollout["right_pos_error_m"])
+            rot = np.maximum(rollout["left_rot_error_deg"], rollout["right_rot_error_deg"])
+            worst = int(np.argmax(np.maximum(pos / args.max_ik_position_error_m,
+                                             rot / args.max_ik_rotation_error_deg)))
+            last_failure = (f"frame {int(rollout['frame_indices'][worst])}: "
+                            f"{float(pos[worst]) * 1000:.2f}mm/{float(rot[worst]):.2f}deg")
+            score = float(max(pos[worst] / args.max_ik_position_error_m,
+                              rot[worst] / args.max_ik_rotation_error_deg))
+            passed = _rollout_within_thresholds(rollout, args)
+            record.update({"passed": passed, "worst_frame": int(rollout["frame_indices"][worst]),
+                           "position_error_m": float(pos[worst]),
+                           "rotation_error_deg": float(rot[worst]), "score": score})
+            attempts.append(record)
+            if passed:
+                return rollout
+            if best_trajectory_failure is None or score < best_trajectory_failure["score"]:
+                best_trajectory_failure = record.copy()
+        return None
+
+    try:
+        candidate, result, diagnostics = search_feasible_placement(candidates, evaluate)
+    except ValueError as exc:
+        raise PlacementSearchError(
+            f"Unable to find strict episode XY placement: {exc}; best trajectory failure: {best_trajectory_failure}; last failure: {last_failure}",
+            attempts,
+        ) from exc
+    base = table_from_base.copy()
+    base[:2] = candidate.xy
+    diagnostics.update({"algorithm": ALGORITHM_VERSION, "zero_preserved": False,
+                        "attempts": attempts, "best_trajectory_failure": best_trajectory_failure,
+                        "elapsed_seconds": time.perf_counter() - placement_started})
+    print(f"[replay] episode {args.episode}: base in table xy={base[:2].tolist()} m; "
+          f"distance={np.linalg.norm(base[:2]):.4f} m; candidates={diagnostics['oracle_calls']}")
+    return _record_base_placement(result, base, "episode-xy", diagnostics)
+
+
+def _rollout_within_thresholds(rollout: dict[str, np.ndarray], args: argparse.Namespace) -> bool:
+    """判断全段 TCP 误差是否满足用户设置的严格门槛。"""
+    for side in ("left", "right"):
+        pos = np.asarray(rollout[f"{side}_pos_error_m"])
+        rot = np.asarray(rollout[f"{side}_rot_error_deg"])
+        if (not np.isfinite(pos).all() or not np.isfinite(rot).all()
+                or np.any(pos > args.max_ik_position_error_m)
+                or np.any(rot > args.max_ik_rotation_error_deg)):
+            return False
+    return True
+
+
+def _record_base_placement(rollout, table_from_base, policy, diagnostics):
+    """将固定的每段 base 摆放和数值搜索说明写入回放结果。"""
+    rollout["table_from_robot_pose7"] = np.asarray([table_from_base], dtype=np.float32)
+    rollout["base_placement_policy"] = np.asarray([policy])
+    rollout["base_placement_scope"] = np.asarray(["simulation"])
+    rollout["base_placement_verified"] = np.asarray([False])
+    rollout["base_placement_diagnostics_json"] = np.asarray([json.dumps(diagnostics, sort_keys=True)])
+    return rollout
+
+
+def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
+    """使用指定的固定桌面到机器人变换求解整条轨迹。"""
+    report(args, "模型与轨迹初始化", candidate=getattr(args, "_placement_candidate", None))
+    resolve_replay_options(args)
+    runtime = getattr(args, "_episode_runtime", None)
+    if runtime is None:
+        runtime = args._episode_runtime = load_embodiment(args.robot)
+    loaded = getattr(args, "_episode_loaded", None)
+    if loaded is None:
+        loaded = args._episode_loaded = load_episode_states(args)
+    states, fps, source_info, recorded_gripper_openings = loaded
     source_metadata = handumi_metadata(source_info)
     from handumi.config import dataset_active_sides
 
@@ -778,6 +1000,23 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
     controller_device = _resolved_controller_device(args, source_info)
     requested_retarget_mode = str(args.retarget_mode)
     retarget_mode = _resolved_retarget_mode(args, source_info)
+    if retarget_mode == "absolute-tcp" and args.raw_controller_debug:
+        raise SystemExit("absolute-tcp requires calibrated TCP poses, not raw controller debug.")
+    if (retarget_mode == "absolute-tcp" and
+            (_metadata_tcp_snapshot(source_info) or {}).get("applied_to_state") is True):
+        raise SystemExit("absolute-tcp requires the supported raw controller state layout; the dataset reports an already-applied TCP calibration.")
+    if retarget_mode == "absolute-tcp":
+        source_indices = list(range(args.start_frame, len(states), args.stride))
+        if args.max_frames is not None:
+            source_indices = source_indices[:args.max_frames]
+        for frame in source_indices:
+            state = states[frame]
+            for side, pose_slice in (("left", LEFT_POSE_SLICE), ("right", RIGHT_POSE_SLICE)):
+                if side in runtime.arms:
+                    pose = state[pose_slice]
+                    _require_finite_frame(frame, f"{side} source pose", pose)
+                    if float(np.linalg.norm(pose[3:7])) < 1e-8:
+                        raise SystemExit(f"Invalid zero {side} source quaternion at frame {frame}.")
     if runtime.config.replay_gripper_mode == "physical-width":
         from handumi.dataset.gripper import require_physical_width
         require_physical_width(source_metadata)
@@ -845,6 +1084,8 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 else None
             ),
         )
+        if retarget_mode == "absolute-tcp" and tcp_selection.source.startswith("legacy device fallback"):
+            raise SystemExit("absolute-tcp requires a dataset, configured, or explicit controller-to-TCP calibration; a legacy device fallback cannot establish the source tool frame.")
         (
             states_for_retarget,
             raw_left_controller_arr,
@@ -926,6 +1167,7 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
     right_adapter = None
     robot_from_table = None
     deployment_calibration = None
+    robot_tcp = None
     left_tool_adapter = None
     right_tool_adapter = None
     initial_solve_count = 0
@@ -957,16 +1199,18 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
     else:
         if source_metadata.get("tracking_workspace") != "table":
             raise SystemExit(
-                "--retarget-mode absolute-table requires a dataset recorded in the "
+                f"--retarget-mode {retarget_mode} requires a dataset recorded in the "
                 "calibrated table workspace."
             )
-        deployment_calibration = getattr(args, "deployment_selection", None)
+        deployment_calibration = (getattr(args, "_placement_override", None)
+                                  or getattr(args, "deployment_selection", None))
         if deployment_calibration is None:
             deployment_calibration = resolve_deployment_calibration(
                 args.robot,
                 explicit_path=args.deployment_calibration,
                 profile=args.deployment_profile,
                 rig_config=args.rig_config,
+                identity_fallback=retarget_mode == "absolute-tcp",
             )
         robot_from_table = deployment_calibration.pose7
         print_deployment_calibration(deployment_calibration)
@@ -979,6 +1223,24 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
             states_for_retarget[frame_indices[0]],
             robot_from_table,
         )
+        if retarget_mode == "absolute-tcp":
+            robot_tcp = load_robot_tcp_calibration(
+                args.robot,
+                {side: runtime.config.arms[side] for side in runtime.arms},
+                explicit_path=getattr(args, "robot_tcp_calibration", None),
+            )
+            print(f"[replay] robot TCP: {robot_tcp.path} sha256={robot_tcp.sha256} verified={robot_tcp.verified}")
+            if hasattr(args, "_placement_context"):
+                source_left, source_right = raw_state_pose7_pair(states_for_retarget[frame_indices[0]])
+                args._placement_context.update({
+                    "runtime": runtime, "tool": robot_tcp, "deployment": deployment_calibration,
+                    "targets": {"left": source_left, "right": source_right},
+                    "locked": locked_joint_indices,
+                })
+            if "left" in runtime.arms:
+                home_left_pose7 = robot_tcp.achieved_tcp("left", home_left_pose7)
+            if "right" in runtime.arms:
+                home_right_pose7 = robot_tcp.achieved_tcp("right", home_right_pose7)
         if args.absolute_orientation == "relative-start":
             left_tool_adapter = orientation_only_pose_adapter(
                 mapped_left, home_left_pose7
@@ -997,41 +1259,61 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
             first_left_target = home_left_pose7.copy()
         if "right" not in runtime.arms:
             first_right_target = home_right_pose7.copy()
+        first_left_ee = (
+            robot_tcp.target_ee("left", first_left_target)
+            if robot_tcp is not None and "left" in runtime.arms else first_left_target
+        )
+        first_right_ee = (
+            robot_tcp.target_ee("right", first_right_target)
+            if robot_tcp is not None and "right" in runtime.arms else first_right_target
+        )
         initial_solver = runtime.solver_cls(
             config=replace(cfg, max_joint_delta=None),
             locked_joint_indices=locked_joint_indices,
         )
-        # Seed the start-pose solve from the working posture rather than the
-        # folded home: the local solver lands in whichever elbow branch it
-        # starts near, and every later frame warm-starts from this one.
-        q = posture_seed(runtime.config.posture_q, runtime.config.home_q)
+        # 绝对 TCP 模式从 HOME 求首帧；旧模式保留原有工作姿态种子。
+        initial_seed = getattr(args, "_initial_q_seed", None)
+        q = (np.asarray(initial_seed, dtype=np.float32).copy() if initial_seed is not None
+             else runtime.config.home_q.astype(np.float32).copy() if robot_tcp is not None
+             else posture_seed(runtime.config.posture_q, runtime.config.home_q))
+        report(args, "首帧求解（可能含编译）", candidate=getattr(args, "_placement_candidate", None))
         for initial_solve_count in range(1, args.initial_solve_iterations + 1):
-            q = initial_solver.ik(
-                q,
-                left_pose=(first_left_target[:3], first_left_target[3:7]),
-                right_pose=(first_right_target[:3], first_right_target[3:7]),
-            )
+            if initial_seed is None or initial_solve_count > 1:
+                q = initial_solver.ik(
+                    q,
+                    left_pose=(first_left_ee[:3], first_left_ee[3:7]),
+                    right_pose=(first_right_ee[:3], first_right_ee[3:7]),
+                )
             initial_left, initial_right = initial_solver.fk_pose7(q)
+            if robot_tcp is not None:
+                _require_finite_frame(frame_indices[0], "initial IK joint or FK", q, initial_left, initial_right)
+                if "left" in runtime.arms:
+                    initial_left = robot_tcp.achieved_tcp("left", initial_left)
+                if "right" in runtime.arms:
+                    initial_right = robot_tcp.achieved_tcp("right", initial_right)
             initial_errors = pose_error_arrays(
                 first_left_target[None],
                 first_right_target[None],
                 initial_left[None],
                 initial_right[None],
             )
+            if robot_tcp is not None:
+                _require_finite_frame(frame_indices[0], "initial TCP error", *initial_errors.values())
+            error_sides = runtime.arms if robot_tcp is not None else ("left", "right")
             initial_max_position_error_m = max(
-                float(initial_errors["left_pos_error_m"][0]),
-                float(initial_errors["right_pos_error_m"][0]),
+                float(initial_errors[f"{side}_pos_error_m"][0]) for side in error_sides
             )
             initial_max_rotation_error_deg = max(
-                float(initial_errors["left_rot_error_deg"][0]),
-                float(initial_errors["right_rot_error_deg"][0]),
+                float(initial_errors[f"{side}_rot_error_deg"][0]) for side in error_sides
             )
-            if initial_max_position_error_m <= args.initial_position_tolerance_m:
+            if (initial_max_position_error_m <= args.initial_position_tolerance_m
+                    and (robot_tcp is None or initial_max_rotation_error_deg <= args.max_ik_rotation_error_deg)):
                 break
-        if initial_max_position_error_m > args.initial_position_tolerance_m:
+        if (initial_max_position_error_m > args.initial_position_tolerance_m
+                or (robot_tcp is not None and initial_max_rotation_error_deg > args.max_ik_rotation_error_deg)):
             raise SystemExit(
-                "Unable to prepare replay start pose: maximum TCP position error "
-                f"is {initial_max_position_error_m * 100:.2f} cm after "
+                "Unable to prepare replay start pose: maximum TCP position and rotation errors "
+                f"are {initial_max_position_error_m * 100:.2f} cm and {initial_max_rotation_error_deg:.2f} deg after "
                 f"{initial_solve_count} IK iterations. Check robot_from_table, TCP "
                 "calibration, or robot reachability. Pass a dataset-specific "
                 "--deployment-calibration or raise --initial-position-tolerance-m "
@@ -1041,6 +1323,8 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
 
     start = time.perf_counter()
     for selected_index, frame_index in enumerate(frame_indices):
+        report(args, "逐帧求解", current=selected_index, total=len(frame_indices),
+               candidate=getattr(args, "_placement_candidate", None))
         state = states_for_retarget[frame_index]
         raw_left, raw_right = raw_state_pose7_pair(state)
         if retarget_mode == "anchored":
@@ -1053,7 +1337,7 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 right_pose=(right_pose7[:3], right_pose7[3:7]),
             )
             fk_left_pose7, fk_right_pose7 = solver.fk_pose7(q)
-        elif retarget_mode == "absolute-table":
+        elif retarget_mode in {"absolute-table", "absolute-tcp"}:
             if robot_from_table is None:
                 raise RuntimeError("Absolute table retarget mode was not initialized.")
             left_pose7, right_pose7 = absolute_table_robot_target_pose7(
@@ -1062,12 +1346,25 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 left_tool_adapter_pose7=left_tool_adapter,
                 right_tool_adapter_pose7=right_tool_adapter,
             )
-            q = solver.ik(
-                q,
-                left_pose=(left_pose7[:3], left_pose7[3:7]),
-                right_pose=(right_pose7[:3], right_pose7[3:7]),
-            )
+            left_ee = (robot_tcp.target_ee("left", left_pose7)
+                       if robot_tcp is not None and "left" in runtime.arms else left_pose7)
+            right_ee = (robot_tcp.target_ee("right", right_pose7)
+                        if robot_tcp is not None and "right" in runtime.arms else right_pose7)
+            if robot_tcp is not None:
+                _require_finite_frame(frame_index, "TCP target", left_pose7, right_pose7, left_ee, right_ee)
+            if robot_tcp is None or selected_index != 0:
+                q = solver.ik(
+                    q,
+                    left_pose=(left_ee[:3], left_ee[3:7]),
+                    right_pose=(right_ee[:3], right_ee[3:7]),
+                )
             fk_left_pose7, fk_right_pose7 = solver.fk_pose7(q)
+            if robot_tcp is not None:
+                _require_finite_frame(frame_index, "IK joint or FK", q, fk_left_pose7, fk_right_pose7)
+                if "left" in runtime.arms:
+                    fk_left_pose7 = robot_tcp.achieved_tcp("left", fk_left_pose7)
+                if "right" in runtime.arms:
+                    fk_right_pose7 = robot_tcp.achieved_tcp("right", fk_right_pose7)
         elif selected_index == 0:
             left_pose7 = home_left_pose7.copy()
             right_pose7 = home_right_pose7.copy()
@@ -1124,6 +1421,8 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 q,
                 {"left": float(opening[0]), "right": float(opening[1])},
             )
+        if robot_tcp is not None:
+            _require_finite_frame(frame_index, "output joint", q)
         qs.append(q.copy())
         raw_left_gt.append(raw_left)
         raw_right_gt.append(raw_right)
@@ -1131,6 +1430,8 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
         right_targets.append(right_pose7)
         left_achieved.append(fk_left_pose7)
         right_achieved.append(fk_right_pose7)
+    report(args, "逐帧求解", current=len(frame_indices), total=len(frame_indices),
+           candidate=getattr(args, "_placement_candidate", None))
     elapsed = time.perf_counter() - start
     approach_qs = joint_approach_ramp(
         runtime.config.home_q.astype(np.float32),
@@ -1142,6 +1443,9 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
     achieved_left = np.asarray(left_achieved, dtype=np.float32)
     achieved_right = np.asarray(right_achieved, dtype=np.float32)
     errors = pose_error_arrays(target_left, target_right, achieved_left, achieved_right)
+    if robot_tcp is not None:
+        for i, frame in enumerate(frame_indices):
+            _require_finite_frame(frame, "TCP error", *(value[i] for value in errors.values()))
     all_pos_err = np.concatenate(
         [errors[f"{side}_pos_error_m"] for side in runtime.arms]
     )
@@ -1161,6 +1465,7 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
     )
     print(
         f"[replay] retarget={retarget_mode} "
+        f"controller_device={controller_device} "
         f"compose={args.compose_source} translation_scale={args.translation_scale:g} "
         f"max_joint_delta={cfg.max_joint_delta}"
     )
@@ -1175,7 +1480,7 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
     else:
         print(f"[replay] input pose: calibrated HandUMI TCP via {calibration_source}")
     print(f"[replay] grippers: {gripper_source}")
-    if retarget_mode == "absolute-table":
+    if retarget_mode in {"absolute-table", "absolute-tcp"}:
         print(
             "[replay] start prepared: "
             f"iterations={initial_solve_count} "
@@ -1209,6 +1514,14 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
         )
     if violations:
         message = "IK fidelity threshold exceeded: " + "; ".join(violations)
+        if robot_tcp is not None:
+            frame_errors = []
+            for i, frame in enumerate(frame_indices):
+                pos = max(float(errors[f"{side}_pos_error_m"][i]) for side in runtime.arms)
+                rot = max(float(errors[f"{side}_rot_error_deg"][i]) for side in runtime.arms)
+                if pos > args.max_ik_position_error_m or rot > args.max_ik_rotation_error_deg:
+                    frame_errors.append(f"{frame}: {pos * 1000:.2f}mm/{rot:.2f}deg")
+            message += "; frames (position/rotation): " + ", ".join(frame_errors)
         if args.strict_ik:
             raise SystemExit(message)
         print(f"[replay] warning: {message}")
@@ -1289,7 +1602,18 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
             [robot_from_table] if robot_from_table is not None else [],
             dtype=np.float32,
         ),
+        "table_from_robot_pose7": np.asarray(
+            [pose_inv(robot_from_table)] if robot_from_table is not None else [], dtype=np.float32,
+        ),
+        "base_placement_policy": np.asarray(["fixed"]),
+        "base_placement_scope": np.asarray([deployment_calibration.scope if deployment_calibration is not None else ""]),
+        "base_placement_verified": np.asarray([deployment_calibration.verified if deployment_calibration is not None else False]),
+        "base_placement_diagnostics_json": np.asarray([""]),
         **_deployment_npz_entries(deployment_calibration),
+        "robot_tcp_calibration_json": np.asarray([json.dumps(robot_tcp.metadata(), sort_keys=True) if robot_tcp is not None else ""]),
+        "max_ik_position_error_m": np.asarray([args.max_ik_position_error_m]),
+        "max_ik_rotation_error_deg": np.asarray([args.max_ik_rotation_error_deg]),
+        "initial_position_tolerance_m": np.asarray([args.initial_position_tolerance_m]),
         "left_tool_adapter_pose7": np.asarray(
             [left_tool_adapter] if left_tool_adapter is not None else [],
             dtype=np.float32,
@@ -1343,7 +1667,7 @@ def _render_task_scene(server, args: argparse.Namespace, rollout: dict[str, np.n
         return
     transforms = rollout["robot_from_table_pose7"]
     if len(transforms) != 1:
-        raise SystemExit("--scene currently requires --retarget-mode absolute-table.")
+        raise SystemExit("--scene requires an absolute table or TCP retarget mode.")
 
     from handumi.sim.scene import load_scene
 
@@ -1420,8 +1744,9 @@ def _base_footprints(runtime, urdf) -> list[np.ndarray]:
 
 
 def _render_table(
-    server, runtime, urdf, rollout: dict[str, np.ndarray], *, clean: bool = False
-) -> None:
+    server, runtime, urdf, rollout: dict[str, np.ndarray], *, clean: bool = False,
+    base_pose7: np.ndarray | None = None,
+) -> list:
     """Draw the grid on the calibrated tabletop and the rail under the bases.
 
     The grid lies in the table plane rather than at robot-world z=0, so a
@@ -1429,33 +1754,35 @@ def _render_table(
     visible. When the table is below the bases, two rails fill the gap.
     ``clean`` keeps only the rails, leaving out grid, axes and labels.
     """
+    handles = []
+    base_pose7 = np.asarray(base_pose7 if base_pose7 is not None else [0, 0, 0, 0, 0, 0, 1])
     table_transforms = rollout.get("robot_from_table_pose7")
     if table_transforms is None or len(table_transforms) != 1:
         if not clean:
-            server.scene.add_grid("/grid", width=3.0, height=3.0, cell_size=0.1)
-        return
+            handles.append(server.scene.add_grid("/grid", width=3.0, height=3.0, cell_size=0.1))
+        return handles
     table_pose7 = np.asarray(table_transforms[0], dtype=np.float64)
     if not clean:
-        server.scene.add_grid(
+        handles.append(server.scene.add_grid(
             "/grid",
             width=3.0,
             height=3.0,
             cell_size=0.1,
             position=tuple(table_pose7[:3]),
             wxyz=tuple(table_pose7[[6, 3, 4, 5]]),
-        )
-        server.scene.add_frame(
+        ))
+        handles.append(server.scene.add_frame(
             "/table_origin",
             position=tuple(table_pose7[:3]),
             wxyz=tuple(table_pose7[[6, 3, 4, 5]]),
             axes_length=0.15,
             axes_radius=0.004,
-        )
-        _render_placement_measurements(server, runtime, urdf, table_pose7)
-    table_z = float(table_pose7[2])
+        ))
+        handles.extend(_render_placement_measurements(server, runtime, urdf, table_pose7, base_pose7))
+    table_z = float(pose_mul(pose_inv(base_pose7), table_pose7)[2])
     footprints = _base_footprints(runtime, urdf)
     if not footprints or table_z > -1e-3:
-        return
+        return handles
     lower = np.min([f[0] for f in footprints], axis=0)
     upper = np.max([f[1] for f in footprints], axis=0)
     # Two T-slot rails run under the front and back edges of the bases,
@@ -1465,51 +1792,66 @@ def _render_table(
     y_max = float(upper[1]) + MOUNT_RAIL_MARGIN_Y_M
     base_z = float(lower[2])
     for name, edge_x in (("front", float(upper[0])), ("back", float(lower[0]))):
-        server.scene.add_box(
+        local_pose = np.array([edge_x, (y_min + y_max) / 2.0,
+                               (base_z + table_z) / 2.0, 0, 0, 0, 1])
+        world_pose = pose_mul(base_pose7, local_pose)
+        handles.append(server.scene.add_box(
             f"/mount_rail_{name}",
             dimensions=(MOUNT_RAIL_PROFILE_M, y_max - y_min, base_z - table_z),
-            position=(edge_x, (y_min + y_max) / 2.0, (base_z + table_z) / 2.0),
+            position=tuple(world_pose[:3]),
+            wxyz=tuple(world_pose[[6, 3, 4, 5]]),
             color=(150, 155, 160),
-        )
+        ))
+    return handles
 
 
-def _render_placement_measurements(server, runtime, urdf, table_pose7: np.ndarray) -> None:
-    """Dimension the table placement on the tabletop (table z=0).
-
-    The reference point is the robot-world origin (for bimanual layouts,
-    midway between the arm bases) dropped onto the tabletop, so the line to
-    the ChArUco center is the horizontal distance measured on the table. The
-    base-to-base line joins the centers of the arm bases (their joint-1
-    axes) on the base plane.
-    """
+def _render_placement_measurements(server, runtime, urdf, table_pose7: np.ndarray,
+                                   base_pose7: np.ndarray | None = None) -> list:
+    """在侧栏显示摆放尺寸，场景仅保留标记与可选的简短文字。"""
     magenta = (220, 40, 200)
     table_center = np.asarray(table_pose7[:3], dtype=np.float64)
-    reference = np.array([0.0, 0.0, table_center[2]])
+    base_pose7 = np.asarray(base_pose7 if base_pose7 is not None else [0, 0, 0, 0, 0, 0, 1])
+    # 基座参考点位于桌面高度，便于测量桌面原点的水平偏移。
+    normal = pose7_to_mat(table_pose7)[:3, 2]
+    reference = base_pose7[:3] - normal * np.dot(base_pose7[:3] - table_center, normal)
+    offset = table_center - reference
+    coincident = float(np.linalg.norm(offset)) < 1e-6
+    labels = []
+    segments = [] if coincident else [[reference, table_center]]
+    handles = [server.scene.add_frame("/measure", show_axes=False)]
     server.scene.add_icosphere(
         "/measure/reference", radius=0.012, color=magenta, position=tuple(reference)
     )
-    server.scene.add_label(
-        "/measure/reference/label",
-        "reference: robot origin on table z=0",
-        position=(0.0, 0.0, 0.03),
-        anchor="bottom-center",
+    # 重合时只创建一条标签；默认隐藏，避免标签随观察角度相互遮挡。
+    label_specs = (
+        [("origin", "桌面原点 / 基座参考点", table_center)]
+        if coincident else [
+            ("reference", "基座参考点", reference),
+            ("charuco", "桌面原点", table_center),
+        ]
     )
-    server.scene.add_label(
-        "/measure/charuco/label",
-        "ChArUco center",
-        position=tuple(table_center + [0.0, 0.0, 0.03]),
-        anchor="bottom-center",
-    )
-    offset = table_center - reference
-    segments = [[reference, table_center]]
-    server.scene.add_label(
-        "/measure/reference_to_charuco",
-        f"{np.linalg.norm(offset[:2]):.3f} m (x={offset[0]:.3f}, y={offset[1]:.3f})",
-        position=tuple((reference + table_center) / 2.0 + [0.0, 0.0, 0.02]),
-        anchor="bottom-center",
-    )
+    for name, text, position in label_specs:
+        labels.append(server.scene.add_label(
+            f"/measure/{name}_label",
+            text,
+            position=tuple(position + [0.0, 0.0, 0.06]),
+            anchor="bottom-center",
+            font_screen_scale=0.8,
+            visible=False,
+        ))
+    table_in_base = pose_mul(pose_inv(base_pose7), table_pose7)
+    base_in_table = pose_mul(pose_inv(table_pose7), base_pose7)
+    details = [
+        "紫色圆点：基座在桌面的参考点。坐标轴：桌面原点。",
+        "桌面原点与基座参考点重合。" if coincident else "桌面原点与基座参考点分开显示。",
+        f"**水平距离：** {np.linalg.norm(offset[:2]):.3f} m",
+        f"**水平偏移：** X {offset[0]:+.3f} m，Y {offset[1]:+.3f} m",
+        f"**桌面原点（base 坐标）：**\n"
+        f"X {table_in_base[0]:+.3f} m，Y {table_in_base[1]:+.3f} m，Z {table_in_base[2]:+.3f} m",
+        f"**基座原点（桌面坐标）：**\nX {base_in_table[0]:+.3f} m，Y {base_in_table[1]:+.3f} m，Z {base_in_table[2]:+.3f} m",
+    ]
     bases = [
-        urdf.get_transform(urdf.joint_map[names[0]].parent)[:3, 3]
+        pose_mul(base_pose7, np.r_[urdf.get_transform(urdf.joint_map[names[0]].parent)[:3, 3], [0, 0, 0, 1]])[:3]
         for side in runtime.active_sides
         if (names := runtime.arm_joint_names(side))
     ]
@@ -1523,45 +1865,184 @@ def _render_placement_measurements(server, runtime, urdf, table_pose7: np.ndarra
                 color=magenta,
                 position=tuple(center),
             )
-        server.scene.add_label(
-            "/measure/base_to_base",
-            f"base center to base center {np.linalg.norm(left - right):.3f} m",
-            position=tuple((left + right) / 2.0 + [-0.15, 0.0, 0.02]),
-            anchor="bottom-center",
+        details.append(
+            f"**双臂基座间距：** {np.linalg.norm(left - right):.3f} m"
         )
-    server.scene.add_line_segments(
-        "/measure/lines",
-        points=np.asarray(segments, dtype=np.float32),
-        colors=magenta,
-        line_width=3.0,
+    if segments:
+        server.scene.add_line_segments(
+            "/measure/lines",
+            points=np.asarray(segments, dtype=np.float32),
+            colors=magenta,
+            line_width=3.0,
+        )
+    folder = server.gui.add_folder("坐标与距离", order=100)
+    handles.append(folder)
+    with folder:
+        server.gui.add_markdown("\n\n".join(details))
+        show_labels = server.gui.add_checkbox("显示场景文字", False)
+
+    @show_labels.on_update
+    def _toggle_labels(_) -> None:
+        """按需显示简短场景文字，完整尺寸始终保留在侧栏。"""
+        with server.atomic():
+            for label in labels:
+                label.visible = show_labels.value
+    return handles
+
+
+def _prepare_all_episodes(args: argparse.Namespace, *, initial_failure: str | None = None) -> dict[int, str]:
+    """在启动窗口前有界并行准备其他 episode，并报告失败。"""
+    from handumi.scripts.replay.replay_scheduler import EpisodeScheduler
+
+    if args.no_cache:
+        raise SystemExit("--prepare-mode all requires caching; remove --no-cache.")
+    info = ensure_metadata(DatasetRef.from_repo_id(args.repo_id, root=args.dataset_root, revision=args.revision))
+    count = int(info.get("total_episodes", 0))
+    scheduler = EpisodeScheduler(args, count, current=args.episode,
+                                 workers=args.prepare_workers, background=True)
+    if initial_failure is not None:
+        scheduler.failures[args.episode] = initial_failure
+    previous = -1
+    try:
+        while scheduler.queue or scheduler.running:
+            scheduler.poll()
+            done = len(scheduler.completed)
+            if done != previous:
+                print(f"[replay] preparing {done}/{count} episodes; failed={len(scheduler.failures)}")
+                previous = done
+            time.sleep(0.05)
+        if scheduler.failures:
+            for episode, message in sorted(scheduler.failures.items()):
+                print(f"[replay] episode {episode} failed: {message}")
+        failures = dict(scheduler.failures)
+    finally:
+        scheduler.close()
+    # 本轮已经刷新完成，后续切换按内容键读取刚写入的结果。
+    args.refresh_cache = False
+    return failures
+
+
+def _prepare_all_headless(args: argparse.Namespace) -> tuple[dict | None, dict[int, str]]:
+    """从首段开始并行准备全部段，仅保留选中段以供导出。"""
+    from handumi.scripts.replay.replay_progress import BatchProgress
+    from handumi.scripts.replay.replay_scheduler import EpisodeScheduler
+
+    info = ensure_metadata(DatasetRef.from_repo_id(
+        args.repo_id, root=args.dataset_root, revision=args.revision
+    ))
+    count = int(info.get("total_episodes", 0))
+    if count <= 0:
+        raise SystemExit("Dataset contains no episodes.")
+    if not 0 <= args.episode < count:
+        raise SystemExit(f"Episode {args.episode} is out of range 0..{count - 1}.")
+    started = time.monotonic()
+    scheduler = EpisodeScheduler(
+        args, count, current=args.episode, workers=args.prepare_workers,
+        background=True, batch=True, progress=args.progress != "off",
     )
+    try:
+        with BatchProgress(count, args.progress) as display:
+            scheduler.warning_sink = lambda message: display.console.print(
+                message, markup=False, highlight=False
+            )
+            while scheduler.queue or scheduler.running:
+                scheduler.poll()
+                display.update(scheduler)
+                if scheduler.queue or scheduler.running:
+                    time.sleep(0.05)
+            display.update(scheduler, force=True)
+        for episode, message in sorted(scheduler.failures.items()):
+            print(f"[replay] episode {episode} failed: {message}")
+        if scheduler.stage_seconds:
+            totals = ", ".join(
+                f"{stage}={seconds:.2f}s" for stage, seconds in sorted(scheduler.stage_seconds.items())
+            )
+            print(f"[replay] worker stage time (sum across workers): {totals}")
+        print(f"[replay] total preparation wall time: {time.monotonic() - started:.2f}s")
+        rollout = None if args.episode in scheduler.failures else scheduler.take(args.episode)
+        return rollout, dict(scheduler.failures)
+    finally:
+        scheduler.close()
 
 
 def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> None:
+    """显示回放窗口，允许选择 episode 并在加载失败时保留当前回放。"""
     import viser
     from viser.extras import ViserUrdf
 
+    from handumi.scripts.replay.replay_scheduler import EpisodeScheduler
+    from handumi.visualize.gripper_curve import add_gripper_curve, gripper_curve_image
+
     runtime = load_embodiment(args.robot)
+    source_info = ensure_metadata(
+        DatasetRef.from_repo_id(
+            args.repo_id, root=args.dataset_root, revision=args.revision,
+        )
+    )
+    active_episode = int(args.episode)
+    episode_count = int(source_info.get("total_episodes", active_episode + 1))
     server = viser.ViserServer(port=args.port)
-    from handumi.visualize.gripper_curve import add_gripper_curve
+    episode_picker = server.gui.add_dropdown(
+        "Episode",
+        options=tuple(str(i) for i in range(episode_count)),
+        initial_value=str(active_episode),
+        disabled=episode_count < 2,
+        hint="编号从 0 开始；切换时沿用当前机器人、标定与 IK 设置。",
+        order=-10,
+    )
+    status = server.gui.add_markdown(
+        f"Episode **{active_episode}** · **{len(rollout['qpos'])}** 帧", order=-9,
+    )
+    curve = None
     if "gripper_normalized" in rollout:
-        add_gripper_curve(server, rollout["gripper_normalized"], float(np.asarray(rollout.get("fps", [30])).reshape(-1)[0]))
+        curve = add_gripper_curve(
+            server, rollout["gripper_normalized"], float(rollout["fps"][0]),
+        )
     urdf = runtime.load_urdf(load_meshes=True)
+    def display_base(data):
+        """绝对 TCP 轨迹以桌面为世界坐标，其余回放保持原显示坐标。"""
+        poses = data.get("table_from_robot_pose7")
+        modes = data.get("retarget_mode")
+        if poses is not None and len(poses) == 1 and modes is not None and str(modes[0]) == "absolute-tcp":
+            return np.asarray(poses[0], dtype=np.float32)
+        return None
+
+    def display_table(data, base):
+        """构造桌面世界下的显示参数，不修改轨迹和标定记录。"""
+        if base is None:
+            return data
+        return {**data, "robot_from_table_pose7": np.asarray([[0, 0, 0, 0, 0, 0, 1]], dtype=np.float32)}
+
+    base_pose = display_base(rollout)
+    robot_root = server.scene.add_frame(
+        "/robot", show_axes=False,
+        position=tuple(base_pose[:3]) if base_pose is not None else (0, 0, 0),
+        wxyz=tuple(base_pose[[6, 3, 4, 5]]) if base_pose is not None else (1, 0, 0, 0),
+    )
     robot_view = ViserUrdf(server, urdf, root_node_name="/robot")
-    _render_task_scene(server, args, rollout)
-    _render_table(server, runtime, urdf, rollout, clean=args.clean_view)
+    _render_task_scene(server, args, display_table(rollout, base_pose))
+    table_handles = _render_table(server, runtime, urdf, display_table(rollout, base_pose),
+                                  clean=args.clean_view, base_pose7=base_pose) or []
     markers = {}
+    trajectories = {}
+
+    def trajectory_points(
+        data: dict[str, np.ndarray], kind: str, side: str,
+    ) -> np.ndarray:
+        """提取轨迹点；单帧数据使用重合端点，避免空曲线。"""
+        poses = np.asarray(data[f"{kind}_{side}_pose7_robot_world"])
+        base = display_base(data)
+        points = np.asarray([pose_mul(base, pose)[:3] for pose in poses]) if base is not None else poses[:, :3]
+        return np.repeat(points, 2, axis=0) if len(points) == 1 else points
+
     if not args.hide_trajectories:
         colors = {"left": ((255, 190, 50), (80, 160, 255)),
                   "right": ((80, 220, 130), (255, 90, 90))}
         for side in runtime.active_sides:
             for kind, color in zip(("target", "achieved"), colors[side], strict=True):
-                server.scene.add_spline_catmull_rom(
+                trajectories[kind, side] = server.scene.add_spline_catmull_rom(
                     f"/traj/{kind}_{side}",
-                    positions=tuple(
-                        (float(row[0]), float(row[1]), float(row[2]))
-                        for row in rollout[f"{kind}_{side}_pose7_robot_world"]
-                    ),
+                    points=trajectory_points(rollout, kind, side),
                     color=color, line_width=2.0,
                 )
                 markers[kind, side] = server.scene.add_icosphere(
@@ -1575,8 +2056,24 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
     frame = server.gui.add_slider("Frame", 0, total_frames - 1, 1, 0)
     err_text = server.gui.add_text("EE error (cm/deg)", "-", disabled=True)
     opening_text = server.gui.add_text("Gripper opening (Link7 flange replay)", "-", disabled=True)
+    # 回调只投递请求，求解和绘制由主循环串行处理，避免切换与播放竞争。
+    requests: SimpleQueue[int] = SimpleQueue()
+    scheduler = EpisodeScheduler(
+        args, episode_count, current=active_episode,
+        workers=getattr(args, "prepare_workers", 8),
+        background=getattr(args, "prepare_mode", "background") == "background",
+    )
+    pending_episode = None
+
+    @episode_picker.on_update
+    def request_episode(event) -> None:
+        """记录用户选择；程序回退选择器时不触发重复加载。"""
+        requested = int(event.target.value)
+        if requested != active_episode or pending_episode is not None:
+            requests.put(requested)
 
     def draw(index: int) -> None:
+        """刷新当前轨迹的机器人、标记、误差与夹爪开度。"""
         # Frames before the episode replay the home -> start lead-in; markers
         # stay pinned on frame 0 so the approach visibly aims at it.
         if index < approach_frames:
@@ -1588,7 +2085,9 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
             robot_view.update_cfg(rollout["qpos"][i])
         opening_text.value = " ".join(f"{side}={rollout['gripper_normalized'][i, column]:.1%}" for column, side in enumerate(("left", "right")) if side in runtime.active_sides)
         for (kind, side), marker in markers.items():
-            marker.position = tuple(rollout[f"{kind}_{side}_pose7_robot_world"][i, :3])
+            pose = rollout[f"{kind}_{side}_pose7_robot_world"][i]
+            base = display_base(rollout)
+            marker.position = tuple(pose_mul(base, pose)[:3] if base is not None else pose[:3])
         if index < approach_frames:
             err_text.value = "home -> start approach"
         else:
@@ -1601,14 +2100,126 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
     draw(0)
     print(f"[replay] viewer: http://localhost:{server.get_port()}")
     current = 0
-    while True:
-        if play.value:
-            current = (current + 1) % total_frames
-            frame.value = current
-        else:
-            current = int(frame.value)
-        draw(current)
-        time.sleep(1.0 / 30.0)
+    failure_status = None
+    try:
+        while True:
+            requested = None
+            # 快速连续操作时，只加载最新选择。
+            while True:
+                try:
+                    requested = requests.get_nowait()
+                except Empty:
+                    break
+            if requested is not None:
+                failure_status = None
+                if requested == active_episode:
+                    pending_episode = None
+                else:
+                    pending_episode = requested
+                    scheduler.request(requested)
+            scheduler.poll()
+            next_rollout = None
+            if pending_episode is not None:
+                try:
+                    next_rollout = scheduler.take(pending_episode)
+                except RuntimeError as exc:
+                    failed_episode = pending_episode
+                    pending_episode = None
+                    print(f"[replay] cannot load episode {failed_episode}: {exc}")
+                    with server.atomic():
+                        episode_picker.value = str(active_episode)
+                    failure_status = (
+                        f"Episode **{failed_episode}** 加载失败，继续显示 **{active_episode}**。\n\n"
+                        + str(exc)[:500]
+                    )
+                if (pending_episode is not None and next_rollout is None
+                        and pending_episode not in scheduler.running.values()
+                        and pending_episode not in scheduler.queue):
+                    scheduler.request(pending_episode)
+            if next_rollout is not None:
+                requested = pending_episode
+                try:
+                    # 先完成求解和图表准备，失败时不改动当前可视化。
+                    next_approach = next_rollout.get("approach_qpos")
+                    next_approach_frames = (
+                        0 if next_approach is None else len(next_approach)
+                    )
+                    next_total_frames = next_approach_frames + len(next_rollout["qpos"])
+                    next_points = {
+                        key: trajectory_points(next_rollout, *key) for key in trajectories
+                    }
+                    next_base_pose = display_base(next_rollout)
+                    next_display = display_table(next_rollout, next_base_pose)
+                    next_curve = (
+                        gripper_curve_image(
+                            next_rollout["gripper_normalized"],
+                            float(next_rollout["fps"][0]),
+                        )
+                        if "gripper_normalized" in next_rollout else None
+                    )
+                except (Exception, SystemExit) as exc:
+                    print(f"[replay] cannot load episode {requested}: {exc}")
+                    pending_episode = None
+                    with server.atomic():
+                        episode_picker.value = str(active_episode)
+                        status.content = (
+                            f"Episode **{requested}** 加载失败，继续显示 **{active_episode}**。\n\n"
+                            + str(exc)[:500]
+                        )
+                    failure_status = status.content
+                else:
+                    with server.atomic():
+                        rollout = next_rollout
+                        approach, approach_frames = next_approach, next_approach_frames
+                        total_frames = next_total_frames
+                        active_episode = requested
+                        pending_episode = None
+                        if next_base_pose is not None:
+                            robot_root.position = tuple(next_base_pose[:3])
+                            robot_root.wxyz = tuple(next_base_pose[[6, 3, 4, 5]])
+                            for handle in table_handles:
+                                handle.remove()
+                            table_handles = _render_table(
+                                server, runtime, urdf, next_display, clean=args.clean_view,
+                                base_pose7=next_base_pose,
+                            ) or []
+                        frame.value = current = 0
+                        frame.max = total_frames - 1
+                        for key, trajectory in trajectories.items():
+                            trajectory.points = next_points[key]
+                        if next_curve is not None:
+                            if curve is None:
+                                curve = server.gui.add_image(
+                                    next_curve, label="Gripper opening", order=0,
+                                )
+                            else:
+                                curve.image = next_curve
+                            curve.visible = True
+                        elif curve is not None:
+                            curve.visible = False
+                        episode_picker.value = str(active_episode)
+                        failure_status = None
+                        draw(0)
+                pending_episode = None
+            progress_label = "按需处理" if getattr(args, "prepare_mode", "background") == "off" else "后台处理"
+            progress = f"{progress_label} **{len(scheduler.completed)}/{episode_count}** · 失败 **{len(scheduler.failures)}**"
+            if failure_status is not None:
+                status.content = failure_status + "\n\n" + progress
+            elif pending_episode is not None:
+                status.content = f"正在准备 Episode **{pending_episode}**，继续播放 **{active_episode}**。\n\n" + progress
+            else:
+                status.content = f"Episode **{active_episode}** · **{len(rollout['qpos'])}** 帧\n\n" + progress
+            if play.value:
+                current = (current + 1) % total_frames
+                frame.value = current
+            else:
+                current = min(max(int(frame.value), 0), total_frames - 1)
+                frame.value = current
+            draw(current)
+            time.sleep(1.0 / 30.0)
+    finally:
+        scheduler.close()
+        server.stop()
 
 
 def main() -> None:
@@ -1620,6 +2231,7 @@ def main() -> None:
         parser.print_help()
         return
     args = parser.parse_args(raw_argv)
+    resolve_replay_options(args)
     try:
         selection = resolve_dataset_selection(
             args.dataset,
@@ -1642,6 +2254,10 @@ def main() -> None:
         return
     if args.stride < 1:
         raise ValueError("--stride must be >= 1.")
+    if args.prepare_workers < 1:
+        raise ValueError("--prepare-workers must be >= 1.")
+    if args.prepare_mode == "all" and args.no_cache:
+        raise ValueError("--prepare-mode all requires caching; remove --no-cache.")
     if args.initial_solve_iterations < 1:
         raise ValueError("--initial-solve-iterations must be >= 1.")
     if args.initial_position_tolerance_m <= 0.0:
@@ -1654,9 +2270,41 @@ def main() -> None:
         raise ValueError("--max-ik-rotation-error-deg must be > 0.")
     if args.table_clearance_warning_m <= 0.0:
         raise ValueError("--table-clearance-warning-m must be > 0.")
-    rollout = solve_episode(args)
-    save_rollout(args, rollout)
+    from handumi.scripts.replay.replay_prepare import prepare_episode
+
+    if args.headless and args.prepare_mode == "all":
+        rollout, failures = _prepare_all_headless(args)
+        if failures:
+            raise SystemExit(f"Preparation failed for {len(failures)} episode(s).")
+        if rollout is None:
+            raise SystemExit(f"Prepared episode {args.episode} did not return a rollout.")
+        save_rollout(args, rollout)
+        return
+
+    initial_failure = None
+    try:
+        rollout = prepare_episode(args)
+    except (Exception, SystemExit) as exc:
+        if args.prepare_mode != "all":
+            raise
+        initial_failure = str(exc)
+        print(f"[replay] episode {args.episode} failed: {initial_failure}")
+        rollout = None
+    if args.prepare_mode == "all":
+        failures = _prepare_all_episodes(args, initial_failure=initial_failure)
+        if args.headless and failures:
+            raise SystemExit(f"Preparation failed for {len(failures)} episode(s).")
+        if rollout is None and not args.headless:
+            info = ensure_metadata(DatasetRef.from_repo_id(args.repo_id, root=args.dataset_root, revision=args.revision))
+            usable = [index for index in range(int(info.get("total_episodes", 0))) if index not in failures]
+            if not usable:
+                raise SystemExit("No episode could be prepared.")
+            args.episode = usable[0]
+            rollout = prepare_episode(args)
+    if rollout is not None:
+        save_rollout(args, rollout)
     if not args.headless:
+        assert rollout is not None
         show_viewer(args, rollout)
 
 

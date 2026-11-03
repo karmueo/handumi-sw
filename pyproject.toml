@@ -105,9 +105,11 @@ packages = ["src/handumi"]
 "configs/calibration/table/README.md" = "handumi/configs/calibration/table/README.md"
 "configs/calibration/table/local/README.md" = "handumi/configs/calibration/table/local/README.md"
 "configs/calibration/table/local/example.yaml" = "handumi/configs/calibration/table/local/example.yaml"
+"configs/calibration/robot_tcp/example.yaml" = "handumi/configs/calibration/robot_tcp/example.yaml"
+"configs/calibration/robot_tcp/README.md" = "handumi/configs/calibration/robot_tcp/README.md"
 
 [tool.hatch.build.targets.sdist]
-exclude = ["configs/calibration/umi/local/**"]
+exclude = ["configs/calibration/umi/local/**", "configs/calibration/robot_tcp/local/**", "**/.handumi/**"]
 include = [
     "src/handumi",
     "assets",

@@ -28,7 +28,10 @@ from typing import Any
 
 import numpy as np
 
-from handumi.calibration.deployment import load_deployment_calibration
+from handumi.calibration.deployment import (
+    DeploymentCalibration,
+    load_deployment_calibration,
+)
 from handumi.config import DEFAULT_RIG_CONFIG
 from handumi.dataset import DatasetRef, handumi_metadata, open_dataset
 from handumi.dataset.canonical import (
@@ -47,6 +50,7 @@ from handumi.dataset.paths import repo_path
 from handumi.dataset.selection import resolve_dataset_selection
 from handumi.robots.kinematics import pose_error_arrays
 from handumi.robots.registry import EMBODIMENT_NAMES, load_embodiment
+from handumi.robots.utils import mat_to_pose7, pose_inv, pose_mul
 from handumi.scripts.replay.replay_in_sim import (
     _column_float32,
     _render_table,
@@ -368,11 +372,16 @@ def build_rollout(args: argparse.Namespace) -> dict[str, np.ndarray]:
     if getattr(args, "recorded_openings", None) is not None:
         gripper_normalized = args.recorded_openings[frame_indices]
     solver = runtime.solver_cls()
+    tool_poses = _recorded_tool_poses(meta, runtime)
     start = time.perf_counter()
     left_tcp = np.empty((len(qpos), 7), dtype=np.float32)
     right_tcp = np.empty((len(qpos), 7), dtype=np.float32)
     for index, q in enumerate(qpos):
         left_tcp[index], right_tcp[index] = solver.fk_pose7(q)
+        if "left" in tool_poses:
+            left_tcp[index] = pose_mul(left_tcp[index], tool_poses["left"])
+        if "right" in tool_poses:
+            right_tcp[index] = pose_mul(right_tcp[index], tool_poses["right"])
     elapsed = time.perf_counter() - start
 
     approach_qpos = joint_approach_ramp(
@@ -381,7 +390,10 @@ def build_rollout(args: argparse.Namespace) -> dict[str, np.ndarray]:
         frames=int(round(fps * args.approach_seconds)),
     )
 
-    deployment = _deployment_pose7(meta)
+    recorded_placement = meta.get("deployment_calibration")
+    source_index = (source_episode_index(args.dataset_root, args.episode)
+                    if isinstance(recorded_placement, dict) and recorded_placement.get("per_episode") else None)
+    deployment = _deployment_pose7(meta, source_index=source_index)
     print(
         f"[replay-joints] robot={args.robot} episode={args.episode} "
         f"frames={len(qpos)} fps={fps:g} source={args.source} "
@@ -429,6 +441,10 @@ def build_rollout(args: argparse.Namespace) -> dict[str, np.ndarray]:
             if deployment is not None
             else np.empty((0, 7), dtype=np.float32)
         ),
+        "table_from_robot_pose7": (
+            np.asarray([pose_inv(deployment)], dtype=np.float32)
+            if deployment is not None else np.empty((0, 7), dtype=np.float32)
+        ),
     }
 
 
@@ -439,7 +455,28 @@ def _gripper_source(meta: dict[str, object]) -> str:
     return "unknown"
 
 
-def _deployment_pose7(meta: dict[str, object]) -> np.ndarray | None:
+def _recorded_tool_poses(meta: dict[str, Any], runtime) -> dict[str, np.ndarray]:
+    """从转换元数据恢复末端到 TCP 外参，用于关节 FK 与轨迹核验。"""
+    if meta.get("retarget_mode") != "absolute-tcp":
+        return {}
+    from handumi.calibration.robot_tcp import rigid_transform
+
+    calibration = meta.get("robot_tcp_calibration")
+    if not isinstance(calibration, dict) or not isinstance(calibration.get("arms"), dict):
+        raise SystemExit("Missing robot TCP calibration in converted dataset metadata.")
+    result = {}
+    for side in runtime.arms:
+        try:
+            arm = calibration["arms"][side]
+            if arm["ee_link"] != runtime.config.arms[side].ee_link:
+                raise ValueError("ee_link does not match robot configuration")
+            result[side] = mat_to_pose7(rigid_transform(arm["ee_to_tcp"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SystemExit(f"Invalid recorded {side} robot TCP calibration: {exc}") from exc
+    return result
+
+
+def _deployment_pose7(meta: dict[str, object], *, source_index: int | None = None) -> np.ndarray | None:
     """Load the exact table placement conversion used, if it is still here.
 
     The transform is only needed to draw the table frame and an optional task
@@ -448,6 +485,15 @@ def _deployment_pose7(meta: dict[str, object]) -> np.ndarray | None:
     file drops the scene instead of substituting one.
     """
     recorded = meta.get("deployment_calibration")
+    report = _ik_fidelity_entry(meta, source_index)
+    placement = report.get("base_placement") if report is not None else None
+    if isinstance(placement, dict):
+        pose = np.asarray(placement.get("robot_from_table_pose7"), dtype=np.float32)
+        if pose.shape != (7,) or not np.isfinite(pose).all() or not np.isclose(np.linalg.norm(pose[3:]), 1, atol=1e-3):
+            raise SystemExit(f"Invalid per-episode table placement for source episode {source_index}.")
+        return pose
+    if isinstance(recorded, dict) and recorded.get("per_episode"):
+        raise SystemExit(f"Missing per-episode table placement for source episode {source_index}.")
     if not isinstance(recorded, dict) or not recorded.get("path"):
         return None
     path = repo_path(str(recorded["path"]))
@@ -591,17 +637,29 @@ def verify_episode(args: argparse.Namespace) -> bool:
     right = np.empty((len(expanded), 7), dtype=np.float32)
     for index, q in enumerate(expanded):
         left[index], right[index] = solver.fk_pose7(q)
-    errors = pose_error_arrays(
-        np.asarray(rollout["achieved_left_pose7_robot_world"], dtype=np.float32),
-        np.asarray(rollout["achieved_right_pose7_robot_world"], dtype=np.float32),
-        left,
-        right,
-    )
+    tools = _recorded_tool_poses(meta, runtime)
+    for side, poses in (("left", left), ("right", right)):
+        if side in tools:
+            for i in range(len(poses)):
+                poses[i] = pose_mul(poses[i], tools[side])
+    source_left = np.asarray(rollout["achieved_left_pose7_robot_world"], dtype=np.float32)
+    source_right = np.asarray(rollout["achieved_right_pose7_robot_world"], dtype=np.float32)
+    recorded_base = _deployment_pose7(meta, source_index=source_index)
+    source_base = rollout.get("table_from_robot_pose7")
+    if recorded_base is not None and source_base is not None and len(source_base) == 1:
+        # 两次搜索的 base 可不同；先还原到同一桌面坐标再比较真实 TCP。
+        recorded_in_table = pose_inv(recorded_base)
+        for poses in (left, right):
+            for i in range(len(poses)):
+                poses[i] = pose_mul(recorded_in_table, poses[i])
+        source_left = np.asarray([pose_mul(source_base[0], p) for p in source_left])
+        source_right = np.asarray([pose_mul(source_base[0], p) for p in source_right])
+    errors = pose_error_arrays(source_left, source_right, left, right)
     position_mm = 1000.0 * float(
-        max(errors["left_pos_error_m"].max(), errors["right_pos_error_m"].max())
+        max(errors[f"{side}_pos_error_m"].max() for side in runtime.arms)
     )
     rotation_deg = float(
-        max(errors["left_rot_error_deg"].max(), errors["right_rot_error_deg"].max())
+        max(errors[f"{side}_rot_error_deg"].max() for side in runtime.arms)
     )
     within = (
         position_mm <= args.verify_position_tolerance_mm
@@ -648,12 +706,9 @@ def verify_episode(args: argparse.Namespace) -> bool:
             f"({'equal' if digest == expected else 'differs, as expected'})"
         )
     args.verify_reference = {
-        "left": np.asarray(
-            rollout["achieved_left_pose7_robot_world"], dtype=np.float32
-        ),
-        "right": np.asarray(
-            rollout["achieved_right_pose7_robot_world"], dtype=np.float32
-        ),
+        # viewer 接收机器人 base 坐标，因此先将桌面参考变回本次记录的 base。
+        "left": np.asarray([pose_mul(recorded_base, p) for p in source_left]) if recorded_base is not None and source_base is not None and len(source_base) == 1 else source_left,
+        "right": np.asarray([pose_mul(recorded_base, p) for p in source_right]) if recorded_base is not None and source_base is not None and len(source_base) == 1 else source_right,
     }
     return ok
 
@@ -686,6 +741,8 @@ def _solve_source_episode(
 
     replay_args.source = str(meta.get("conversion_source", "observation.state"))
     replay_args.retarget_mode = str(meta.get("retarget_mode", "absolute-table"))
+    replay_args.base_placement = str(meta.get("base_placement", "auto"))
+    replay_args.strict_ik = replay_args.retarget_mode == "absolute-tcp"
     replay_args.compose_source = str(meta.get("compose_source", "commanded"))
     replay_args.translation_scale = float(meta.get("translation_scale", 1.0))
     replay_args.absolute_orientation = str(
@@ -695,20 +752,41 @@ def _solve_source_episode(
         meta.get("initial_solve_iterations", 12)
     )
     replay_args.initial_position_tolerance_m = float(
-        meta.get("initial_position_tolerance_m", 0.01)
+        meta.get("initial_position_tolerance_m", 0.005 if replay_args.retarget_mode == "absolute-tcp" else 0.01)
     )
+    replay_args.max_ik_position_error_m = float(meta.get("max_ik_position_error_m", 0.005 if replay_args.retarget_mode == "absolute-tcp" else 0.03))
+    replay_args.max_ik_rotation_error_deg = float(meta.get("max_ik_rotation_error_deg", 5.0 if replay_args.retarget_mode == "absolute-tcp" else 45.0))
     replay_args.raw_controller_debug = bool(meta.get("raw_controller_debug", False))
     device = meta.get("controller_device")
-    replay_args.controller_device = str(device) if device in ("pico", "meta") else None
+    replay_args.controller_device = str(device) if device in ("pico", "meta", "vive") else None
+    tool = meta.get("robot_tcp_calibration")
+    if isinstance(tool, dict) and tool.get("path"):
+        tool_path = repo_path(str(tool["path"]))
+        if tool_path is None or not tool_path.is_file():
+            raise SystemExit("Recorded robot TCP calibration is not available for verification.")
+        if tool.get("sha256") and hashlib.sha256(tool_path.read_bytes()).hexdigest() != tool["sha256"]:
+            raise SystemExit("Recorded robot TCP calibration changed since conversion.")
+        replay_args.robot_tcp_calibration = tool_path
     representation = meta.get("gripper_representation")
     if isinstance(representation, dict) and representation.get("max_width_m"):
         replay_args.gripper_max_width_m = float(representation["max_width_m"])
 
     recorded = meta.get("deployment_calibration")
-    if isinstance(recorded, dict) and recorded.get("path"):
-        path = repo_path(str(recorded["path"]))
-        if path is not None and path.is_file():
-            replay_args.deployment_calibration = path
+    if isinstance(recorded, dict):
+        reference_pose = recorded.get("robot_from_table_pose7")
+        if reference_pose is not None:
+            pose = np.asarray(reference_pose, dtype=np.float32)
+            if pose.shape != (7,) or not np.isfinite(pose).all():
+                raise SystemExit("Invalid reference placement in conversion metadata.")
+            replay_args.deployment_selection = DeploymentCalibration(
+                args.robot, pose, None, str(recorded.get("scope", "assumed")),
+                str(recorded.get("source", "recorded_reference")), bool(recorded.get("verified", False)),
+                str(recorded.get("profile", "identity")), recorded.get("lab"),
+            )
+        elif recorded.get("path"):
+            path = repo_path(str(recorded["path"]))
+            if path is not None and path.is_file():
+                replay_args.deployment_calibration = path
     return solve_episode(replay_args)
 
 
@@ -736,8 +814,12 @@ def save_rollout(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Pa
     return output
 
 
-def _points(pose7: np.ndarray) -> tuple[tuple[float, float, float], ...]:
-    return tuple((float(x), float(y), float(z)) for x, y, z in np.asarray(pose7)[:, :3])
+def _points(pose7: np.ndarray, base: np.ndarray | None = None) -> tuple[tuple[float, float, float], ...]:
+    """将 base 下轨迹按需转换到桌面显示坐标。"""
+    poses = np.asarray(pose7)
+    if base is not None:
+        poses = np.asarray([pose_mul(base, pose) for pose in poses])
+    return tuple((float(x), float(y), float(z)) for x, y, z in poses[:, :3])
 
 
 def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> None:
@@ -750,9 +832,17 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
     if "gripper_normalized" in rollout:
         add_gripper_curve(server, rollout["gripper_normalized"], float(np.asarray(rollout.get("fps", [30])).reshape(-1)[0]))
     urdf = runtime.load_urdf(load_meshes=True)
+    table_poses = rollout.get("table_from_robot_pose7")
+    base = (np.asarray(table_poses[0]) if str(rollout["retarget_mode"][0]) == "absolute-tcp"
+            and table_poses is not None and len(table_poses) == 1 else None)
+    server.scene.add_frame("/robot", show_axes=False,
+                           position=tuple(base[:3]) if base is not None else (0, 0, 0),
+                           wxyz=tuple(base[[6, 3, 4, 5]]) if base is not None else (1, 0, 0, 0))
     robot_view = ViserUrdf(server, urdf, root_node_name="/robot")
-    _render_task_scene(server, args, rollout)
-    _render_table(server, runtime, urdf, rollout, clean=args.clean_view)
+    display = ({**rollout, "robot_from_table_pose7": np.array([[0, 0, 0, 0, 0, 0, 1]])}
+               if base is not None else rollout)
+    _render_task_scene(server, args, display)
+    _render_table(server, runtime, urdf, display, clean=args.clean_view, base_pose7=base)
 
     reference = getattr(args, "verify_reference", None)
     marker_left = marker_right = None
@@ -762,25 +852,25 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
             # the re-solved replay path instead of hiding it.
             server.scene.add_spline_catmull_rom(
                 "/traj/replay_left",
-                positions=_points(reference["left"]),
+                positions=_points(reference["left"], base),
                 color=(255, 190, 50),
                 line_width=4.0,
             )
             server.scene.add_spline_catmull_rom(
                 "/traj/replay_right",
-                positions=_points(reference["right"]),
+                positions=_points(reference["right"], base),
                 color=(80, 220, 130),
                 line_width=4.0,
             )
         server.scene.add_spline_catmull_rom(
             "/traj/tcp_left",
-            positions=_points(rollout["fk_left_pose7_robot_world"]),
+            positions=_points(rollout["fk_left_pose7_robot_world"], base),
             color=(80, 160, 255),
             line_width=2.0,
         )
         server.scene.add_spline_catmull_rom(
             "/traj/tcp_right",
-            positions=_points(rollout["fk_right_pose7_robot_world"]),
+            positions=_points(rollout["fk_right_pose7_robot_world"], base),
             color=(255, 90, 90),
             line_width=2.0,
         )
@@ -806,8 +896,8 @@ def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> Non
             i = index - approach_frames
             robot_view.update_cfg(rollout["qpos"][i])
         if marker_left is not None and marker_right is not None:
-            marker_left.position = tuple(rollout["fk_left_pose7_robot_world"][i, :3])
-            marker_right.position = tuple(rollout["fk_right_pose7_robot_world"][i, :3])
+            marker_left.position = tuple(_points(rollout["fk_left_pose7_robot_world"][i:i+1], base)[0])
+            marker_right.position = tuple(_points(rollout["fk_right_pose7_robot_world"][i:i+1], base)[0])
         if index < approach_frames:
             gripper_text.value = "home -> start approach"
         else:

@@ -1,0 +1,15 @@
+# 机器人末端链接到真实工具 TCP 的示例；示例单位矩阵不能代替实际标定。
+schema_version: 1
+kind: handumi_robot_tcp_calibration
+robot: rm75b
+verified: false
+calibration:
+  arms:
+    right:
+      ee_link: Link7
+      ee_to_tcp:
+        - [1.0, 0.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0, 0.0]
+        - [0.0, 0.0, 1.0, 0.0]
+        - [0.0, 0.0, 0.0, 1.0]
+sources: {}

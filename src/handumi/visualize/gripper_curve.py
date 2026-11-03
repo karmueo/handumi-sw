@@ -3,8 +3,8 @@
 import numpy as np
 
 
-def add_gripper_curve(server, openings, fps):
-    """绘制左右开度随时间的曲线；当前播放帧由回放器数值组件指示。"""
+def gripper_curve_image(openings, fps):
+    """生成左右夹爪开度曲线图，供新建或更新回放图表使用。"""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
@@ -19,6 +19,11 @@ def add_gripper_curve(server, openings, fps):
     axis.legend(loc="upper right")
     figure.tight_layout()
     canvas.draw()
+    return np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
+
+
+def add_gripper_curve(server, openings, fps):
+    """在侧栏创建开度曲线，返回可原位更新图像的控件。"""
     return server.gui.add_image(
-        np.asarray(canvas.buffer_rgba())[:, :, :3].copy(), label="Gripper opening"
+        gripper_curve_image(openings, fps), label="Gripper opening"
     )

@@ -78,3 +78,6 @@ interlatent/
 # 本机 UMI 安装与时间标定，不纳入版本管理。
 configs/calibration/umi/local/
 plan.md
+configs/calibration/robot_tcp/local/
+# 数据集逐段回放缓存为本机生成物。
+.handumi/

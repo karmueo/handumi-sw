@@ -29,6 +29,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("dataset", help="Local dataset path or Hugging Face repo id.")
     parser.add_argument("--robot", choices=EMBODIMENT_NAMES, required=True)
+    parser.add_argument("--retarget-mode", choices=("auto", "absolute-tcp"), default="auto")
+    parser.add_argument("--base-placement", choices=("auto", "fixed", "episode-xy"), default="auto")
+    parser.add_argument("--robot-tcp-calibration", type=Path, default=None)
+    parser.add_argument("--cache-dir", type=Path, default=None)
+    cache_mode = parser.add_mutually_exclusive_group()
+    cache_mode.add_argument("--no-cache", action="store_true")
+    cache_mode.add_argument("--refresh-cache", action="store_true")
+    parser.add_argument("--deployment-calibration", type=Path, default=None)
     parser.add_argument("--revision", default="main", help="Hub dataset revision.")
     parser.add_argument(
         "--episodes",
@@ -65,12 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-position-error-m",
         type=float,
-        default=RetargetScreeningConfig.max_position_error_m,
+        default=None,
     )
     parser.add_argument(
         "--max-rotation-error-deg",
         type=float,
-        default=RetargetScreeningConfig.max_rotation_error_deg,
+        default=None,
     )
     parser.add_argument(
         "--controller-tcp-calibration",
@@ -127,8 +135,8 @@ def main() -> None:
         return
 
     config = RetargetScreeningConfig(
-        max_position_error_m=args.max_position_error_m,
-        max_rotation_error_deg=args.max_rotation_error_deg,
+        max_position_error_m=args.max_position_error_m if args.max_position_error_m is not None else (0.005 if args.retarget_mode == "absolute-tcp" else 0.03),
+        max_rotation_error_deg=args.max_rotation_error_deg if args.max_rotation_error_deg is not None else (5.0 if args.retarget_mode == "absolute-tcp" else 45.0),
         max_base_rotation_deg=args.max_base_rotation_deg,
     )
     payload = screen_dataset(
@@ -142,6 +150,13 @@ def main() -> None:
         jobs=args.jobs,
         config=config,
         controller_tcp_calibration=args.controller_tcp_calibration,
+        retarget_mode=args.retarget_mode,
+        base_placement=args.base_placement,
+        cache_dir=args.cache_dir,
+        no_cache=args.no_cache,
+        refresh_cache=args.refresh_cache,
+        robot_tcp_calibration=args.robot_tcp_calibration,
+        deployment_calibration=args.deployment_calibration,
     )
     write_screening_report(report_path, payload)
     markdown_path = args.markdown or report_path.with_suffix(".md")
