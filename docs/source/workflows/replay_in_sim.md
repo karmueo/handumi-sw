@@ -257,6 +257,8 @@ JAX_PLATFORMS=cpu handumi replay-joints \
   --episode 0
 ```
 
+查看器默认先播放 `--episode` 指定的段（默认 0），并在后台准备其他 episode；使用侧栏的 **Episode** 下拉框切换，当前段会循环播放。切换失败时保留当前画面。`--headless`、输出文件和 `--verify` 仅处理初始指定的段。
+
 该命令读取数据集自身的编码。标准转换结果（`handumi.state_layout` 使用弧度和米）会直接展开为 URDF 关节；采用 LeRobot 从臂布局的数据集，无论由 HandUMI 导出还是由插件录制（`robot_type: bi_piper_follower`、`bi_openarm_follower`），都通过导出器使用的相同布局定义解码，因此参考采集数据和 HandUMI 导出数据可以在同一查看器中回放。如果元数据未指定布局，请传入 `--state-layout`；如果插件录制时使用了角度选项，请传入 `--use-degrees`。缺少此检测时，插件向量与标准向量同为 14 列，`-99.8` 会被直接当作弧度渲染，且不会报错。
 
 `--verify` 通过两种不同方式，将标准转换结果与源采集数据进行比较：

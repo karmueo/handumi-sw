@@ -24,6 +24,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from queue import Empty, SimpleQueue
 from typing import Any
 
 import numpy as np
@@ -79,7 +80,10 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     parser.add_argument(
         "--help-advanced", action="store_true", help="Show expert options."
     )
-    parser.add_argument("--episode", type=int, default=0)
+    parser.add_argument(
+        "--episode", type=int, default=0,
+        help="Initial episode (default: 0); select other episodes in the viewer.",
+    )
     parser.add_argument(
         "--robot",
         choices=EMBODIMENT_NAMES,
@@ -893,100 +897,278 @@ def _points(pose7: np.ndarray, base: np.ndarray | None = None) -> tuple[tuple[fl
     return tuple((float(x), float(y), float(z)) for x, y, z in poses[:, :3])
 
 
+def _prepare_joint_worker(values: dict[str, Any], episode: int, refresh: bool) -> dict:
+    """在独立进程中准备关节轨迹，不写入输出文件或运行验证。"""
+    del refresh
+    args = argparse.Namespace(**values)
+    args.episode = episode
+    try:
+        return {"rollout": build_rollout(args)}
+    except (Exception, SystemExit) as exc:
+        return {"error": str(exc)}
+
+
+def _display_data(rollout: dict[str, np.ndarray]):
+    """计算显示坐标、桌面参数和非空轨迹点，供切换前检查。"""
+    poses = rollout.get("table_from_robot_pose7")
+    modes = rollout.get("retarget_mode")
+    base = (np.asarray(poses[0]) if modes is not None and str(modes[0]) == "absolute-tcp"
+            and poses is not None and len(poses) == 1 else None)
+    display = ({**rollout, "robot_from_table_pose7": np.array([[0, 0, 0, 0, 0, 0, 1]])}
+               if base is not None else rollout)
+    points = {}
+    for side in ("left", "right"):
+        trajectory = _points(rollout[f"fk_{side}_pose7_robot_world"], base)
+        points[side] = trajectory if len(trajectory) > 1 else trajectory * 2
+    return base, display, points
+
+
+class _EnvironmentApi:
+    """为场景与 GUI 创建调用记录句柄，并可为场景节点添加路径前缀。"""
+
+    def __init__(self, api, handles: list, prefix: str = ""):
+        """绑定真实接口、待清理的句柄列表和可选场景前缀。"""
+        self._api, self._handles, self._prefix = api, handles, prefix
+
+    def __getattr__(self, name):
+        """代理非创建操作；创建操作记录句柄以支持失败回滚。"""
+        target = getattr(self._api, name)
+        if not name.startswith("add_") or not callable(target):
+            return target
+
+        def add(*args, **kwargs):
+            """创建并记录一个可回收的显示元素。"""
+            if self._prefix and args and isinstance(args[0], str) and args[0].startswith("/"):
+                args = (self._prefix + args[0], *args[1:])
+            handle = target(*args, **kwargs)
+            self._handles.append(handle)
+            return handle
+
+        return add
+
+
+class _EnvironmentServer:
+    """隔离某个 episode 的场景和控件，其他服务调用交给原服务器。"""
+
+    def __init__(self, server, handles: list, prefix: str):
+        """创建记录所有新增节点和控件的代理。"""
+        self._server = server
+        self.scene = _EnvironmentApi(server.scene, handles, prefix)
+        self.gui = _EnvironmentApi(server.gui, handles)
+
+    def __getattr__(self, name):
+        """转发服务器操作。"""
+        return getattr(self._server, name)
+
+
+def _remove_environment(handles: list) -> None:
+    """倒序清理一组环境节点和侧栏控件。"""
+    for handle in reversed(handles):
+        handle.remove()
+
+
+def _build_environment(server, runtime, urdf, args, display, base, serial):
+    """在独立隐藏根节点下准备桌面和任务场景，失败时删除所有临时元素。"""
+    prefix = f"/joint_environment_{serial}"
+    handles = []
+    try:
+        root = server.scene.add_frame(prefix, show_axes=False, visible=False)
+        handles.append(root)
+        proxy = _EnvironmentServer(server, handles, prefix)
+        _render_task_scene(proxy, args, display)
+        _render_table(proxy, runtime, urdf, display, clean=args.clean_view, base_pose7=base)
+        return root, handles
+    except BaseException:
+        _remove_environment(handles)
+        raise
+
+
 def show_viewer(args: argparse.Namespace, rollout: dict[str, np.ndarray]) -> None:
+    """后台准备全部 episode，并在选择失败时保留当前显示。"""
     import viser
     from viser.extras import ViserUrdf
 
+    from handumi.scripts.replay.replay_scheduler import EpisodeScheduler
+    from handumi.visualize.gripper_curve import add_gripper_curve, gripper_curve_image
+
     runtime = load_embodiment(args.robot)
+    active_episode = int(args.episode)
+    verified_episode = active_episode
+    episode_count = int(args.dataset_info.get("total_episodes", 0))
     server = viser.ViserServer(port=args.port)
-    from handumi.visualize.gripper_curve import add_gripper_curve
-    if "gripper_normalized" in rollout:
-        add_gripper_curve(server, rollout["gripper_normalized"], float(np.asarray(rollout.get("fps", [30])).reshape(-1)[0]))
-    urdf = runtime.load_urdf(load_meshes=True)
-    table_poses = rollout.get("table_from_robot_pose7")
-    base = (np.asarray(table_poses[0]) if str(rollout["retarget_mode"][0]) == "absolute-tcp"
-            and table_poses is not None and len(table_poses) == 1 else None)
-    server.scene.add_frame("/robot", show_axes=False,
-                           position=tuple(base[:3]) if base is not None else (0, 0, 0),
-                           wxyz=tuple(base[[6, 3, 4, 5]]) if base is not None else (1, 0, 0, 0))
-    robot_view = ViserUrdf(server, urdf, root_node_name="/robot")
-    display = ({**rollout, "robot_from_table_pose7": np.array([[0, 0, 0, 0, 0, 0, 1]])}
-               if base is not None else rollout)
-    _render_task_scene(server, args, display)
-    _render_table(server, runtime, urdf, display, clean=args.clean_view, base_pose7=base)
-
-    reference = getattr(args, "verify_reference", None)
-    marker_left = marker_right = None
-    if not args.hide_trajectories:
-        if reference is not None:
-            # Drawn first and thicker, so the joint-level path rides on top of
-            # the re-solved replay path instead of hiding it.
-            server.scene.add_spline_catmull_rom(
-                "/traj/replay_left",
-                positions=_points(reference["left"], base),
-                color=(255, 190, 50),
-                line_width=4.0,
-            )
-            server.scene.add_spline_catmull_rom(
-                "/traj/replay_right",
-                positions=_points(reference["right"], base),
-                color=(80, 220, 130),
-                line_width=4.0,
-            )
-        server.scene.add_spline_catmull_rom(
-            "/traj/tcp_left",
-            positions=_points(rollout["fk_left_pose7_robot_world"], base),
-            color=(80, 160, 255),
-            line_width=2.0,
+    scheduler = None
+    try:
+        picker = server.gui.add_dropdown(
+            "Episode", options=tuple(str(i) for i in range(episode_count)),
+            initial_value=str(active_episode), disabled=episode_count < 2,
+            hint="编号从 0 开始，后台准备其他 episode。", order=-10,
         )
-        server.scene.add_spline_catmull_rom(
-            "/traj/tcp_right",
-            positions=_points(rollout["fk_right_pose7_robot_world"], base),
-            color=(255, 90, 90),
-            line_width=2.0,
+        status = server.gui.add_markdown(
+            f"Episode **{active_episode}** · **{len(rollout['qpos'])}** 帧", order=-9,
         )
-        marker_left = server.scene.add_icosphere(
-            "/tcp/left", radius=0.014, color=(80, 160, 255)
+        curve = add_gripper_curve(server, rollout["gripper_normalized"], float(rollout["fps"][0]))
+        urdf = runtime.load_urdf(load_meshes=True)
+        base, display, points = _display_data(rollout)
+        robot_root = server.scene.add_frame(
+            "/robot", show_axes=False,
+            position=tuple(base[:3]) if base is not None else (0, 0, 0),
+            wxyz=tuple(base[[6, 3, 4, 5]]) if base is not None else (1, 0, 0, 0),
         )
-        marker_right = server.scene.add_icosphere(
-            "/tcp/right", radius=0.014, color=(255, 90, 90)
+        robot_view = ViserUrdf(server, urdf, root_node_name="/robot")
+        # 每段环境使用独立根节点，新环境准备完成后再替换旧环境。
+        environment_serial = 0
+        environment_root, environment_handles = _build_environment(
+            server, runtime, urdf, args, display, base, environment_serial,
         )
+        environment_root.visible = True
+        reference = getattr(args, "verify_reference", None)
+        references = {}
+        trajectories = {}
+        markers = {}
+        if not args.hide_trajectories:
+            if reference is not None:
+                for side, color in (("left", (255, 190, 50)), ("right", (80, 220, 130))):
+                    reference_points = _points(reference[side], base)
+                    if len(reference_points) == 1:
+                        reference_points *= 2
+                    references[side] = server.scene.add_spline_catmull_rom(
+                        f"/traj/replay_{side}", points=reference_points, color=color, line_width=4.0,
+                    )
+            for side, color in (("left", (80, 160, 255)), ("right", (255, 90, 90))):
+                trajectories[side] = server.scene.add_spline_catmull_rom(
+                    f"/traj/tcp_{side}", points=points[side], color=color, line_width=2.0,
+                )
+                markers[side] = server.scene.add_icosphere(f"/tcp/{side}", radius=0.014, color=color)
 
-    approach = rollout["approach_qpos"]
-    approach_frames = len(approach)
-    total_frames = approach_frames + len(rollout["qpos"])
-    play = server.gui.add_checkbox("Play", True)
-    frame = server.gui.add_slider("Frame", 0, total_frames - 1, 1, 0)
-    gripper_text = server.gui.add_text("Gripper opening", "-", disabled=True)
+        approach = rollout["approach_qpos"]
+        approach_frames = len(approach)
+        total_frames = approach_frames + len(rollout["qpos"])
+        fps = float(rollout["fps"][0])
+        play = server.gui.add_checkbox("Play", True)
+        frame = server.gui.add_slider("Frame", 0, total_frames - 1, 1, 0)
+        gripper_text = server.gui.add_text("Gripper opening", "-", disabled=True)
+        requests: SimpleQueue[int] = SimpleQueue()
+        # 开度和验证结果由每段重建，避免把初始段的大数组传给每个子进程。
+        worker_args = argparse.Namespace(**{
+            key: value for key, value in vars(args).items()
+            if key not in {"recorded_openings", "observation_openings", "action_openings", "verify_reference"}
+        })
+        scheduler = EpisodeScheduler(worker_args, episode_count, current=active_episode, worker=_prepare_joint_worker)
+        pending_episode = None
+        failure_status = None
 
-    def draw(index: int) -> None:
-        if index < approach_frames:
-            robot_view.update_cfg(approach[index])
-            i = 0
-        else:
-            i = index - approach_frames
-            robot_view.update_cfg(rollout["qpos"][i])
-        if marker_left is not None and marker_right is not None:
-            marker_left.position = tuple(_points(rollout["fk_left_pose7_robot_world"][i:i+1], base)[0])
-            marker_right.position = tuple(_points(rollout["fk_right_pose7_robot_world"][i:i+1], base)[0])
-        if index < approach_frames:
-            gripper_text.value = "home -> start approach"
-        else:
-            opening = rollout["gripper_normalized"][i]
-            gripper_text.value = f"L={opening[0] * 100:.0f}% R={opening[1] * 100:.0f}%"
+        @picker.on_update
+        def request_episode(event) -> None:
+            """仅投递选择请求，由主循环处理显示更新。"""
+            requested = int(event.target.value)
+            if requested != active_episode or pending_episode is not None:
+                requests.put(requested)
 
-    draw(0)
-    print(f"[replay-joints] viewer: http://localhost:{server.get_port()}")
-    current = 0
-    fps = float(rollout["fps"][0])
-    while True:
-        if play.value:
-            current = (current + 1) % total_frames
-            frame.value = current
-        else:
-            current = int(frame.value)
-        draw(current)
-        time.sleep(1.0 / fps)
+        def draw(index: int) -> None:
+            """绘制当前帧的关节、轨迹标记与夹爪开度。"""
+            if index < approach_frames:
+                robot_view.update_cfg(approach[index])
+                i = 0
+            else:
+                i = index - approach_frames
+                robot_view.update_cfg(rollout["qpos"][i])
+            for side, marker in markers.items():
+                marker.position = tuple(_points(rollout[f"fk_{side}_pose7_robot_world"][i:i + 1], base)[0])
+            if index < approach_frames:
+                gripper_text.value = "home -> start approach"
+            else:
+                opening = rollout["gripper_normalized"][i]
+                gripper_text.value = f"L={opening[0] * 100:.0f}% R={opening[1] * 100:.0f}%"
+
+        draw(0)
+        print(f"[replay-joints] viewer: http://localhost:{server.get_port()}")
+        current = 0
+        while True:
+            requested = None
+            while True:
+                try:
+                    requested = requests.get_nowait()
+                except Empty:
+                    break
+            if requested is not None:
+                failure_status = None
+                pending_episode = None if requested == active_episode else requested
+                if pending_episode is not None:
+                    scheduler.request(pending_episode)
+            scheduler.poll()
+            next_rollout = None
+            if pending_episode is not None:
+                try:
+                    next_rollout = scheduler.take(pending_episode)
+                except RuntimeError as exc:
+                    failure_status = f"Episode **{pending_episode}** 加载失败，继续显示 **{active_episode}**。\n\n{str(exc)[:500]}"
+                    pending_episode = None
+                    picker.value = str(active_episode)
+                if (pending_episode is not None and next_rollout is None
+                        and pending_episode not in scheduler.running.values()
+                        and pending_episode not in scheduler.queue):
+                    scheduler.request(pending_episode)
+            if next_rollout is not None:
+                requested = pending_episode
+                try:
+                    next_base, next_display, next_points = _display_data(next_rollout)
+                    next_approach = next_rollout["approach_qpos"]
+                    next_total = len(next_approach) + len(next_rollout["qpos"])
+                    next_fps = float(next_rollout["fps"][0])
+                    next_curve = gripper_curve_image(next_rollout["gripper_normalized"], next_fps)
+                    if args.scene is not None and len(next_display["robot_from_table_pose7"]) != 1:
+                        raise ValueError("--scene requires an absolute table or TCP retarget mode.")
+                    environment_serial += 1
+                    next_root, next_handles = _build_environment(
+                        server, runtime, urdf, args, next_display, next_base, environment_serial,
+                    )
+                except (Exception, SystemExit) as exc:
+                    failure_status = f"Episode **{requested}** 加载失败，继续显示 **{active_episode}**。\n\n{str(exc)[:500]}"
+                    pending_episode = None
+                    picker.value = str(active_episode)
+                else:
+                    with server.atomic():
+                        next_root.visible = True
+                        _remove_environment(environment_handles)
+                        environment_root, environment_handles = next_root, next_handles
+                        robot_root.position = tuple(next_base[:3]) if next_base is not None else (0, 0, 0)
+                        robot_root.wxyz = tuple(next_base[[6, 3, 4, 5]]) if next_base is not None else (1, 0, 0, 0)
+                        rollout, base = next_rollout, next_base
+                        approach, approach_frames = next_approach, len(next_approach)
+                        total_frames, fps = next_total, next_fps
+                        active_episode, pending_episode = requested, None
+                        frame.value = current = 0
+                        frame.max = total_frames - 1
+                        for side, trajectory in trajectories.items():
+                            trajectory.points = next_points[side]
+                        for side, path in references.items():
+                            path.visible = active_episode == verified_episode
+                            if path.visible:
+                                ref_points = _points(reference[side], base)
+                                path.points = ref_points if len(ref_points) > 1 else ref_points * 2
+                        curve.image = next_curve
+                        picker.value = str(active_episode)
+                        failure_status = None
+                        draw(0)
+            progress = f"后台处理 **{len(scheduler.completed)}/{episode_count}** · 失败 **{len(scheduler.failures)}**"
+            if failure_status is not None:
+                status.content = failure_status + "\n\n" + progress
+            elif pending_episode is not None:
+                status.content = f"正在准备 Episode **{pending_episode}**，继续播放 **{active_episode}**。\n\n" + progress
+            else:
+                status.content = f"Episode **{active_episode}** · **{len(rollout['qpos'])}** 帧\n\n" + progress
+            if play.value:
+                current = (current + 1) % total_frames
+                frame.value = current
+            else:
+                current = min(max(int(frame.value), 0), total_frames - 1)
+                frame.value = current
+            draw(current)
+            time.sleep(1.0 / fps)
+    finally:
+        if scheduler is not None:
+            scheduler.close()
+        server.stop()
 
 
 def main() -> None:
@@ -1014,6 +1196,11 @@ def main() -> None:
         raise SystemExit("--verify-rotation-tolerance-deg must be >= 0.")
 
     args.dataset_info = dataset_info(selection.root)
+    episode_count = int(args.dataset_info.get("total_episodes", 0))
+    if episode_count <= 0:
+        raise SystemExit("Dataset has no episodes.")
+    if not 0 <= args.episode < episode_count:
+        raise SystemExit(f"Episode {args.episode} is out of range 0..{episode_count - 1}.")
     args.external_layout = resolve_state_layout(args, args.dataset_info)
     if args.external_layout is not None and args.verify:
         raise SystemExit(

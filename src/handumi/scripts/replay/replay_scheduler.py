@@ -255,8 +255,13 @@ class EpisodeScheduler:
         executor=None,
         batch: bool = False,
         progress: bool = False,
+        worker=None,
     ):
-        """创建 spawn 池；后台队列只保存编号，不预先提交全部任务。"""
+        """创建 spawn 池；后台队列只保存编号，不预先提交全部任务。
+
+        worker 可指定模块级可序列化函数，接收参数字典、episode 编号和刷新标志，
+        返回含 rollout 或 error 的字典；省略时使用 TCP 回放准备任务。
+        """
         if workers < 1:
             raise ValueError("prepare workers 必须至少为 1")
         if episode_count <= 0:
@@ -267,6 +272,8 @@ class EpisodeScheduler:
             key: value for key, value in vars(args).items() if not key.startswith("_")
         }
         self.workers = workers
+        # 允许其他回放类型复用调度策略，默认保留 TCP 回放行为。
+        self.worker = worker or _worker_prepare
         self.batch = batch
         if batch:
             self.values.update(_batch_compact=True, _batch_current=current)
@@ -355,7 +362,7 @@ class EpisodeScheduler:
             try:
                 with _spawn_environment():
                     future = self.executor.submit(
-                        _worker_prepare, self.values, episode, refresh
+                        self.worker, self.values, episode, refresh
                     )
                 self.running[future] = episode
             except Exception as exc:
