@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Grade a dataset's episodes by how well one embodiment can retarget them."""
+"""根据目标机器人筛选数据集，并显示筛选和报告写入进度。"""
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from handumi.config import DEFAULT_RIG_CONFIG
@@ -15,6 +16,7 @@ from handumi.dataset.screening import (
     screening_report_path,
     write_screening_report,
 )
+from handumi.dataset.screening_progress import ScreenProgress
 from handumi.dataset.selection import resolve_dataset_selection
 from handumi.robots.registry import EMBODIMENT_NAMES
 
@@ -63,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Defaults to DATASET/meta/handumi_screening_<robot>.json.",
+    )
+    parser.add_argument(
+        "--progress", choices=("auto", "on", "off"), default="auto",
+        help="Show screening progress in a terminal or as periodic text.",
     )
     parser.add_argument(
         "--markdown",
@@ -148,30 +154,42 @@ def main() -> None:
         max_rotation_error_deg=args.max_rotation_error_deg if args.max_rotation_error_deg is not None else (5.0 if args.retarget_mode == "absolute-tcp" else 45.0),
         max_base_rotation_deg=args.max_base_rotation_deg,
     )
-    payload = screen_dataset(
-        selection.root,
-        robot=args.robot,
-        repo_id=selection.repo_id,
-        revision=args.revision,
-        episodes=episodes,
-        deployment_profile=args.deployment_profile,
-        rig_config=args.rig_config,
-        jobs=args.jobs,
-        config=config,
-        controller_tcp_calibration=args.controller_tcp_calibration,
-        retarget_mode=args.retarget_mode,
-        base_placement=args.base_placement,
-        cache_dir=args.cache_dir,
-        no_cache=args.no_cache,
-        refresh_cache=args.refresh_cache,
-        robot_tcp_calibration=args.robot_tcp_calibration,
-        deployment_calibration=args.deployment_calibration,
-        deployment_selection=getattr(args, "deployment_selection", None),
-        initial_position_tolerance_m=args.initial_position_tolerance_m,
-    )
-    write_screening_report(report_path, payload)
-    markdown_path = args.markdown or report_path.with_suffix(".md")
-    markdown_path.write_text(render_screening_markdown(payload), encoding="utf-8")
+    with ScreenProgress(mode=args.progress) as display:
+        payload = screen_dataset(
+            selection.root,
+            robot=args.robot,
+            repo_id=selection.repo_id,
+            revision=args.revision,
+            episodes=episodes,
+            deployment_profile=args.deployment_profile,
+            rig_config=args.rig_config,
+            jobs=args.jobs,
+            config=config,
+            controller_tcp_calibration=args.controller_tcp_calibration,
+            retarget_mode=args.retarget_mode,
+            base_placement=args.base_placement,
+            cache_dir=args.cache_dir,
+            no_cache=args.no_cache,
+            refresh_cache=args.refresh_cache,
+            robot_tcp_calibration=args.robot_tcp_calibration,
+            deployment_calibration=args.deployment_calibration,
+            deployment_selection=getattr(args, "deployment_selection", None),
+            initial_position_tolerance_m=args.initial_position_tolerance_m,
+            progress=args.progress,
+            _progress_display=display,
+        )
+        display.phase("保存报告")
+        writing_started = time.monotonic()
+        write_screening_report(report_path, payload)
+        markdown_path = args.markdown or report_path.with_suffix(".md")
+        markdown_path.write_text(render_screening_markdown(payload), encoding="utf-8")
+        if "performance" in payload:
+            # 先写轨迹和报告，再补记写入耗时；第二次只更新小型 JSON。
+            performance = payload["performance"]
+            performance["report_writing_seconds"] = time.monotonic() - writing_started
+            performance["total_seconds"] += performance["report_writing_seconds"]
+            write_screening_report(report_path, {k: v for k, v in payload.items() if k != "_solves"})
+        display.phase("报告已保存")
 
     summary = payload["summary"]
     print(

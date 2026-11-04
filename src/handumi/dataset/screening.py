@@ -17,6 +17,7 @@ import contextlib
 import hashlib
 import io
 import json
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,7 +29,7 @@ import numpy as np
 import pyroki as pk
 
 from handumi.dataset.analysis import dataset_payload_manifest
-from handumi.dataset.parallel import describe_jobs, map_episodes, resolve_jobs
+from handumi.dataset.parallel import map_episodes, resolve_jobs
 from handumi.dataset.paths import portable_path, repo_path
 from handumi.dataset.quality import EpisodeQualityReport, QualityFinding
 
@@ -381,13 +382,14 @@ def _mesh_separation(mesh_a, transform_a, mesh_b, transform_b, *, stride: int = 
     """
     import trimesh
 
-    a = mesh_a.copy()
-    a.apply_transform(transform_a)
-    b = mesh_b.copy()
-    b.apply_transform(transform_b)
+    # 两个查询均在目标网格局部坐标进行，使静态网格的索引得以复用。
+    a_from_b = np.linalg.inv(transform_a) @ transform_b
+    b_from_a = np.linalg.inv(transform_b) @ transform_a
+    vertices_b = trimesh.transform_points(mesh_b.vertices[::stride], a_from_b)
+    vertices_a = trimesh.transform_points(mesh_a.vertices[::stride], b_from_a)
     deepest = max(
-        float(trimesh.proximity.signed_distance(a, b.vertices[::stride]).max()),
-        float(trimesh.proximity.signed_distance(b, a.vertices[::stride]).max()),
+        float(trimesh.proximity.signed_distance(mesh_a, vertices_b).max()),
+        float(trimesh.proximity.signed_distance(mesh_b, vertices_a).max()),
     )
     return -deepest
 
@@ -439,6 +441,15 @@ def _collision_metrics(
     confirmed_frames: set[int] = set()
     mesh_min = float("inf")
     unverifiable = 0
+    frame_transforms = {}
+
+    def transforms_for(frame):
+        """同一帧的 FK 变换在所有待验证连杆对间复用。"""
+        index = int(frame)
+        if index not in frame_transforms:
+            frame_transforms[index] = _link_transforms(runtime, qpos[index])
+        return frame_transforms[index]
+
     for pair in np.flatnonzero((self_distances < 0.0).any(axis=0)):
         a, b = link_names[idx_i[pair]], link_names[idx_j[pair]]
         candidates = np.flatnonzero(self_distances[:, pair] < 0.0)
@@ -453,7 +464,7 @@ def _collision_metrics(
         probe = ordered[:narrow_phase_frames]
         separations = {}
         for frame in probe:
-            transforms = _link_transforms(runtime, qpos[frame])
+            transforms = transforms_for(frame)
             separations[int(frame)] = _mesh_separation(
                 meshes[a], transforms[a], meshes[b], transforms[b], stride=vertex_stride
             )
@@ -467,7 +478,7 @@ def _collision_metrics(
                 if separations[int(frame)] <= 0.0:
                     confirmed_frames.add(int(frame))
                 continue
-            transforms = _link_transforms(runtime, qpos[frame])
+            transforms = transforms_for(frame)
             if (
                 _mesh_separation(
                     meshes[a],
@@ -522,6 +533,7 @@ def _build_screen_state(
     """
     from handumi.calibration.deployment import resolve_deployment_calibration
     from handumi.robots.registry import build_pruned_collision_model, load_embodiment
+    from handumi.scripts.replay.replay_prepare import EpisodePreparationContext
 
     runtime = load_embodiment(robot)
     deployment = deployment_selection or resolve_deployment_calibration(
@@ -562,6 +574,7 @@ def _build_screen_state(
     )
     return {
         "runtime": runtime,
+        "preparation_context": EpisodePreparationContext(),
         "coll": coll,
         "plane": plane,
         "world_fn": world_fn,
@@ -672,24 +685,61 @@ def arm_activity_metrics(rollout: dict[str, Any], runtime) -> dict[str, float | 
     return out
 
 
-def _screen_one_episode(episode: int, state: dict[str, Any]) -> dict[str, Any]:
-    """Solve and grade one episode. Runs in the calling process or in a worker.
+def _screen_warnings(output: str) -> list[str]:
+    """提取须告知用户的回放警告，并限制单段日志内存。"""
+    prefixes = ("[replay] warning:", "[replay] cache write skipped:",
+                "[replay] cache revalidation skipped:",
+                "[replay] source or calibration changed during solve")
+    return [line[:4096] for line in output.splitlines() if line.startswith(prefixes)][:10]
 
-    Returns plain arrays and floats: a compiled JAX function cannot cross a
-    process boundary, and nothing here needs to.
+
+def _screen_one_episode(episode: int, state: dict[str, Any]) -> dict[str, Any]:
+    """记录单段真实阶段耗时，并在可用时向主进程发送进度。"""
+    from handumi.scripts.replay.replay_progress import WorkerProgress
+
+    class EventAdapter:
+        """把限频后的工作进程事件交给调度层的非阻塞回调。"""
+
+        def put_nowait(self, event):
+            """转发事件；队列已满时由调度层丢弃。"""
+            details = {key: value for key, value in event.items() if key not in {"stage", "episode"}}
+            state["_progress"](event["stage"], **details)
+
+    events = EventAdapter() if state.get("_progress") is not None else None
+    timing = WorkerProgress(episode, events)
+    local_state = {**state, "_worker_progress": timing}
+    try:
+        result = _screen_one_episode_body(episode, local_state)
+    except BaseException:
+        timing.finish()
+        raise
+    result["performance"] = timing.finish()
+    return result
+
+
+def _screen_one_episode_body(episode: int, state: dict[str, Any]) -> dict[str, Any]:
+    """在主进程或工作进程中求解并评分单段数据。
+
+    返回可跨进程传递的普通数组和数值指标，不传递编译后的 JAX 函数。
     """
     from handumi.scripts.replay.replay_prepare import prepare_episode
 
     args = _replay_args(episode=episode, **state["args_template"])
+    args._replay_progress = state.get("_worker_progress")
     captured = io.StringIO()
     try:
         with contextlib.redirect_stdout(captured):
-            rollout = prepare_episode(args)
+            preparation_context = state.get("preparation_context")
+            if preparation_context is None:
+                rollout = prepare_episode(args)
+            else:
+                rollout = prepare_episode(args, preparation_context=preparation_context)
     except SystemExit as exc:
         # The solver could not reach the demonstrated start pose at all.
         return {
             "episode_index": episode,
             "unreachable": str(exc),
+            "warnings": _screen_warnings(captured.getvalue()),
             "frame_count": 0,
             "metrics": {},
             "solves": {},
@@ -731,6 +781,8 @@ def _screen_one_episode(episode: int, state: dict[str, Any]) -> dict[str, Any]:
         "joint_limit_frames_pct": joint_limit_frames_pct(qpos, state["runtime"]),
     }
     metrics.update(arm_activity_metrics(rollout, state["runtime"]))
+    if state.get("_worker_progress") is not None:
+        state["_worker_progress"]("碰撞评分")
     metrics.update(
         _collision_metrics(
             qpos,
@@ -746,6 +798,7 @@ def _screen_one_episode(episode: int, state: dict[str, Any]) -> dict[str, Any]:
     return {
         "episode_index": episode,
         "unreachable": None,
+        "warnings": _screen_warnings(captured.getvalue()),
         "frame_count": int(len(qpos)),
         "metrics": metrics,
         "solves": solves,
@@ -771,7 +824,7 @@ def screen_dataset(
     deployment_profile: str = "auto",
     rig_config: Path | None = None,
     config: RetargetScreeningConfig | None = None,
-    progress: bool = True,
+    progress: bool | str = True,
     jobs: int | None = 1,
     controller_tcp_calibration: Path | None = None,
     retarget_mode: str = "auto",
@@ -783,6 +836,52 @@ def screen_dataset(
     cache_dir: Path | None = None,
     no_cache: bool = False,
     refresh_cache: bool = False,
+    _progress_display=None,
+) -> dict[str, Any]:
+    """构建进度显示上下文并执行逐段筛选。"""
+    from handumi.dataset.screening_progress import ScreenProgress
+
+    mode = progress if isinstance(progress, str) else ("auto" if progress else "off")
+    if mode not in {"auto", "on", "off"}:
+        raise ValueError(f"Invalid screening progress mode: {mode}")
+    context = (contextlib.nullcontext(_progress_display) if _progress_display is not None
+               else ScreenProgress(mode=mode))
+    with context as display:
+        return _screen_dataset_impl(
+            root, robot=robot, repo_id=repo_id, revision=revision, episodes=episodes,
+            deployment_profile=deployment_profile, rig_config=rig_config, config=config,
+            progress=progress, jobs=jobs, controller_tcp_calibration=controller_tcp_calibration,
+            retarget_mode=retarget_mode, base_placement=base_placement,
+            robot_tcp_calibration=robot_tcp_calibration, deployment_calibration=deployment_calibration,
+            deployment_selection=deployment_selection,
+            initial_position_tolerance_m=initial_position_tolerance_m, cache_dir=cache_dir,
+            no_cache=no_cache, refresh_cache=refresh_cache, _progress_display=display,
+        )
+
+
+def _screen_dataset_impl(
+    root: str | Path,
+    *,
+    robot: str,
+    repo_id: str | None = None,
+    revision: str = "main",
+    episodes: list[int] | tuple[int, ...] | None = None,
+    deployment_profile: str = "auto",
+    rig_config: Path | None = None,
+    config: RetargetScreeningConfig | None = None,
+    progress: bool | str = True,
+    jobs: int | None = 1,
+    controller_tcp_calibration: Path | None = None,
+    retarget_mode: str = "auto",
+    base_placement: str = "auto",
+    robot_tcp_calibration: Path | None = None,
+    deployment_calibration: Path | None = None,
+    deployment_selection: Any = None,
+    initial_position_tolerance_m: float | None = None,
+    cache_dir: Path | None = None,
+    no_cache: bool = False,
+    refresh_cache: bool = False,
+    _progress_display=None,
 ) -> dict[str, Any]:
     """逐段求解和评分，必要时保存数据集专用的仿真布局，保留原始采集数据。
 
@@ -799,6 +898,12 @@ def screen_dataset(
     from handumi.config import DEFAULT_RIG_CONFIG
     from handumi.scripts.replay.replay_deployment import estimate_dataset_deployment
 
+    mode = progress if isinstance(progress, str) else ("auto" if progress else "off")
+    if mode not in {"auto", "on", "off"}:
+        raise ValueError(f"Invalid screening progress mode: {mode}")
+    display = _progress_display
+    started = time.monotonic()
+    display.phase("初始化")
     dataset_root = Path(root).resolve()
     info_path = dataset_root / "meta" / "info.json"
     if not info_path.is_file():
@@ -811,6 +916,7 @@ def screen_dataset(
     selected = (
         list(range(total_episodes)) if episodes is None else [int(e) for e in episodes]
     )
+    display.set_total(len(selected))
     out_of_range = [e for e in selected if e < 0 or e >= total_episodes]
     if out_of_range:
         raise ValueError(f"Episode indices out of range: {sorted(out_of_range)}")
@@ -843,6 +949,10 @@ def screen_dataset(
             retarget_mode=retarget_mode, base_placement=base_placement,
             robot_tcp_calibration=robot_tcp_calibration,
         )
+        display.phase("仿真布局估计")
+        args._deployment_progress = lambda current, total: display.phase(
+            "仿真布局估计", current=current, total=total
+        )
         return estimate_dataset_deployment(args)
 
     deployment = deployment_selection or resolve_deployment_calibration(
@@ -866,29 +976,10 @@ def screen_dataset(
         )
         robot_tcp_calibration = robot_tcp.path
     workers = resolve_jobs(jobs, len(selected))
-    if progress:
-        print(f"[screen] resolved mode={retarget_mode} placement={base_placement} "
-              f"calibration={deployment.path or deployment.source} "
-              f"max_position={cfg.max_position_error_m:g}m "
-              f"max_rotation={cfg.max_rotation_error_deg:g}deg")
-        print(f"[screen] {describe_jobs(workers, len(selected))}")
-
-    def _report(episode: int, item: dict[str, Any]) -> None:
-        if not progress:
-            return
-        if item["unreachable"] is not None:
-            print(f"  ep {episode:3d}  IK REJECTED: {item['unreachable']}")
-            return
-        metrics = item["metrics"]
-        print(
-            f"  ep {episode:3d}  pos {metrics['position_error_mean_m'] * 100:5.2f}"
-            f"/{metrics['position_error_p99_m'] * 100:5.2f}"
-            f"/{metrics['position_error_max_m'] * 100:5.2f}cm  "
-            f"rot {metrics['rotation_error_mean_deg']:5.1f}"
-            f"/{metrics['rotation_error_max_deg']:5.1f}deg  "
-            f"self {metrics['self_collision_min_clearance_m'] * 100:5.2f}cm"
-            f"({metrics['self_collision_frames']})"
-        )
+    display.phase("初始化工作进程")
+    preparation_seconds = time.monotonic() - started
+    solve_started = time.monotonic()
+    display.phase("逐段筛选")
 
     solved = map_episodes(
         selected,
@@ -916,8 +1007,13 @@ def screen_dataset(
         },
         task=_screen_one_episode,
         jobs=workers,
-        on_result=_report,
+        on_result=display.on_result,
+        on_progress=display.on_progress if mode != "off" else None,
+        on_tick=display.tick if mode != "off" else None,
     )
+    solve_seconds = time.monotonic() - solve_started
+    display.phase("汇总评分")
+    grade_started = time.monotonic()
 
     raw: list[dict[str, Any]] = []
     solves: dict[str, np.ndarray] = {}
@@ -1001,8 +1097,26 @@ def screen_dataset(
         for report in reports
         if report.accepted and report.findings
     )
+    manifest = dataset_payload_manifest(dataset_root)
+    fingerprint_value = robot_fingerprint(
+        robot, deployment_path=deployment_path,
+        robot_tcp_path=robot_tcp.path if robot_tcp is not None else None,
+    )
+    worker_stages: dict[str, float] = {}
+    for item in solved:
+        for stage, seconds in item.get("performance", {}).get("stage_seconds", {}).items():
+            worker_stages[stage] = worker_stages.get(stage, 0.0) + seconds
+    performance = {
+        "total_seconds": time.monotonic() - started,
+        "phase_seconds": {"preparation": preparation_seconds, "episodes": solve_seconds,
+                          "grading": time.monotonic() - grade_started},
+        "worker_stage_seconds": worker_stages,
+        "workers": workers,
+        "cache_hits": sum(bool(item.get("performance", {}).get("cache_hit")) for item in solved),
+    }
     return {
         "schema_version": SCREENING_SCHEMA_VERSION,
+        "performance": performance,
         "kind": SCREENING_KIND,
         "generated_at": datetime.now(UTC).isoformat(),
         "dataset": resolved_repo_id,
@@ -1012,7 +1126,7 @@ def screen_dataset(
         "base_placement_policy": base_placement,
         "config": asdict(cfg),
         "rotation_fences_deg": fences,
-        "payload_manifest": dataset_payload_manifest(dataset_root),
+        "payload_manifest": manifest,
         "deployment_calibration_path": portable_path(deployment_path) if deployment_path is not None else None,
         "deployment_calibration": {
             "source": deployment.source, "pose7": deployment.pose7.tolist(),
@@ -1030,10 +1144,7 @@ def screen_dataset(
         "solve_cache": portable_path(solve_cache_path(dataset_root, robot))
         if solves
         else None,
-        "robot_fingerprint": robot_fingerprint(
-            robot, deployment_path=deployment_path,
-            robot_tcp_path=robot_tcp.path if robot_tcp is not None else None,
-        ),
+        "robot_fingerprint": fingerprint_value,
         "summary": {
             "total": len(reports),
             "accepted": accepted,

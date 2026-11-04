@@ -103,7 +103,10 @@ def estimate_dataset_deployment(args):
     )
     trajectories = {side: [] for side in home_poses}  # 每段等量抽样，避免长片段独占估计。
     count = int(info.get("total_episodes", 0))
+    progress = getattr(args, "_deployment_progress", None)
     for episode in range(count):
+        if progress is not None:
+            progress(episode, count)
         trial = argparse.Namespace(**vars(args))
         trial.episode = episode
         states, _, _, _ = replay.load_episode_states(trial)
@@ -114,6 +117,8 @@ def estimate_dataset_deployment(args):
         for side in home_poses:
             start = 0 if side == "left" else 7
             trajectories[side].append(states[:, start:start + 7])
+    if progress is not None:
+        progress(count, count)
     pose = fit_simulation_placement(
         {side: np.concatenate(parts) if parts else np.empty((0, 7))
          for side, parts in trajectories.items()}, home_poses,

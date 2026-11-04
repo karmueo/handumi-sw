@@ -12,7 +12,7 @@ from scipy.spatial.transform import Rotation
 from handumi.robots.utils import pose7_to_mat
 
 # 确定性的有界数值搜索；版本进入求解缓存签名。
-ALGORITHM_VERSION = "episode-xy-v4"
+ALGORITHM_VERSION = "episode-xy-v5"
 START_SEEDS = 9
 SLSQP_MAX_ITERATIONS = 200
 MAX_ORACLE_CALLS = 112

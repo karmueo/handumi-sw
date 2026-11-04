@@ -224,7 +224,7 @@ def episode_identity(
         except importlib.metadata.PackageNotFoundError:
             dependencies[name] = None
     collision_meshes = None
-    if args.robot == "rm75b" and config.ik_weights.collision_enabled:
+    if config.ik_weights.collision_enabled:
         import yourdfpy
 
         from handumi.robots.registry import yourdfpy_handler
@@ -237,7 +237,9 @@ def episode_identity(
             if collision.geometry is not None and collision.geometry.mesh is not None
         })
         collision_meshes = {name: digest_file(resolver(name)) for name in names}
-        if not collision_meshes or any(value is None for value in collision_meshes.values()):
+        if args.robot == "rm75b" and (not collision_meshes or any(
+            value is None for value in collision_meshes.values()
+        )):
             raise SystemExit("RM75B collision mesh missing; cannot validate replay cache.")
     settings = {name: getattr(args, name, None) for name in _SETTING_KEYS}
     if args.robot == "rm75b" and config.ik_weights.collision_enabled:
@@ -470,8 +472,49 @@ def load_prepared_episode(args: argparse.Namespace) -> dict[str, np.ndarray] | N
     return _finish_rollout(args, cached, cached=True)
 
 
+class EpisodePreparationContext:
+    """在单个进程内按几何身份复用模型和连续碰撞检查器。
+
+    不保存 episode 的目标、关节或标定状态；配置、URDF、网格或碰撞模式
+    改变时丢弃旧对象，避免将旧的碰撞证明用于新模型。
+    """
+
+    def __init__(self):
+        """初始化空的单模型缓存。"""
+        self._key = None
+        self._runtime = None
+        self._checker = None
+
+    def resources(self, args, identity):
+        """按内容身份取得模型及对应检查器，必要时重新构建。"""
+        from handumi.robots.registry import load_embodiment
+        from handumi.robots.self_collision import (
+            CollisionChecker,
+            GripperBoxCollisionChecker,
+        )
+
+        is_box = args.robot == "rm75b" and identity.get("mode", args.retarget_mode) == "absolute-tcp"
+        key = fingerprint({
+            "robot": args.robot, "config": identity.get("robot_config_sha256"),
+            "urdf": identity.get("urdf_sha256"),
+            "meshes": identity.get("collision_meshes"), "box": is_box,
+            "code": identity.get("code"), "settings": identity.get("settings"),
+        })
+        if key != self._key:
+            runtime = load_embodiment(args.robot, collision_kind="gripper-box") if is_box else load_embodiment(args.robot)
+            checker = None
+            if args.robot == "rm75b" and runtime.config.ik_weights.collision_enabled:
+                solver = runtime.solver_cls()
+                checker_type = GripperBoxCollisionChecker if is_box else CollisionChecker
+                checker = checker_type(runtime.robot, solver.robot_collision, runtime.load_urdf(),
+                                       runtime.config.ik_weights.self_collision_margin)
+            self._key, self._runtime, self._checker = key, runtime, checker
+        return self._runtime, self._checker
+
+
 def prepare_episode(
-    args: argparse.Namespace, *, runtime_provider=None
+    args: argparse.Namespace, *, runtime_provider=None,
+    preparation_context: EpisodePreparationContext | None = None,
 ) -> dict[str, np.ndarray]:
     """载入或求解单段；非严格结果也可共享，严格调用始终重新检查。"""
     from handumi.scripts.replay import replay_in_sim as replay
@@ -479,6 +522,24 @@ def prepare_episode(
     report(args, "读取数据与缓存查找")
     replay.resolve_replay_options(args)
     _require_dataset_placement(args)
+    if getattr(args, "no_cache", False) and preparation_context is not None:
+        loaded = replay.load_episode_states(args)
+        key, identity = episode_identity(args, loaded)
+        runtime, checker = preparation_context.resources(args, identity)
+        run_args = argparse.Namespace(**vars(args))
+        run_args._episode_loaded = loaded
+        run_args._episode_runtime = runtime
+        run_args._episode_collision_checker = checker
+        if getattr(args, "base_placement", None) == "dataset-xy-yaw":
+            observer = getattr(args, "_placement_score", None)
+            if observer is not None:
+                observer.configure_frames(len(loaded[0]))
+                observer.identity_key = key
+            run_args.strict_ik = False
+            rollout = replay.solve_episode(run_args)
+            run_args.strict_ik = args.strict_ik
+            return _finish_rollout(run_args, rollout, runtime=runtime, checker=checker)
+        return replay.solve_episode(run_args)
     if getattr(args, "no_cache", False):
         if getattr(args, "base_placement", None) == "dataset-xy-yaw":
             run_args = argparse.Namespace(**vars(args))
@@ -526,8 +587,10 @@ def prepare_episode(
     was_hit = (cached is not None and _valid_rollout(cached)
                and _valid_collision_summary(args, cached))
     finish_runtime = finish_checker = None
+    if preparation_context is not None:
+        finish_runtime, finish_checker = preparation_context.resources(args, identity)
     if was_hit:
-        if runtime_provider is not None:
+        if runtime_provider is not None and preparation_context is None:
             finish_runtime = runtime_provider(args, identity)
         report(args, "cache_hit")
         print(f"[replay] cache hit episode={args.episode} key={key[:12]}")
@@ -536,7 +599,10 @@ def prepare_episode(
         print(f"[replay] cache miss episode={args.episode} key={key[:12]}")
         run_args = argparse.Namespace(**vars(args))
         run_args._episode_loaded = loaded
-        if runtime_provider is not None:
+        if preparation_context is not None:
+            run_args._episode_runtime = finish_runtime
+            run_args._episode_collision_checker = finish_checker
+        if runtime_provider is not None and preparation_context is None:
             report(args, "模型初始化")
             run_args._episode_runtime = runtime_provider(args, identity)
         run_args.strict_ik = False

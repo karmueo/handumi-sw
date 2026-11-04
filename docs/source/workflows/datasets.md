@@ -213,6 +213,21 @@ JAX_PLATFORMS=cpu handumi dataset screen \
   --robot piper
 ```
 
+Screening shows the completed episode count, solver failures, cache hits,
+elapsed time, and the current stage of each worker. For an `episode-xy`
+placement search, the display also reports the active candidate and frame.
+The remaining time is an estimate based on completed episodes. Solver failures
+are distinct from the final rejection count, which is calculated after all
+episodes have been graded.
+
+Progress defaults to `--progress auto`: an interactive terminal shows a
+progress bar, while redirected output receives periodic plain-text updates.
+Use `--progress off` to suppress progress, or `--progress on` to request it
+explicitly. Warnings and the final summary remain visible in all modes. Set
+`--jobs 1` to process episodes sequentially or specify a larger worker count;
+the report retains the original episode order. The report's `performance`
+object records elapsed and stage timings, worker count, and cache hits.
+
 Every episode runs through the same solver `handumi convert` uses, so the
 numbers are the ones that would be written, not an approximation. Per episode
 the report records TCP position and orientation error, the start-pose residual,

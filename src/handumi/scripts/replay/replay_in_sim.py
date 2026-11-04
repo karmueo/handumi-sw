@@ -947,6 +947,7 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
         base[:2] = candidate.xy
         trial = argparse.Namespace(**vars(attempt))
         trial._placement_candidate = candidate_count
+        trial._placement_require_fidelity = True
         trial._placement_override = replace(
             calibration, pose7=pose_inv(base), path=None, scope="simulation",
             source="episode_xy_search", verified=False, profile="episode-xy",
@@ -1611,7 +1612,7 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
                 right_pose=(retry_right[:3], retry_right[3:7]),
                 assess=assess_candidate, frame=int(frame_index),
                 check_motion=selected_index > 0,
-                strict_fidelity=args.strict_ik,
+                strict_fidelity=args.strict_ik or getattr(args, "_placement_require_fidelity", False),
                 candidate_transform=(
                     preserve_gripper_opening if gripper_openings is not None else None
                 ),
@@ -1654,6 +1655,21 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
                         )
         if robot_tcp is not None:
             _require_finite_frame(frame_index, "output joint", q)
+        if (getattr(args, "_placement_require_fidelity", False)
+                and collision_checker is None and robot_tcp is not None):
+            # 无碰撞重试器的机器人仍在该帧完整求解后拒绝精度失败候选。
+            frame_errors = pose_error_arrays(
+                left_pose7[None], right_pose7[None],
+                fk_left_pose7[None], fk_right_pose7[None],
+            )
+            for side in runtime.arms:
+                pos = float(frame_errors[f"{side}_pos_error_m"][0])
+                rot = float(frame_errors[f"{side}_rot_error_deg"][0])
+                if pos > args.max_ik_position_error_m or rot > args.max_ik_rotation_error_deg:
+                    raise SystemExit(
+                        f"IK fidelity threshold exceeded: frame {int(frame_index)}: "
+                        f"position={pos * 1000:.2f}mm rotation={rot:.2f}deg"
+                    )
         placement_score = getattr(args, "_placement_score", None)
         if placement_score is not None:
             frame_errors = pose_error_arrays(

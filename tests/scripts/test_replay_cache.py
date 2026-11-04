@@ -958,3 +958,64 @@ def test_search_scratch_stores_only_fully_validated_rollout(tmp_path, monkeypatc
     failed_key = scratch_key(1, context["input_identity"], selection.pose7)
     assert not result["passed"]
     assert EpisodeSolveCache(tmp_path / "isolated-scratch").load(failed_key) == (None, None)
+
+
+def test_context_cache_hit_checks_every_segment(tmp_path, monkeypatch):
+    """复用上下文命中缓存后仍重新检查首帧和全部运动段。"""
+    args, _, _ = _args_and_loaded(tmp_path, monkeypatch, collision_enabled=True)
+    args.approach_seconds = 0
+    args.strict_ik = False
+    key = "a" * 64
+    monkeypatch.setattr(prepare, "episode_identity", lambda *a: (key, {}))
+    monkeypatch.setattr(prepare, "_valid_collision_summary", lambda *a: True)
+    monkeypatch.setattr(prepare, "_strict_gate", lambda *a, **k: None)
+    prepare.EpisodeSolveCache(prepare.cache_directory(args)).store(key, _rollout())
+    calls = []
+
+    class Checker:
+        """记录最终验收所检查的姿态与运动段。"""
+        def check_pose(self, q):
+            """验证首帧姿态。"""
+            calls.append("pose")
+            return SimpleNamespace(safe=True)
+        def check_segment(self, a, b):
+            """验证相邻帧完整运动。"""
+            calls.append("segment")
+            return SimpleNamespace(safe=True)
+
+    checker = Checker()
+    context = SimpleNamespace(resources=lambda *a: (object(), checker))
+    monkeypatch.setattr(replay, "solve_episode", lambda *a: pytest.fail("缓存命中不能重新求解"))
+    prepare.prepare_episode(args, preparation_context=context)
+    assert calls == ["pose", "segment"]
+
+
+def test_no_cache_dataset_placement_context_still_finishes(tmp_path, monkeypatch):
+    """禁用缓存的共享布局仍配置 observer 并执行严格终验。"""
+    from handumi.calibration.deployment import DeploymentCalibration
+
+    args, _, _ = _args_and_loaded(tmp_path, monkeypatch)
+    args.no_cache = True
+    args.strict_ik = True
+    args.base_placement = "dataset-xy-yaw"
+    args.deployment_selection = DeploymentCalibration(
+        "rm75b", np.array([0, 0, 0, 0, 0, 0, 1]), None,
+        "simulation", "test", False, "dataset-xy-yaw", None)
+    seen = []
+    observer = SimpleNamespace(configure_frames=lambda count: seen.append(("frames", count)))
+    args._placement_score = observer
+    monkeypatch.setattr(prepare, "episode_identity", lambda *a: ("key", {}))
+    context = SimpleNamespace(resources=lambda *a: ("runtime", "checker"))
+    def solve(run_args):
+        """记录预求解以非严格模式进行。"""
+        seen.append(("solve", run_args.strict_ik))
+        return _rollout()
+    def finish(run_args, rollout, **kwargs):
+        """验证恢复严格模式并显式传递同一检查器。"""
+        seen.append(("finish", run_args.strict_ik, kwargs["checker"]))
+        return rollout
+    monkeypatch.setattr(replay, "solve_episode", solve)
+    monkeypatch.setattr(prepare, "_finish_rollout", finish)
+    prepare.prepare_episode(args, preparation_context=context)
+    assert seen == [("frames", 2), ("solve", False), ("finish", True, "checker")]
+    assert observer.identity_key == "key"

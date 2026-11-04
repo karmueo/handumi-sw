@@ -1198,3 +1198,95 @@ def test_tcp_conversion_gate_rejects_different_screening_signature(tmp_path):
         ).status
         == "clear"
     )
+
+
+def test_episode_candidate_fidelity_failure_stops_after_retries(monkeypatch, tmp_path):
+    """候选帧重试全部失败后停止，下一原始帧不进入求解。"""
+    from dataclasses import replace
+
+    from handumi.robots.self_collision import CollisionResult
+
+    args, states, _, _ = _fixture_replay(monkeypatch, tmp_path, later_miss=True)
+    runtime = replay.load_embodiment("rm75b")
+    original_solver = runtime.solver_cls
+    runtime.config.ik_weights = replace(runtime.config.ik_weights, self_collision_weight=1.0)
+    runtime.robot = SimpleNamespace(joints=SimpleNamespace(
+        lower_limits=np.full(7, -100.0), upper_limits=np.full(7, 100.0)))
+    weights = []
+
+    class Solver(original_solver):
+        """记录逐帧求解器的全部碰撞代价重试。"""
+        def __init__(self, config=None, locked_joint_indices=()):
+            """保存测试配置以支持真实重试中的权重替换。"""
+            super().__init__(config, locked_joint_indices)
+            self.config = config
+            self.robot_collision = object()
+
+        def ik(self, q, *, left_pose, right_pose):
+            """记录重试权重，沿用测试中不跟随目标的关节策略。"""
+            if self.limited and self.config.self_collision_weight:
+                weights.append(self.config.self_collision_weight)
+            return super().ik(q, left_pose=left_pose, right_pose=right_pose)
+
+    runtime.solver_cls = Solver
+    class Checker:
+        """所有姿态与运动均安全，迫使失败原因来自精度。"""
+        model = object()
+        def check_pose(self, q):
+            """接受姿态。"""
+            return CollisionResult(True, 1.0, ("a", "b"), "clear")
+        def check_segment(self, a, b):
+            """接受完整关节运动。"""
+            return self.check_pose(a)
+
+    extended = np.vstack([states, states[-1]])
+    extended[2, 7] += 0.02
+    info = {"handumi": {"recording_device": "vive", "active_sides": ["right"],
+                        "tracking_workspace": "table"}}
+    monkeypatch.setattr(replay, "load_episode_states", lambda args: (extended, 30.0, info, None))
+    frames = []
+    args._replay_progress = lambda stage, **details: frames.append(details["current"]) if stage == "逐帧求解" else None
+    args._episode_runtime = runtime
+    args._episode_collision_checker = Checker()
+    args._placement_require_fidelity = True
+    args.strict_ik = False
+    with pytest.raises(SystemExit, match="IK fidelity threshold exceeded: frame 1"):
+        replay._solve_episode_fixed(args)
+    assert weights == [100.0, 300.0, 1000.0]
+    assert frames == [0, 1]
+
+
+def test_failed_candidate_still_tries_home_seed(monkeypatch, tmp_path):
+    """候选关节分支失败后，搜索仍以 HOME 分支验证同一摆放。"""
+    args, _, _, _ = _fixture_replay(monkeypatch, tmp_path)
+    args.base_placement = "episode-xy"
+    args.deployment_selection = None
+    candidate = PlacementCandidate(np.array([0.1, 0.0]), np.zeros(7))
+    calibration = DeploymentCalibration(
+        "rm75b", IDENTITY_POSE7.copy(), None, "simulation", "test", False, "sim", None)
+    seeds = []
+
+    def fixed(attempt):
+        """首调返回搜索上下文，候选分支失败后记录 HOME 回退。"""
+        if getattr(attempt, "_placement_context_only", False):
+            attempt._placement_context.update(runtime=None, tool=None, targets={},
+                                              deployment=calibration, locked=())
+            raise replay._PlacementContextReady
+        assert attempt._placement_require_fidelity
+        seed = attempt._initial_q_seed
+        seeds.append(seed)
+        raise SystemExit("IK fidelity threshold exceeded: frame 2")
+
+    def search(items, evaluate, *, first_feasible):
+        """每轮只尝试同一候选，模拟快速种子与完整种子两轮。"""
+        assert evaluate(items[0]) is None
+        raise ValueError("no candidate")
+
+    monkeypatch.setattr(replay, "_solve_episode_fixed", fixed)
+    monkeypatch.setattr(replay, "first_frame_candidates", lambda *a, **kw: [candidate])
+    monkeypatch.setattr(replay, "search_feasible_placement", search)
+    with pytest.raises(replay.PlacementSearchError, match="frame 2"):
+        replay.solve_episode(args)
+    assert len(seeds) == 4
+    assert seeds[0] is not None and seeds[1] is None
+    assert seeds[2] is not None and seeds[3] is None
