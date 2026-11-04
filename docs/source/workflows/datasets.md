@@ -262,18 +262,18 @@ directly.
 
 Episodes are independent -- the IK warm-starts each frame from the previous one
 within an episode, never across them -- so `--jobs N` solves several at once.
-`handumi convert` takes the same flag and pre-solves whatever the screening
-cache does not already hold. Measured on a 201-episode dataset, screening went
+`handumi convert` defaults to up to 8 worker processes for episodes without a
+matching screening or complete replay cache. The worker count is limited by
+the number of uncached episodes and available CPUs; pass `--jobs 1` to solve
+sequentially or `--jobs N` to set another maximum. Dataset writing remains
+sequential. Measured on a 201-episode dataset, screening went
 from 5.7 to 1.5 seconds per episode, saturating around six workers because the
 solver already uses about three cores inside one episode.
 
-What `--jobs` does not promise is bit-identical arithmetic. Running a solve in
-another process reorders float32 reductions, so metrics move in their last
-significant digits exactly as they do between two sequential runs. Every status
-and finding was identical across job counts on the measured dataset, and the
-conversion path does not depend on reproducing a solve at all: it reuses the
-cached trajectory screening graded, which is the artifact rather than a recipe
-for one.
+Separate solves are not guaranteed to produce bit-identical trajectories:
+process settings can change floating-point operations and the optimizer's path.
+Conversion reuses the trajectory screening graded when a matching cache is
+available, and applies the same strict IK checks to newly solved trajectories.
 
 ### One command for the whole review
 

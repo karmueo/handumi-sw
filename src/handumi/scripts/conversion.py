@@ -104,6 +104,17 @@ class ConversionTcpCalibrationSelection:
 # ---------------------------------------------------------------------------
 
 
+def _positive_jobs(value: str) -> int:
+    """解析正整数进程数，让非法参数在处理数据前报错。"""
+    try:
+        jobs = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--jobs must be a positive integer") from exc
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("--jobs must be at least 1")
+    return jobs
+
+
 def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     def advanced(text: str) -> str:
         return text if show_advanced else argparse.SUPPRESS
@@ -361,11 +372,10 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--jobs",
-        type=int,
-        default=None,
-        help="Processes solving episodes at once. Episodes are independent, so "
-        "this changes wall-clock only. The default leaves room for the threads "
-        "the solver already uses inside one episode; 1 solves them in order.",
+        type=_positive_jobs,
+        default=8,
+        help="Maximum processes solving episodes at once (default: 8); "
+        "limited by available CPUs and uncached episodes. 1 solves in order.",
     )
     parser.add_argument(
         "--no-solve-cache",
@@ -993,24 +1003,25 @@ def _write_gripper_joints(
 # ---------------------------------------------------------------------------
 
 
-def _presolve_worker_state(**_: object) -> dict[str, object]:
-    """Nothing shared to build: solve_episode caches the embodiment per process."""
-    return {}
+def _presolve_worker_state(*, args: argparse.Namespace) -> dict[str, object]:
+    """在每个 spawn 进程中保存可序列化的转换配置。"""
+    return {"args": args}
 
 
-def _presolve_one(episode: int, _state: dict[str, object]) -> dict[str, object]:
+def _presolve_one(episode: int, state: dict[str, object]) -> dict[str, object]:
+    """预求解一段；失败留给主进程按原有流程处理。"""
     import contextlib
     import io
 
     from handumi.scripts.replay.replay_prepare import prepare_episode as _solve
 
-    args = _PRESOLVE_ARGS["args"]
-    replay_args = _replay_args_for_episode(args, episode)
+    args = state["args"]
     captured = io.StringIO()
     try:
+        replay_args = _replay_args_for_episode(args, episode)
         with contextlib.redirect_stdout(captured):
             rollout = _solve(replay_args)
-    except SystemExit as exc:
+    except (Exception, SystemExit) as exc:
         return {"episode": episode, "error": str(exc)}
     return {
         "episode": episode,
@@ -1022,17 +1033,14 @@ def _presolve_one(episode: int, _state: dict[str, object]) -> dict[str, object]:
     }
 
 
-_PRESOLVE_ARGS: dict[str, Any] = {}
-
-
 def _cached_solve_for(
     args: argparse.Namespace, episode: int
 ) -> dict[str, np.ndarray] | None:
-    """The screening solve for this episode, when it is still valid."""
+    """查找配置有效的筛选轨迹或完整回放缓存。"""
     if args.no_solve_cache or getattr(args, "refresh_cache", False):
         return None
     selection = getattr(args, "deployment_selection", None)
-    return load_cached_solve(
+    cached = load_cached_solve(
         args.root,
         robot=args.embodiment,
         episode=episode,
@@ -1041,6 +1049,15 @@ def _cached_solve_for(
             deployment_path=selection.path if selection is not None else None,
         ),
     )
+    if cached is not None:
+        return cached
+    # 完整回放缓存与消费端使用相同校验；出错时留给逐段处理报告。
+    from handumi.scripts.replay.replay_prepare import load_prepared_episode
+
+    try:
+        return load_prepared_episode(_replay_args_for_episode(args, episode))
+    except (Exception, SystemExit):
+        return None
 
 
 def presolve_episodes(
@@ -1064,17 +1081,17 @@ def presolve_episodes(
         for episode in episodes
         if _cached_solve_for(args, episode) is None
     ]
+    workers = resolve_jobs(jobs, len(missing), min_episodes_per_job=1)
     if not missing:
-        return {}
-    workers = resolve_jobs(jobs, len(missing))
-    if workers <= 1:
+        print("[convert] pre-solving: 0 episodes; no worker pool needed")
         return {}
     print(f"[convert] pre-solving {describe_jobs(workers, len(missing))}")
-    _PRESOLVE_ARGS["args"] = args
+    if workers <= 1:
+        return {}
     results = map_episodes(
         missing,
         setup=_presolve_worker_state,
-        setup_kwargs={},
+        setup_kwargs={"args": args},
         task=_presolve_one,
         jobs=workers,
     )

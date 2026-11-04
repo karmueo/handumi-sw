@@ -19,8 +19,8 @@ cannot drift from the parallel one by accident.
 Workers start with *spawn*, never fork. JAX installs threads and accelerator
 state at import, and forking a process that has already imported it deadlocks
 rather than failing, so a fresh interpreter per worker is the only safe option.
-It costs one JIT compilation per worker, which is why small datasets are left
-sequential.
+It costs one JIT compilation per worker, so callers may limit parallelism for
+small datasets.
 """
 
 from __future__ import annotations
@@ -41,15 +41,20 @@ THREADS_PER_WORKER: int | None = 1
 _STATE: dict[str, Any] = {}
 
 
-def resolve_jobs(requested: int | None, episode_count: int) -> int:
-    """Pick a worker count, and say when parallelism cannot pay for itself.
+def resolve_jobs(
+    requested: int | None,
+    episode_count: int,
+    *,
+    min_episodes_per_job: int = MIN_EPISODES_PER_JOB,
+) -> int:
+    """确定工作进程数，并按数据量和可用 CPU 数限制。
 
-    ``None`` asks for the default, which leaves enough room for the threads the
-    solver already uses inside one episode: measured on a 24-core machine the
-    sequential screen already occupied about three cores, so handing every core
-    its own worker would oversubscribe by that factor and lose most of what it
-    gained.
+    requested 为 None 时默认每三个 CPU 分配一个进程；
+    min_episodes_per_job 控制每个进程所需的最少段数，设为 1 可关闭小批次降档。
+    无待处理段时返回 1，供调用方选择不启动进程池。
     """
+    if min_episodes_per_job < 1:
+        raise ValueError("min_episodes_per_job must be at least 1")
     if requested is not None and requested < 1:
         raise ValueError(f"--jobs must be at least 1, got {requested}")
     if episode_count <= 0:
@@ -58,8 +63,8 @@ def resolve_jobs(requested: int | None, episode_count: int) -> int:
     if requested is None:
         requested = max(1, available // 3)
     capped = min(requested, episode_count, available)
-    if capped > 1 and episode_count < capped * MIN_EPISODES_PER_JOB:
-        capped = max(1, episode_count // MIN_EPISODES_PER_JOB)
+    if capped > 1 and episode_count < capped * min_episodes_per_job:
+        capped = max(1, episode_count // min_episodes_per_job)
     return max(1, capped)
 
 
