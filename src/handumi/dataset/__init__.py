@@ -1,7 +1,8 @@
-"""LeRobot dataset read/write boundary for handumi."""
+"""提供 HandUMI 数据集读写接口，并配置扩展元数据的日志兼容。"""
 
 from typing import Any
 
+from handumi.dataset._logging import configure_lerobot_logging
 from handumi.dataset.capture import (
     CAMERA_STALE_TIMEOUT_S,
     FEETECH_SAMPLE_HZ,
@@ -44,6 +45,9 @@ from handumi.dataset.reader import (
     recording_device,
     validate_raw_state_metadata,
 )
+
+# 在每个工作进程导入数据集模块时安装，覆盖 QA 子命令和并行读取。
+configure_lerobot_logging()
 
 
 def __getattr__(name: str) -> Any:
