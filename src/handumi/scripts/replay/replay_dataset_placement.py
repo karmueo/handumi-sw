@@ -287,7 +287,8 @@ def _full_episode(args, context, episode: int, selection, *, progress_callback=N
         with contextlib.redirect_stdout(io.StringIO()):
             rollout = replay.solve_episode(trial)
             trial.strict_ik = True
-            _finish_rollout(trial, rollout)
+            _finish_rollout(trial, rollout, runtime=context["runtime"],
+                            checker=context["collision_checker"])
     except SystemExit as exc:
         message = str(exc)
         if not message.startswith(_EXPECTED_FAILURES):
@@ -295,6 +296,15 @@ def _full_episode(args, context, episode: int, selection, *, progress_callback=N
         return {"episode": episode, "passed": False, "prefix_frames": observer.prefix,
                 "total_frames": total, "first_failed_frame": (observer.failed_frame if observer.failed_frame is not None else observer.current_frame),
                 "error": message[:4000]}
+    scratch_dir = getattr(args, "_placement_scratch_dir", None)
+    input_identity = context.get("input_identity")
+    if scratch_dir is not None and input_identity is not None:
+        from handumi.scripts.replay.replay_placement_cache import store_scratch
+
+        try:
+            store_scratch(Path(scratch_dir), episode, input_identity, selection.pose7, rollout)
+        except (OSError, ValueError) as exc:
+            print(f"[replay] placement scratch write skipped episode={episode}: {exc}")
     return {"episode": episode, "passed": True, "prefix_frames": observer.prefix,
             "total_frames": total, "first_failed_frame": None,
             "max_position_error_m": float(max(np.max(rollout["left_pos_error_m"]), np.max(rollout["right_pos_error_m"]))),
@@ -309,6 +319,70 @@ def _estimate(args, reference):
         return _estimate_with_progress(args, reference, progress)
 
 
+def _estimate_parallel_with_progress(args, reference, progress, contexts, geometry,
+                                     started, stages, workers):
+    """并行评分独立任务，保持候选顺序及原有排序与严格验收语义。"""
+    from handumi.scripts.replay.replay_placement_pool import PlacementPool
+
+    reference_pose = pose_inv(reference.pose7).astype(float)
+    episodes = [context["targets_for_search"] for context in contexts]
+    count = len(contexts)
+    stage_started = time.monotonic()
+    with PlacementPool(args, contexts, reference, workers, progress) as pool:
+        first_results = pool.first_frames(reference_pose)
+        call_index = 0
+
+        def first_xy(_base, episode):
+            """按生成器的固定朝向顺序读取已完成的首帧结果。"""
+            nonlocal call_index
+            yaw = call_index // count
+            call_index += 1
+            return first_results[yaw][episode]
+
+        candidates = generate_candidates(reference_pose, episodes, geometry[0], first_xy)
+        stages["candidate_generation"] = time.monotonic() - stage_started
+        stage_started = time.monotonic()
+        sample_results = iter(pool.sample_scores(candidates))
+        finalists, sample_records = choose_finalists(
+            candidates, reference_pose, args.placement_search_candidates,
+            lambda _candidate: next(sample_results),
+        )
+        stages["sample_evaluation"] = time.monotonic() - stage_started
+        stage_started = time.monotonic()
+        full_results = pool.full_scores(finalists)
+        evaluations = []
+        winner = None
+        best_key = None
+        for candidate, results in zip(finalists, full_results, strict=True):
+            key = rank_result(candidate, reference_pose, results)
+            evaluations.append({"pose7": candidate.pose.tolist(),
+                                "yaw_index": candidate.yaw_index,
+                                "passed_episodes": -key[0], "prefix_frames": -key[1],
+                                "episodes": results})
+            if best_key is None or key < best_key:
+                best_key, winner = key, candidate
+        stages["full_evaluation"] = time.monotonic() - stage_started
+    total_frames = sum(len(episode.poses) for episode in episodes)
+    report = {
+        "algorithm": ALGORITHM_VERSION, "robot": args.robot,
+        "episode_count": count, "total_frames": total_frames,
+        "episode_state_digests": [array_digest(context["loaded"][0]) for context in contexts],
+        "reference_episode_identities": [context["input_identity"] for context in contexts],
+        "max_position_error_m": args.max_ik_position_error_m,
+        "max_rotation_error_deg": args.max_ik_rotation_error_deg,
+        "initial_position_tolerance_m": args.initial_position_tolerance_m,
+        "reference_table_from_robot_pose7": reference_pose.tolist(),
+        "sample_candidates": sample_records, "candidates": evaluations,
+        "candidate_budget": args.placement_search_candidates,
+        "elapsed_seconds": time.monotonic() - started, "stage_seconds": stages,
+        "passed_episodes": -best_key[0] if best_key is not None else 0,
+        "prefix_frames": -best_key[1] if best_key is not None else 0,
+        "verified_prefix_rate": (-best_key[1] / total_frames) if best_key is not None and total_frames else 0.0,
+        "table_from_robot_pose7": winner.pose.tolist() if winner is not None else None,
+    }
+    return winner, report
+
+
 def _estimate_with_progress(args, reference, progress):
     """在独立进度显示生命周期内运行搜索，不修改原始参数对象。"""
     from handumi.robots.utils import pose_inv
@@ -316,6 +390,13 @@ def _estimate_with_progress(args, reference, progress):
     started = time.monotonic()
     contexts, geometry = _episode_contexts(args, reference, progress)
     stages = {"input_preparation": time.monotonic() - started}
+    workers = getattr(args, "placement_workers", None)
+    if workers is None:
+        workers = getattr(args, "prepare_workers", 8)
+    if workers > 1:
+        return _estimate_parallel_with_progress(
+            args, reference, progress, contexts, geometry, started, stages, workers,
+        )
     reference_pose = pose_inv(reference.pose7).astype(float)
     episodes = [context["targets_for_search"] for context in contexts]
 
@@ -434,34 +515,50 @@ def resolve_dataset_placement(args):
                 raise SystemExit(f"Dataset placement {path} must have simulation scope.")
             print(f"[replay] reusing fixed dataset placement: {path}", flush=True)
             return selection
-        try:
-            candidate, report = _estimate(args, reference)
-        except (Exception, SystemExit) as exc:
-            failure_path = directory / f"{args.robot}.latest.json"
-            _json_write(failure_path, {"status": "search_error", "algorithm": ALGORITHM_VERSION,
-                                      "robot": args.robot, "error": str(exc)})
-            raise
-        generation = uuid.uuid4().hex
-        report["generation"] = generation
-        report_path = directory / f"{args.robot}.{generation}.json"
-        _json_write(report_path, report)
-        if candidate is None or report["passed_episodes"] < 1:
-            _json_write(directory / f"{args.robot}.latest.json", {"status": "search_failed", "search_report": report_path.name, **report})
-            raise SystemExit(f"Dataset placement search found no fully passing episode; see {report_path}.")
-        robot_from_table = pose_inv(candidate.pose)
-        data = {
-            "schema_version": 1, "kind": "handumi_robot_table_calibration",
-            "robot": args.robot, "scope": "simulation", "verified": False,
-            "source": "dataset_xy_yaw_search", "generation": generation,
-            "search_report": report_path.name,
-            "calibration": {"robot_from_table": {
-                "position": robot_from_table[:3].tolist(),
-                "quaternion": robot_from_table[3:].tolist(),
-            }},
-        }
-        _write_atomic(path, yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
-        print(f"[replay] fixed dataset placement: {path} ({report['passed_episodes']}/{report['episode_count']} episodes passed)", flush=True)
-        return load_deployment_calibration(path, expected_robot=args.robot, profile="dataset-xy-yaw")
+        # 结果只在本次搜索期间存在，退出时连同未选中的候选一起清理。
+        cache_enabled = not (getattr(args, "no_cache", False) or getattr(args, "refresh_cache", False))
+        scratch_context = (tempfile.TemporaryDirectory(prefix=".search-", dir=directory)
+                           if cache_enabled else contextlib.nullcontext(None))
+        with scratch_context as scratch_dir:
+            search_args = argparse.Namespace(**vars(args))
+            if scratch_dir is not None:
+                search_args._placement_scratch_dir = scratch_dir
+            try:
+                candidate, report = _estimate(search_args, reference)
+            except (Exception, SystemExit) as exc:
+                failure_path = directory / f"{args.robot}.latest.json"
+                _json_write(failure_path, {"status": "search_error", "algorithm": ALGORITHM_VERSION,
+                                          "robot": args.robot, "error": str(exc)})
+                raise
+            generation = uuid.uuid4().hex
+            report["generation"] = generation
+            report_path = directory / f"{args.robot}.{generation}.json"
+            _json_write(report_path, report)
+            if candidate is None or report["passed_episodes"] < 1:
+                _json_write(directory / f"{args.robot}.latest.json", {"status": "search_failed", "search_report": report_path.name, **report})
+                raise SystemExit(f"Dataset placement search found no fully passing episode; see {report_path}.")
+            robot_from_table = pose_inv(candidate.pose)
+            data = {
+                "schema_version": 1, "kind": "handumi_robot_table_calibration",
+                "robot": args.robot, "scope": "simulation", "verified": False,
+                "source": "dataset_xy_yaw_search", "generation": generation,
+                "search_report": report_path.name,
+                "calibration": {"robot_from_table": {
+                    "position": robot_from_table[:3].tolist(),
+                    "quaternion": robot_from_table[3:].tolist(),
+                }},
+            }
+            _write_atomic(path, yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
+            print(f"[replay] fixed dataset placement: {path} ({report['passed_episodes']}/{report['episode_count']} episodes passed)", flush=True)
+            selection = load_deployment_calibration(path, expected_robot=args.robot, profile="dataset-xy-yaw")
+            if scratch_dir is not None:
+                from handumi.scripts.replay.replay_placement_cache import promote_winner
+
+                try:
+                    promote_winner(args, reference, selection, candidate, report, Path(scratch_dir))
+                except (Exception, SystemExit) as exc:
+                    print(f"[replay] placement cache promotion skipped: {exc}")
+            return selection
 
 
 def write_evaluation_report(args, failures: dict[int, str], *, completed=None) -> Path:

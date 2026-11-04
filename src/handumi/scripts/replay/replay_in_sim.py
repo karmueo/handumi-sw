@@ -268,6 +268,8 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
     )
     parser.add_argument("--prepare-workers", type=int, default=8,
                         help="Maximum concurrent episode preparation workers (default: 8).")
+    parser.add_argument("--placement-workers", type=int, default=None,
+                        help="Concurrent dataset placement workers (default: --prepare-workers; 1 disables parallel search).")
     parser.add_argument("--progress", choices=("auto", "on", "off"), default="auto",
                         help="Show batch progress (auto/on) or disable it (off).")
     parser.add_argument("--cache-dir", type=Path, default=None,
@@ -346,6 +348,9 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
 def resolve_replay_options(args: argparse.Namespace) -> None:
     """补全按模式区分的默认值，并拒绝与绝对 TCP 朝向冲突的设置。"""
     absolute_tcp = args.retarget_mode == "absolute-tcp"
+    placement_workers = getattr(args, "placement_workers", None)
+    if placement_workers is not None and placement_workers < 1:
+        raise ValueError("--placement-workers must be >= 1.")
     robot = getattr(args, "robot", None) or getattr(args, "embodiment", None)  # 回放与转换共用的目标机器人。
     if getattr(args, "approach_seconds", None) is None:
         # RM75B 绝对 TCP 回放直接从首帧摆放，其他模式保留原接近轨迹。

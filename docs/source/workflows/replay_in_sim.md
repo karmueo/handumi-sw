@@ -85,6 +85,15 @@ RM75B 的内部关节状态由七轴和两个平移夹指组成，初始 home �
 
 RM75B 的 `dataset-xy-yaw` 模式先联合评估数据集全部 episode，搜索一组共享底座 XY 和水平转角；高度和倾斜沿用参考仿真摆放。完整严格通过的段数优先，其次比较严格通过的连续前缀帧比例及与参考摆放的距离。搜索使用有限候选，不保证全局最优或保证超过半数通过。默认先筛选代表帧，再对最多 8 个候选完整求解整个数据集，因此首次运行可能需要较长时间。
 
+共享底座搜索使用 `--placement-workers` 控制并行进程数；未指定时沿用 `--prepare-workers`，默认最多 8 个。候选生成、代表帧评分和完整轨迹验证按独立任务并行，同一段内的帧按原顺序求解。设置 `--placement-workers 1` 可使用串行路径。每个进程需要初始化模型和编译求解器，小数据集未必随进程数增加而变快；比较时应同时记录包含启动成本的总时间和预热后的阶段时间。
+
+```bash
+handumi replay outputs/umi-demo --robot rm75b --deployment-profile sim \
+  --retarget-mode absolute-tcp --base-placement dataset-xy-yaw \
+  --placement-workers 4 --prepare-workers 4 \
+  --strict-ik --headless --prepare-mode all
+```
+
 `absolute-tcp` 默认的首帧位置容差和逐帧位置误差上限均为 5 mm，逐帧姿态误差上限为 5°；这组默认值也适用于 RM75B 的共享底座搜索。可通过原有容差参数显式调整。首次估计会依次显示输入准备、候选生成、代表帧预筛和完整轨迹验证的进度；完整验证显示当前候选、episode 和已求解帧数。终端输出重定向时定期记录纯文本状态，`--progress off` 关闭进度显示。
 
 ```bash
@@ -98,6 +107,33 @@ handumi replay outputs/umi-demo --robot rm75b --retarget-mode absolute-tcp \
 ```
 
 至少一段完整通过后，位姿保存至 `DATASET/.handumi/base_placement/rm75b.yaml`，估计详情和本次评估结果保存在同目录 JSON；成功轨迹进入现有逐段缓存。后续运行沿用已保存位姿，即使追加数据或更换模型、标定和精度参数也不会自动重估。重估没有找到完整通过段时保留旧位姿并返回失败。全部段都会尝试；任何段失败时全量命令非零退出，报告保留已完成的成功和失败信息。最终结果只为选中段另行导出 NPZ。
+
+搜索期间通过严格验收的完整轨迹暂存在独立临时目录。选中摆放后，程序重新核对实际数据、求解配置和写入的标定，再将匹配的胜出轨迹转入正式缓存，减少后续准备阶段的重复求解。身份不符或临时文件损坏时仍会正常求解；退出搜索时清理临时结果。`--no-cache` 和 `--refresh-cache` 不使用这一提升路径，搜索中途退出也不能恢复本次搜索进度。模型和碰撞检查器可在同一求解上下文内复用，精度、逐帧和运动段碰撞检查仍执行。
+
+### 小样本速度对比
+
+仓库中的基准工具按 episode 长度分位提取四条完整轨迹，只读取状态、夹爪开度和必要元数据，不解码视频。快照、冻结候选和结果必须放在原数据集之外，机器人 TCP 标定需显式指定：
+
+```bash
+export JAX_PLATFORMS=cpu PYTHONHASHSEED=0
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export XLA_FLAGS='--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1'
+python tools/benchmark_replay_placement.py snapshot outputs/umi-demo \
+  /tmp/handumi-replay-sample \
+  --robot-tcp-calibration configs/calibration/robot_tcp/local/rm75b.yaml
+python tools/benchmark_replay_placement.py run /tmp/handumi-replay-sample \
+  /tmp/handumi-replay-candidates.json /tmp/handumi-replay-serial.json \
+  --workers 1 --warm-runs 3
+python tools/benchmark_replay_placement.py run /tmp/handumi-replay-sample \
+  /tmp/handumi-replay-candidates.json /tmp/handumi-replay-parallel.json \
+  --workers 4 --warm-runs 3
+python tools/benchmark_replay_placement.py compare \
+  /tmp/handumi-replay-serial.json /tmp/handumi-replay-parallel.json
+```
+
+各版本复用同一快照和冻结候选，性能测试按顺序运行。上述线程与 XLA 设置需在新 Python 进程启动前生效，使串行路径和工作进程采用相同数值环境；仅固定哈希种子不足以保证数值可重复。基准只验证八个朝向的代表候选和两个完整轨迹候选，不能替代全数据集验收；默认生产搜索仍保留原有候选预算。`--shortest` 统一缩为快照中最短的两段，仍保留全部帧。`--capture-dir` 用于单独保存轨迹并以 `compare-captures` 验证数值，捕获产生的 I/O 不应混入纯性能结论；`--reuse-dir` 必须指定空目录，用于分别测量轨迹缓存提升和后续命中。
+
+JSON 分别记录输入准备、候选生成、代表帧评分、完整验证和预热重复结果。冷轮总耗时包含生产模块导入和工作进程启动，不包含 Python 解释器启动；进程树内存为低频 RSS 采样，可能漏掉短暂峰值。IK 的工厂残差名称采用稳定顺序，避免本地 JAXLS 按函数内存地址排列代价组造成跨进程浮点差异，残差、权重和约束保持不变。
 
 新模式始终验证完整原始帧，不支持 `--start-frame`、`--max-frames`、`--stride` 的裁剪设置或 `--only-manipulation`。首次搜索覆盖全部 episode；`--prepare-mode off` 和 `background` 只影响之后的逐段准备。高级选项 `--placement-search-candidates` 可调整完整验证候选数量。已有物理部署标定时应选择 `--deployment-profile sim`；搜索得到的是未经过实体验证的仿真标定。要在其他回放中使用保存的位姿，可传入 `--base-placement fixed --deployment-calibration DATASET/.handumi/base_placement/rm75b.yaml`。本模式沿用当前精度、关节连续性和自碰撞检查，未增加桌面或物体碰撞检查。
 

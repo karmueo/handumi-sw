@@ -218,7 +218,7 @@ def test_full_scoring_uses_standard_non_strict_solve_and_final_gate(tmp_path, mo
             trial._placement_score.frame_checked(frame, within)
         return {}
 
-    def finish(trial, rollout):
+    def finish(trial, rollout, **kwargs):
         """模拟正式严格验收拒绝超差轨迹。"""
         assert trial.strict_ik
         raise SystemExit("IK fidelity threshold exceeded; frames: 1")
@@ -242,7 +242,7 @@ def test_estimation_reports_real_phase_and_frame_progress(tmp_path, monkeypatch)
 
     from handumi.scripts.replay import replay_progress
 
-    args = _args(tmp_path)
+    args = _args(tmp_path, "--placement-workers", "1")
     reference = _reference()
     pose = np.array([0, 0, 0, 0, 0, 0, 1.0])
     targets = EpisodeTargets(np.array([pose] * 3), np.zeros((3, 3)), 0, 1)
@@ -462,3 +462,93 @@ def test_initialization_failure_writes_diagnostic_and_preserves_calibration(tmp_
     assert calibration.read_text() == "old calibration"
     report = json.loads((directory / "rm75b.latest.json").read_text())
     assert report["status"] == "search_error" and "episode 2" in report["error"]
+
+
+def test_parallel_search_preserves_serial_ranking_and_report(tmp_path, monkeypatch):
+    """相同首帧和评分输入下，并行协调器与串行路径保留相同搜索结果。"""
+    from types import SimpleNamespace
+
+    from handumi.scripts.replay import replay_placement_pool
+
+    args = _args(tmp_path, "--placement-workers", "1", "--placement-search-candidates", "3")
+    reference = _reference()
+    pose = np.array([0., 0., 0., 0., 0., 0., 1.])
+    contexts = []
+    for index in range(2):
+        poses = np.array([pose, pose + np.array([0.05, 0, 0, 0, 0, 0, 0])])
+        targets = EpisodeTargets(poses, np.array([[0.3 + index * 0.1, 0, 0.1]] * 2), 0, 0.9)
+        contexts.append({"runtime": object(), "tool": object(), "targets": {"index": index},
+                         "locked": (), "targets_for_search": targets,
+                         "loaded": (np.zeros((2, 16)),), "input_identity": f"ep{index}"})
+
+    def first(_runtime, _tool, targets, _base, _locked, max_seeds):
+        """返回与段相关且与执行顺序无关的首帧候选。"""
+        return [SimpleNamespace(xy=np.array([0.1 * targets["index"], 0.2]))]
+
+    def sample(_args, _contexts, _reference, *, frame_progress):
+        """使用方向和水平位置决定代表帧分数。"""
+        return lambda candidate: (2 - candidate.yaw_index % 2, 10 - candidate.yaw_index)
+
+    def result(episode, selection):
+        """给定同一摆放时返回稳定的整段评分。"""
+        x = float(pose_inv(selection.pose7)[0])
+        return {"episode": episode, "passed": x < 0.2,
+                "prefix_frames": 2 if x < 0.2 else 1, "total_frames": 2}
+
+    def full(_args, _context, episode, selection, *, progress_callback):
+        """模拟串行整段评分。"""
+        return result(episode, selection)
+
+    class Pool:
+        """按稳定索引模拟并行池输出，检验上层归并与报告。"""
+        def __init__(self, args, given_contexts, ref, workers, progress):
+            """保存池所使用的参考标定及上下文。"""
+            assert given_contexts is contexts and workers == 3
+            self.reference = ref
+
+        def __enter__(self):
+            """进入模拟池。"""
+            return self
+
+        def __exit__(self, *unused):
+            """退出模拟池。"""
+
+        def first_frames(self, reference_pose):
+            """输出与串行首帧求解器一致的候选。"""
+            return [[[np.array([0.1 * episode, 0.2])] for episode in range(2)]
+                    for _ in range(8)]
+
+        def sample_scores(self, candidates):
+            """返回与串行路径相同的代表帧评分。"""
+            return [(2 - candidate.yaw_index % 2, 10 - candidate.yaw_index)
+                    for candidate in candidates]
+
+        def full_scores(self, candidates):
+            """返回与串行路径相同的完整轨迹评分。"""
+            return [[result(episode, dataset_placement._candidate_calibration(
+                self.reference, candidate.pose)) for episode in range(2)]
+                    for candidate in candidates]
+
+    class Progress:
+        """丢弃测试期间的进度事件。"""
+        def update(self, *args, **kwargs):
+            """不显示进度。"""
+
+    monkeypatch.setattr(dataset_placement, "_episode_contexts", lambda *args: (contexts, (0.2,)))
+    monkeypatch.setattr(dataset_placement, "first_frame_candidates", first)
+    monkeypatch.setattr(dataset_placement, "_sample_evaluator", sample)
+    monkeypatch.setattr(dataset_placement, "_full_episode", full)
+    monkeypatch.setattr(replay_placement_pool, "PlacementPool", Pool)
+    serial_winner, serial = dataset_placement._estimate_with_progress(args, reference, Progress())
+    args.placement_workers = 3
+    parallel_winner, parallel = dataset_placement._estimate_with_progress(args, reference, Progress())
+    np.testing.assert_allclose(parallel_winner.pose, serial_winner.pose, atol=1e-5, rtol=1e-5)
+    for key in ("sample_candidates", "candidates", "passed_episodes", "prefix_frames",
+                "verified_prefix_rate", "table_from_robot_pose7"):
+        assert parallel[key] == serial[key]
+
+
+def test_placement_workers_must_be_positive(tmp_path):
+    """通过 CLI 和内部选项解析均拒绝非正数的摆放进程数。"""
+    with pytest.raises(ValueError, match="placement-workers"):
+        _args(tmp_path, "--placement-workers", "0")

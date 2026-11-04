@@ -788,3 +788,173 @@ def test_rm75b_direct_start_checks_first_frame_without_home(tmp_path, monkeypatc
     args.approach_seconds = 1.0
     with pytest.raises(SystemExit, match="home.*Link2/gripper_link"):
         prepare._finish_rollout(args, rollout, cached=True)
+
+
+def _placement_promotion_fixture(tmp_path, monkeypatch):
+    """创建使用真实身份计算和缓存编码的候选轨迹。"""
+    from dataclasses import replace
+
+    from handumi.calibration.deployment import load_deployment_calibration
+    from handumi.retargeting.dataset_placement import Candidate
+    from handumi.scripts.replay.replay_placement_cache import store_scratch
+
+    args, loaded, _ = _args_and_loaded(tmp_path, monkeypatch)
+    path = tmp_path / "placement.yaml"
+    path.write_text(yaml.safe_dump({
+        "kind": "handumi_robot_table_calibration", "robot": "rm75b",
+        "scope": "simulation", "verified": False,
+        "source": "dataset_xy_yaw_search",
+        "calibration": {"robot_from_table": {
+            "position": [0, 0, 0], "quaternion": [0, 0, 0, 1],
+        }},
+    }))
+    selection = load_deployment_calibration(path, expected_robot="rm75b", profile="dataset-xy-yaw")
+    reference = replace(selection, path=None, source="reference")
+    args.deployment_selection = reference
+    replay.resolve_replay_options(args)
+    source_identity = prepare.episode_identity(args, tuple(loaded))[0]
+    scratch = tmp_path / "scratch"
+    pose = np.asarray([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
+    candidate = Candidate(pose.copy(), 0)
+    rollout = _rollout()
+    rollout["robot_from_table_pose7"] = pose[None].copy()
+    store_scratch(scratch, 0, source_identity, selection.pose7, rollout)
+    args.base_placement = "dataset-xy-yaw"
+    report = {"reference_episode_identities": [source_identity]}
+    return args, loaded, reference, selection, candidate, report, scratch
+
+
+def test_placement_promotion_rekeys_updates_metadata_and_hits_cache(tmp_path, monkeypatch):
+    """通过的胜出轨迹需按最终标定生成缓存身份并保持正式来源。"""
+    from handumi.scripts.replay.replay_placement_cache import promote_winner
+
+    args, loaded, reference, selection, candidate, report, scratch = (
+        _placement_promotion_fixture(tmp_path, monkeypatch)
+    )
+    assert promote_winner(args, reference, selection, candidate, report, scratch) == 1
+    args.deployment_selection = selection
+    key, _ = prepare.episode_identity(args, tuple(loaded))
+    cached, failure = EpisodeSolveCache(prepare.cache_directory(args)).load(key)
+    assert failure is None and cached is not None
+    assert cached["base_placement_policy"].item() == "dataset-xy-yaw"
+    assert cached["deployment_calibration_source"].item() == "dataset_xy_yaw_search"
+    args.strict_ik = True
+    monkeypatch.setattr(replay, "solve_episode", lambda _: pytest.fail("should reuse cache"))
+    assert prepare.prepare_episode(args)["qpos"].shape == (2, 9)
+
+
+@pytest.mark.parametrize("change", ["input", "pose", "corrupt", "calibration", "incomplete"])
+def test_placement_promotion_refuses_stale_or_invalid_results(tmp_path, monkeypatch, change):
+    """源输入、位姿、标定或临时文件异常时禁止写入正式缓存。"""
+    from handumi.scripts.replay.replay_placement_cache import (
+        promote_winner,
+        scratch_key,
+    )
+
+    args, loaded, reference, selection, candidate, report, scratch = (
+        _placement_promotion_fixture(tmp_path, monkeypatch)
+    )
+    key = scratch_key(0, report["reference_episode_identities"][0], selection.pose7)
+    if change == "input":
+        loaded[0][0, 7] += 0.1
+    elif change == "pose":
+        candidate.pose[0] = 0.1
+    elif change == "corrupt":
+        EpisodeSolveCache(scratch).path(key).write_bytes(b"corrupt")
+    elif change == "calibration":
+        selection.path.write_text(selection.path.read_text().replace("verified: false", "verified: true"))
+    else:
+        EpisodeSolveCache(scratch).store(key, {"qpos": np.zeros((1, 9))})
+    assert promote_winner(args, reference, selection, candidate, report, scratch) == 0
+    assert not list(prepare.cache_directory(args).rglob("*.npz"))
+
+
+def test_finish_rollout_reuses_supplied_checker(tmp_path, monkeypatch):
+    """复用检查器仍按原顺序执行首帧、轨迹和严格精度检查。"""
+    from types import SimpleNamespace
+
+    args, _, _ = _args_and_loaded(tmp_path, monkeypatch, collision_enabled=True)
+    args.strict_ik = True
+    replay.resolve_replay_options(args)
+    seen = []
+
+    class Checker:
+        """记录调用并返回模拟安全结果。"""
+        def check_pose(self, q):
+            """记录首帧。"""
+            seen.append("pose")
+            return SimpleNamespace(safe=True)
+
+        def check_segment(self, a, b):
+            """记录关节段。"""
+            seen.append("segment")
+            return SimpleNamespace(safe=True)
+
+    checker = Checker()
+    monkeypatch.setattr(prepare, "_valid_collision_summary", lambda *a: True)
+    monkeypatch.setattr("handumi.robots.self_collision.require_clear", lambda result, **kw: None)
+    monkeypatch.setattr("handumi.robots.registry.load_embodiment", lambda *a, **kw: pytest.fail("should reuse checker"))
+    prepare._finish_rollout(args, _rollout(), checker=checker)
+    assert seen == ["pose", "segment"]
+
+
+def test_placement_promotion_rechecks_input_after_validation(tmp_path, monkeypatch):
+    """终验期间数据变化时，已通过的临时轨迹也不能进入正式缓存。"""
+    from handumi.scripts.replay.replay_placement_cache import promote_winner
+
+    args, loaded, reference, selection, candidate, report, scratch = (
+        _placement_promotion_fixture(tmp_path, monkeypatch)
+    )
+    finish = prepare._finish_rollout
+
+    def finish_then_change(*args, **kwargs):
+        """模拟轨迹终验期间源状态改变。"""
+        result = finish(*args, **kwargs)
+        loaded[0][0, 7] += 0.1
+        return result
+
+    monkeypatch.setattr(prepare, "_finish_rollout", finish_then_change)
+    assert promote_winner(args, reference, selection, candidate, report, scratch) == 0
+    assert not list(prepare.cache_directory(args).rglob("*.npz"))
+
+
+def test_finish_does_not_implicitly_reuse_stale_private_checker(tmp_path, monkeypatch):
+    """args 中残留的旧检查器不能被另一次终验隐式使用。"""
+    args, _, _ = _args_and_loaded(tmp_path, monkeypatch, collision_enabled=True)
+    replay.resolve_replay_options(args)
+    args._episode_collision_checker = object()
+    monkeypatch.setattr(prepare, "_valid_collision_summary", lambda *a: True)
+
+    def require_new_runtime(*args, **kwargs):
+        """验证进入重新加载路径，不执行昂贵的模型加载。"""
+        raise RuntimeError("new runtime requested")
+
+    monkeypatch.setattr("handumi.robots.registry.load_embodiment", require_new_runtime)
+    with pytest.raises(RuntimeError, match="new runtime requested"):
+        prepare._finish_rollout(args, _rollout())
+
+
+def test_search_scratch_stores_only_fully_validated_rollout(tmp_path, monkeypatch):
+    """搜索仅暂存全帧严格通过的轨迹，失败段不产生临时缓存。"""
+    from handumi.scripts.replay import replay_dataset_placement as placement
+    from handumi.scripts.replay.replay_placement_cache import scratch_key
+
+    args, loaded, reference, selection, candidate, report, _ = (
+        _placement_promotion_fixture(tmp_path, monkeypatch)
+    )
+    args._placement_scratch_dir = str(tmp_path / "isolated-scratch")
+    context = {
+        "loaded": tuple(loaded), "runtime": object(), "collision_checker": None,
+        "input_identity": report["reference_episode_identities"][0],
+        "targets_for_search": SimpleNamespace(poses=np.zeros((2, 7))),
+    }
+    monkeypatch.setattr(replay, "solve_episode", lambda _: _rollout())
+    result = placement._full_episode(args, context, 0, selection)
+    key = scratch_key(0, context["input_identity"], selection.pose7)
+    cached, failure = EpisodeSolveCache(tmp_path / "isolated-scratch").load(key)
+    assert result["passed"] and cached is not None and failure is None
+    monkeypatch.setattr(replay, "solve_episode", lambda _: _rollout(1.0))
+    result = placement._full_episode(args, context, 1, selection)
+    failed_key = scratch_key(1, context["input_identity"], selection.pose7)
+    assert not result["passed"]
+    assert EpisodeSolveCache(tmp_path / "isolated-scratch").load(failed_key) == (None, None)

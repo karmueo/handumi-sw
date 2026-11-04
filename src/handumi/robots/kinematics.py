@@ -133,6 +133,33 @@ def _posture_cost(JointVar, posture_q, posture_weight):
     return pk.costs.rest_cost(JointVar(0), rest_pose=posture_q, weight=posture_weight)
 
 
+def _stabilize_cost_order_names(costs) -> None:
+    """为本次工厂闭包指定稳定名称，避免代价组按内存地址排序。"""
+    from types import FunctionType
+
+    def function_name(func):
+        """提取底层函数名称；非工厂函数保留其本身的标识。"""
+        if not isinstance(func, FunctionType):
+            return "none"
+        for cell in func.__closure__ or ():
+            value = cell.cell_contents
+            if isinstance(value, FunctionType):
+                return f"{value.__module__}.{value.__qualname__}"
+        return f"{func.__module__}.{func.__qualname__}"
+
+    prefix = "Cost.factory.<locals>.decorator.<locals>.inner.<locals>.<lambda>"
+    for cost in costs:
+        residual = cost.compute_residual
+        if not isinstance(residual, FunctionType) or residual.__qualname__ != prefix:
+            continue
+        # 仅改每次创建的闭包显示名称，不修改底层函数、代价或参数。
+        residual.__qualname__ = (
+            f"handumi_cost.{function_name(residual)}.{cost.kind}.{cost.jac_mode}."
+            f"{cost.jac_batch_size}.{function_name(cost.jac_custom_fn)}."
+            f"{function_name(cost.jac_custom_with_cache_fn)}"
+        )
+
+
 @jdc.jit
 def _solve(
     robot,
@@ -178,6 +205,7 @@ def _solve(
         costs.append(
             _limit_margin_cost(JointVar(0), margin_lower, margin_upper, margin_weights)
         )
+    _stabilize_cost_order_names(costs)
     # q_prev 必须作为优化初值传入。rest cost 只是软约束，不能代替初值；
     # 否则优化器会从 pyroki 的默认中间位形启动，在奇异 home 附近跳到另一
     # IK 分支，即使目标只移动了毫米级。
@@ -257,6 +285,7 @@ def _solve_self_collision(
             weight=self_collision_weight,
         )
     )
+    _stabilize_cost_order_names(costs)
     # 与 _solve 相同：从上一关节角启动，保持分支连续。
     initial_vals = jaxls.VarValues.make([JointVar(0).with_value(q_prev)])
     sol = (

@@ -213,6 +213,9 @@ def episode_identity(
         "retargeting/dataset_placement.py",
         "scripts/replay/replay_in_sim.py",
         "scripts/replay/replay_prepare.py",
+        "scripts/replay/replay_dataset_placement.py",
+        "scripts/replay/replay_placement_cache.py",
+        "scripts/replay/replay_placement_pool.py",
     )
     dependencies = {}
     for name in ("numpy", "scipy", "jax", "jaxlib", "pyroki", "jaxls", "yourdfpy", "trimesh", "rtree"):
@@ -367,7 +370,8 @@ def _valid_collision_summary(args: argparse.Namespace, rollout: dict[str, np.nda
 
 
 def _finish_rollout(
-    args: argparse.Namespace, rollout: dict[str, np.ndarray], *, cached: bool = False
+    args: argparse.Namespace, rollout: dict[str, np.ndarray], *, cached: bool = False,
+    runtime=None, checker=None, validation_context: dict | None = None,
 ) -> dict[str, np.ndarray]:
     """按当前显示配置重建 approach，并对本次调用重新执行 strict 检查。"""
     from handumi.robots.registry import load_robot_config
@@ -391,20 +395,24 @@ def _finish_rollout(
 
         if not _valid_collision_summary(args, rollout):
             raise SystemExit("Missing or invalid RM75B self-collision validation summary.")
-        if str(rollout["retarget_mode"].item()) == "absolute-tcp":
-            runtime = load_embodiment(args.robot, collision_kind="gripper-box")
-        else:
-            runtime = load_embodiment(args.robot)
-        solver = runtime.solver_cls()
-        urdf = runtime.load_urdf()
-        if str(rollout["retarget_mode"].item()) == "absolute-tcp":
-            checker = GripperBoxCollisionChecker(
-                runtime.robot, solver.robot_collision, urdf,
-                config.ik_weights.self_collision_margin,
-            )
-        else:
-            checker = CollisionChecker(runtime.robot, solver.robot_collision,
-                                       urdf, config.ik_weights.self_collision_margin)
+        if checker is None:
+            if runtime is None:
+                if str(rollout["retarget_mode"].item()) == "absolute-tcp":
+                    runtime = load_embodiment(args.robot, collision_kind="gripper-box")
+                else:
+                    runtime = load_embodiment(args.robot)
+            solver = runtime.solver_cls()
+            urdf = runtime.load_urdf()
+            if str(rollout["retarget_mode"].item()) == "absolute-tcp":
+                checker = GripperBoxCollisionChecker(
+                    runtime.robot, solver.robot_collision, urdf,
+                    config.ik_weights.self_collision_margin,
+                )
+            else:
+                checker = CollisionChecker(runtime.robot, solver.robot_collision,
+                                           urdf, config.ik_weights.self_collision_margin)
+        if validation_context is not None:
+            validation_context.update(runtime=runtime, checker=checker)
         if args.approach_seconds > 0 or str(rollout["retarget_mode"].item()) != "absolute-tcp":
             require_clear(checker.check_pose(config.home_q), phase="home", frame="home")
         qpos = rollout["qpos"]
@@ -484,7 +492,12 @@ def prepare_episode(
             run_args._episode_loaded = loaded
             if runtime_provider is not None:
                 run_args._episode_runtime = runtime_provider(args, identity)
-            return _finish_rollout(args, replay.solve_episode(run_args))
+            rollout = replay.solve_episode(run_args)
+            run_args.strict_ik = args.strict_ik
+            return _finish_rollout(
+                run_args, rollout, runtime=getattr(run_args, "_episode_runtime", None),
+                checker=getattr(run_args, "_episode_collision_checker", None),
+            )
         if runtime_provider is not None:
             loaded = replay.load_episode_states(args)
             _, identity = episode_identity(args, loaded)
@@ -512,7 +525,10 @@ def prepare_episode(
         raise SystemExit(failure)
     was_hit = (cached is not None and _valid_rollout(cached)
                and _valid_collision_summary(args, cached))
+    finish_runtime = finish_checker = None
     if was_hit:
+        if runtime_provider is not None:
+            finish_runtime = runtime_provider(args, identity)
         report(args, "cache_hit")
         print(f"[replay] cache hit episode={args.episode} key={key[:12]}")
         rollout = cached
@@ -526,6 +542,8 @@ def prepare_episode(
         run_args.strict_ik = False
         try:
             rollout = replay.solve_episode(run_args)
+            finish_runtime = getattr(run_args, "_episode_runtime", None)
+            finish_checker = getattr(run_args, "_episode_collision_checker", None)
         except SystemExit as exc:
             message = str(exc)
             if message.startswith(_FAILURE_PREFIXES):
@@ -557,4 +575,5 @@ def prepare_episode(
             print(
                 "[replay] source or calibration changed during solve; result not cached"
             )
-    return _finish_rollout(args, rollout, cached=was_hit)
+    return _finish_rollout(args, rollout, cached=was_hit,
+                           runtime=finish_runtime, checker=finish_checker)
