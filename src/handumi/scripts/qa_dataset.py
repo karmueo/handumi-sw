@@ -55,6 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "local", "sim"),
         default="auto",
     )
+    parser.add_argument("--retarget-mode", choices=("auto", "local-relative", "anchored", "absolute-table", "absolute-tcp"), default="auto")
+    parser.add_argument("--base-placement", choices=("auto", "fixed", "episode-xy", "dataset-xy-yaw"), default="auto")
+    parser.add_argument("--deployment-calibration", type=Path, default=None)
+    parser.add_argument("--controller-tcp-calibration", type=Path, default=None)
+    parser.add_argument("--robot-tcp-calibration", type=Path, default=None)
+    parser.add_argument("--initial-position-tolerance-m", type=float, default=None)
+    parser.add_argument("--max-rotation-error-deg", type=float, default=None)
     parser.add_argument(
         "--max-position-error-m",
         type=float,
@@ -121,6 +128,15 @@ def review_steps(args, root: str) -> list[tuple[str, list[str]]]:
             "--deployment-profile", args.deployment_profile,
             "--rig-config", str(args.rig_config),
         ]
+        if args.retarget_mode != "auto":
+            command += ["--retarget-mode", args.retarget_mode]
+        if args.base_placement != "auto":
+            command += ["--base-placement", args.base_placement]
+        for name in ("deployment_calibration", "controller_tcp_calibration", "robot_tcp_calibration",
+                     "initial_position_tolerance_m", "max_rotation_error_deg"):
+            value = getattr(args, name)
+            if value is not None:
+                command += ["--" + name.replace("_", "-"), str(value)]
         if args.max_position_error_m is not None:
             command += ["--max-position-error-m", str(args.max_position_error_m)]
         if args.max_base_rotation_deg is not None:

@@ -81,6 +81,26 @@ RM75B 的内部关节状态由七轴和两个平移夹指组成，初始 home �
 
 `absolute-tcp` 的自适应摆放先搜索靠近桌面原点的候选；近端搜索失败后，再用有限的宽半径候选寻找整段严格达标的摆放。实际结果和搜索预算记录在每段缓存中。搜索只检查有限个数值候选，未找到结果表示搜索未确定可行解；机器人模型、工具标定或输入改变后会生成新缓存键。
 
+### 为整个数据集固定同一底座
+
+RM75B 的 `dataset-xy-yaw` 模式先联合评估数据集全部 episode，搜索一组共享底座 XY 和水平转角；高度和倾斜沿用参考仿真摆放。完整严格通过的段数优先，其次比较严格通过的连续前缀帧比例及与参考摆放的距离。搜索使用有限候选，不保证全局最优或保证超过半数通过。默认先筛选代表帧，再对最多 8 个候选完整求解整个数据集，因此首次运行可能需要较长时间。
+
+`absolute-tcp` 默认的首帧位置容差和逐帧位置误差上限均为 5 mm，逐帧姿态误差上限为 5°；这组默认值也适用于 RM75B 的共享底座搜索。可通过原有容差参数显式调整。首次估计会依次显示输入准备、候选生成、代表帧预筛和完整轨迹验证的进度；完整验证显示当前候选、episode 和已求解帧数。终端输出重定向时定期记录纯文本状态，`--progress off` 关闭进度显示。
+
+```bash
+handumi replay outputs/umi-demo --robot rm75b --retarget-mode absolute-tcp \
+  --base-placement dataset-xy-yaw --strict-ik --headless --prepare-mode all
+
+# 显式重新估计底座；--refresh-cache 仅重算逐段轨迹
+handumi replay outputs/umi-demo --robot rm75b --retarget-mode absolute-tcp \
+  --base-placement dataset-xy-yaw --refresh-base-placement \
+  --strict-ik --headless --prepare-mode all
+```
+
+至少一段完整通过后，位姿保存至 `DATASET/.handumi/base_placement/rm75b.yaml`，估计详情和本次评估结果保存在同目录 JSON；成功轨迹进入现有逐段缓存。后续运行沿用已保存位姿，即使追加数据或更换模型、标定和精度参数也不会自动重估。重估没有找到完整通过段时保留旧位姿并返回失败。全部段都会尝试；任何段失败时全量命令非零退出，报告保留已完成的成功和失败信息。最终结果只为选中段另行导出 NPZ。
+
+新模式始终验证完整原始帧，不支持 `--start-frame`、`--max-frames`、`--stride` 的裁剪设置或 `--only-manipulation`。首次搜索覆盖全部 episode；`--prepare-mode off` 和 `background` 只影响之后的逐段准备。高级选项 `--placement-search-candidates` 可调整完整验证候选数量。已有物理部署标定时应选择 `--deployment-profile sim`；搜索得到的是未经过实体验证的仿真标定。要在其他回放中使用保存的位姿，可传入 `--base-placement fixed --deployment-calibration DATASET/.handumi/base_placement/rm75b.yaml`。本模式沿用当前精度、关节连续性和自碰撞检查，未增加桌面或物体碰撞检查。
+
 下面的诊断命令使用可信的桌面控制器标定快照，检查腕心内外半径必要条件，并对指定关键帧执行不受帧间步长约束的独立多初值 IK。它还复用正式回放完整轨迹，保存 JSON 报告与 NPZ。该诊断当前限定 RM75B 的 base 高度为零，且 base 朝向与桌面相同：
 
 ```bash

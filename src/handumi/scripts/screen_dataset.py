@@ -29,8 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("dataset", help="Local dataset path or Hugging Face repo id.")
     parser.add_argument("--robot", choices=EMBODIMENT_NAMES, required=True)
-    parser.add_argument("--retarget-mode", choices=("auto", "absolute-tcp"), default="auto")
-    parser.add_argument("--base-placement", choices=("auto", "fixed", "episode-xy"), default="auto")
+    parser.add_argument("--retarget-mode", choices=("auto", "local-relative", "anchored", "absolute-table", "absolute-tcp"), default="auto")
+    parser.add_argument("--base-placement", choices=("auto", "fixed", "episode-xy", "dataset-xy-yaw"), default="auto")
     parser.add_argument("--robot-tcp-calibration", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     cache_mode = parser.add_mutually_exclusive_group()
@@ -75,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
     )
+    parser.add_argument("--initial-position-tolerance-m", type=float, default=None)
     parser.add_argument(
         "--max-rotation-error-deg",
         type=float,
@@ -115,6 +116,11 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    from handumi.scripts.replay.replay_deployment import select_saved_dataset_placement
+
+    args.dataset_root = selection.root
+    select_saved_dataset_placement(args, allow_explicit=True)
+
     episodes = None
     if args.episodes:
         try:
@@ -127,6 +133,9 @@ def main() -> None:
         "Screening plan\n"
         f"  Dataset: {selection.root}\n"
         f"  Robot: {args.robot}\n"
+        f"  Retargeting: {args.retarget_mode}\n"
+        f"  Base placement: {args.base_placement}\n"
+        f"  Placement file: {getattr(getattr(args, 'deployment_selection', None), 'path', None) or args.deployment_calibration or 'automatic'}\n"
         f"  Episodes: {'all' if episodes is None else episodes}\n"
         f"  Controller->TCP: {args.controller_tcp_calibration or 'dataset snapshot / robot default'}\n"
         f"  Report: {report_path}"
@@ -157,6 +166,8 @@ def main() -> None:
         refresh_cache=args.refresh_cache,
         robot_tcp_calibration=args.robot_tcp_calibration,
         deployment_calibration=args.deployment_calibration,
+        deployment_selection=getattr(args, "deployment_selection", None),
+        initial_position_tolerance_m=args.initial_position_tolerance_m,
     )
     write_screening_report(report_path, payload)
     markdown_path = args.markdown or report_path.with_suffix(".md")

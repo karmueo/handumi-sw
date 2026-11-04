@@ -236,6 +236,8 @@ def _replay_args(
     base_placement: str = "auto",
     robot_tcp_calibration: Path | None = None,
     deployment_calibration: Path | None = None,
+    deployment_selection: Any = None,
+    initial_position_tolerance_m: float | None = None,
     max_position_error_m: float | None = None,
     max_rotation_error_deg: float | None = None,
     cache_dir: Path | None = None,
@@ -260,17 +262,23 @@ def _replay_args(
     args.base_placement = base_placement
     args.robot_tcp_calibration = robot_tcp_calibration
     args.deployment_calibration = deployment_calibration
+    args.deployment_selection = deployment_selection
+    args.initial_position_tolerance_m = initial_position_tolerance_m
     args.max_ik_position_error_m = max_position_error_m
     args.max_ik_rotation_error_deg = max_rotation_error_deg
     args.cache_dir = cache_dir
     args.no_cache = no_cache
     args.refresh_cache = refresh_cache
-    resolve_replay_options(args)
     args.deployment_profile = deployment_profile
     args.rig_config = rig_config
+    from handumi.scripts.replay.replay_deployment import select_saved_dataset_placement
+
+    if deployment_selection is None:
+        select_saved_dataset_placement(args, allow_explicit=True)
+    resolve_replay_options(args)
     # Grade every episode instead of aborting on the first violation, and skip
     # the playback lead-in: it is render-only and not part of the trajectory.
-    args.strict_ik = retarget_mode == "absolute-tcp"
+    args.strict_ik = args.retarget_mode == "absolute-tcp"
     args.approach_seconds = 0.0
     return args
 
@@ -499,6 +507,8 @@ def _build_screen_state(
     base_placement: str = "auto",
     robot_tcp_calibration: Path | None = None,
     deployment_calibration: Path | None = None,
+    deployment_selection: Any = None,
+    initial_position_tolerance_m: float | None = None,
     max_position_error_m: float | None = None,
     max_rotation_error_deg: float | None = None,
     cache_dir: Path | None = None,
@@ -514,7 +524,7 @@ def _build_screen_state(
     from handumi.robots.registry import build_pruned_collision_model, load_embodiment
 
     runtime = load_embodiment(robot)
-    deployment = resolve_deployment_calibration(
+    deployment = deployment_selection or resolve_deployment_calibration(
         robot,
         explicit_path=deployment_calibration,
         profile=deployment_profile,
@@ -572,6 +582,8 @@ def _build_screen_state(
             "base_placement": base_placement,
             "robot_tcp_calibration": robot_tcp_calibration,
             "deployment_calibration": deployment_calibration,
+            "deployment_selection": deployment_selection,
+            "initial_position_tolerance_m": initial_position_tolerance_m,
             "max_position_error_m": max_position_error_m,
             "max_rotation_error_deg": max_rotation_error_deg,
             "cache_dir": cache_dir,
@@ -766,11 +778,13 @@ def screen_dataset(
     base_placement: str = "auto",
     robot_tcp_calibration: Path | None = None,
     deployment_calibration: Path | None = None,
+    deployment_selection: Any = None,
+    initial_position_tolerance_m: float | None = None,
     cache_dir: Path | None = None,
     no_cache: bool = False,
     refresh_cache: bool = False,
 ) -> dict[str, Any]:
-    """Retarget every episode and grade it. Never modifies the dataset.
+    """逐段求解和评分，必要时保存数据集专用的仿真布局，保留原始采集数据。
 
     ``controller_tcp_calibration`` replaces the capture's controller->TCP
     snapshot with an explicit YAML, exactly as ``handumi convert
@@ -783,9 +797,8 @@ def screen_dataset(
     """
     from handumi.calibration.deployment import resolve_deployment_calibration
     from handumi.config import DEFAULT_RIG_CONFIG
+    from handumi.scripts.replay.replay_deployment import estimate_dataset_deployment
 
-    cfg = config or (RetargetScreeningConfig(max_position_error_m=0.005, max_rotation_error_deg=5.0)
-                     if retarget_mode == "absolute-tcp" else RetargetScreeningConfig())
     dataset_root = Path(root).resolve()
     info_path = dataset_root / "meta" / "info.json"
     if not info_path.is_file():
@@ -803,14 +816,46 @@ def screen_dataset(
         raise ValueError(f"Episode indices out of range: {sorted(out_of_range)}")
 
     resolved_repo_id = repo_id or f"local/{dataset_root.name}"
-    deployment = resolve_deployment_calibration(
+    resolved_args = _replay_args(
+        root=dataset_root, repo_id=resolved_repo_id, revision=revision,
+        robot=robot, episode=selected[0] if selected else 0,
+        deployment_profile=deployment_profile, rig_config=rig_config or DEFAULT_RIG_CONFIG,
+        controller_tcp_calibration=controller_tcp_calibration,
+        retarget_mode=retarget_mode, base_placement=base_placement,
+        robot_tcp_calibration=robot_tcp_calibration,
+        deployment_calibration=deployment_calibration,
+        deployment_selection=deployment_selection,
+        initial_position_tolerance_m=initial_position_tolerance_m,
+    )
+    retarget_mode = resolved_args.retarget_mode
+    base_placement = resolved_args.base_placement
+    deployment_selection = getattr(resolved_args, "deployment_selection", None)
+    cfg = config or (RetargetScreeningConfig(max_position_error_m=0.005, max_rotation_error_deg=5.0)
+                     if retarget_mode == "absolute-tcp" else RetargetScreeningConfig())
+
+    def estimate_deployment():
+        """在父进程估计一次共享布局，交给全部 episode 和工作进程使用。"""
+        args = _replay_args(
+            root=dataset_root, repo_id=resolved_repo_id, revision=revision,
+            robot=robot, episode=selected[0] if selected else 0,
+            deployment_profile=deployment_profile, rig_config=rig_config or DEFAULT_RIG_CONFIG,
+            controller_tcp_calibration=controller_tcp_calibration,
+            retarget_mode=retarget_mode, base_placement=base_placement,
+            robot_tcp_calibration=robot_tcp_calibration,
+        )
+        return estimate_dataset_deployment(args)
+
+    deployment = deployment_selection or resolve_deployment_calibration(
             robot,
             explicit_path=deployment_calibration,
             profile=deployment_profile,
             rig_config=rig_config or DEFAULT_RIG_CONFIG,
             identity_fallback=retarget_mode == "absolute-tcp",
+            simulation_fallback=estimate_deployment,
     )
     deployment_path = deployment.path
+    if deployment.profile == "estimated":
+        deployment_calibration = deployment_path
     robot_tcp = None
     if retarget_mode == "absolute-tcp":
         from handumi.calibration.robot_tcp import load_robot_tcp_calibration
@@ -822,6 +867,10 @@ def screen_dataset(
         robot_tcp_calibration = robot_tcp.path
     workers = resolve_jobs(jobs, len(selected))
     if progress:
+        print(f"[screen] resolved mode={retarget_mode} placement={base_placement} "
+              f"calibration={deployment.path or deployment.source} "
+              f"max_position={cfg.max_position_error_m:g}m "
+              f"max_rotation={cfg.max_rotation_error_deg:g}deg")
         print(f"[screen] {describe_jobs(workers, len(selected))}")
 
     def _report(episode: int, item: dict[str, Any]) -> None:
@@ -857,6 +906,8 @@ def screen_dataset(
             "base_placement": base_placement,
             "robot_tcp_calibration": robot_tcp_calibration,
             "deployment_calibration": deployment_calibration,
+            "deployment_selection": deployment_selection,
+            "initial_position_tolerance_m": initial_position_tolerance_m,
             "max_position_error_m": cfg.max_position_error_m if retarget_mode == "absolute-tcp" else None,
             "max_rotation_error_deg": cfg.max_rotation_error_deg if retarget_mode == "absolute-tcp" else None,
             "cache_dir": cache_dir,
@@ -888,6 +939,8 @@ def screen_dataset(
             base_placement=base_placement,
             robot_tcp_calibration=robot_tcp_calibration,
             deployment_calibration=deployment_calibration,
+            deployment_selection=deployment_selection,
+            initial_position_tolerance_m=initial_position_tolerance_m,
             max_position_error_m=cfg.max_position_error_m,
             max_rotation_error_deg=cfg.max_rotation_error_deg,
         )
@@ -922,6 +975,8 @@ def screen_dataset(
                 base_placement=base_placement,
                 robot_tcp_calibration=robot_tcp_calibration,
                 deployment_calibration=deployment_calibration,
+                deployment_selection=deployment_selection,
+                initial_position_tolerance_m=initial_position_tolerance_m,
                 max_position_error_m=cfg.max_position_error_m if retarget_mode == "absolute-tcp" else None,
                 max_rotation_error_deg=cfg.max_rotation_error_deg if retarget_mode == "absolute-tcp" else None,
             )
@@ -953,11 +1008,17 @@ def screen_dataset(
         "dataset": resolved_repo_id,
         "root": portable_path(dataset_root),
         "robot": robot,
+        "retarget_mode": retarget_mode,
+        "base_placement_policy": base_placement,
         "config": asdict(cfg),
         "rotation_fences_deg": fences,
         "payload_manifest": dataset_payload_manifest(dataset_root),
         "deployment_calibration_path": portable_path(deployment_path) if deployment_path is not None else None,
-        "deployment_calibration": {"source": deployment.source, "pose7": deployment.pose7.tolist()},
+        "deployment_calibration": {
+            "source": deployment.source, "pose7": deployment.pose7.tolist(),
+            "scope": deployment.scope, "verified": deployment.verified,
+            "profile": deployment.profile,
+        },
         "robot_tcp_calibration_path": portable_path(robot_tcp.path) if robot_tcp is not None else None,
         "robot_tcp_calibration": robot_tcp.metadata() if robot_tcp is not None else None,
         "controller_tcp_calibration_path": (
@@ -1440,6 +1501,7 @@ def _idle_label(metrics: dict[str, Any]) -> str:
 
 
 def render_screening_markdown(payload: dict[str, Any]) -> str:
+    """生成筛选报告，并明确标注数据估计的仿真布局及其假设。"""
     summary = payload["summary"]
     lines = [
         f"# Retargeting screening: {payload['robot']}",
@@ -1448,6 +1510,13 @@ def render_screening_markdown(payload: dict[str, Any]) -> str:
         f"- Episodes: {summary['total']} "
         f"({summary['accepted']} accepted, {summary['rejected']} rejected)",
     ]
+    deployment = payload.get("deployment_calibration") or {}  # 报告对应的实际摆放来源。
+    if deployment.get("source") == "dataset_home_alignment_v1":
+        lines += [
+            "- Deployment: data-derived simulation estimate; not physically verified.",
+            "- Assumptions: upright robot base at tabletop height; XY and yaw estimated from TCP trajectories and HOME poses.",
+            f"- Estimated calibration: `{payload.get('deployment_calibration_path')}`",
+        ]
     fences = payload.get("rotation_fences_deg") or {}
     if fences:
         lines.append(

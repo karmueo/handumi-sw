@@ -160,6 +160,8 @@ def episode_identity(
     deployment = None
     tool = None
     if mode in {"absolute-table", "absolute-tcp"}:
+        from handumi.scripts.replay.replay_deployment import estimate_dataset_deployment
+
         selection = getattr(
             args, "deployment_selection", None
         ) or resolve_deployment_calibration(
@@ -168,6 +170,7 @@ def episode_identity(
             profile=args.deployment_profile,
             rig_config=args.rig_config,
             identity_fallback=mode == "absolute-tcp",
+            simulation_fallback=lambda: estimate_dataset_deployment(args),
         )
         deployment = {
             "pose7": np.asarray(selection.pose7).tolist(),
@@ -207,6 +210,7 @@ def episode_identity(
         "robots/utils.py",
         "retargeting/handumi_to_robot.py",
         "retargeting/base_placement.py",
+        "retargeting/dataset_placement.py",
         "scripts/replay/replay_in_sim.py",
         "scripts/replay/replay_prepare.py",
     )
@@ -413,8 +417,22 @@ def _finish_rollout(
             for index in range(1, len(path)):
                 require_clear(checker.check_segment(path[index - 1], path[index]),
                               phase="approach", frame=index)
+    observer = getattr(args, "_placement_score", None)
+    if observer is not None:
+        observer.rollout_checked(rollout, args)
     _strict_gate(args, rollout, warn=cached)
     return rollout
+
+
+def _require_dataset_placement(args: argparse.Namespace) -> None:
+    """拒绝缺失或非仿真的共享标定，避免缓存入口隐式选用其他摆放。"""
+    if getattr(args, "base_placement", None) != "dataset-xy-yaw":
+        return
+    selection = getattr(args, "deployment_selection", None)
+    if selection is None:
+        raise SystemExit("Dataset-wide base placement has not been resolved.")
+    if selection.scope != "simulation":
+        raise SystemExit("Dataset-wide base placement requires a simulation calibration.")
 
 
 def load_prepared_episode(args: argparse.Namespace) -> dict[str, np.ndarray] | None:
@@ -422,10 +440,15 @@ def load_prepared_episode(args: argparse.Namespace) -> dict[str, np.ndarray] | N
     from handumi.scripts.replay import replay_in_sim as replay
 
     replay.resolve_replay_options(args)
+    _require_dataset_placement(args)
     if getattr(args, "no_cache", False) or getattr(args, "refresh_cache", False):
         return None
     loaded = replay.load_episode_states(args)
     key, _ = episode_identity(args, loaded)
+    observer = getattr(args, "_placement_score", None)
+    if observer is not None:
+        observer.configure_frames(len(loaded[0]))
+        observer.identity_key = key
     cached, failure = EpisodeSolveCache(cache_directory(args)).load(key)
     if failure is not None:
         report(args, "cache_hit")
@@ -447,7 +470,21 @@ def prepare_episode(
 
     report(args, "读取数据与缓存查找")
     replay.resolve_replay_options(args)
+    _require_dataset_placement(args)
     if getattr(args, "no_cache", False):
+        if getattr(args, "base_placement", None) == "dataset-xy-yaw":
+            run_args = argparse.Namespace(**vars(args))
+            run_args.strict_ik = False
+            loaded = replay.load_episode_states(args)
+            key, identity = episode_identity(args, loaded)
+            observer = getattr(args, "_placement_score", None)
+            if observer is not None:
+                observer.configure_frames(len(loaded[0]))
+                observer.identity_key = key
+            run_args._episode_loaded = loaded
+            if runtime_provider is not None:
+                run_args._episode_runtime = runtime_provider(args, identity)
+            return _finish_rollout(args, replay.solve_episode(run_args))
         if runtime_provider is not None:
             loaded = replay.load_episode_states(args)
             _, identity = episode_identity(args, loaded)
@@ -457,7 +494,12 @@ def prepare_episode(
             return replay.solve_episode(run_args)
         return replay.solve_episode(args)
     loaded = replay.load_episode_states(args)
+    observer = getattr(args, "_placement_score", None)
+    if observer is not None:
+        observer.configure_frames(len(loaded[0]))
     key, identity = episode_identity(args, loaded)
+    if observer is not None:
+        observer.identity_key = key
     cache = EpisodeSolveCache(cache_directory(args))
     cached, failure = (
         (None, None) if getattr(args, "refresh_cache", False) else cache.load(key)

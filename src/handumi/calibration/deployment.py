@@ -1,7 +1,8 @@
-"""Resolve target robot/table calibrations without coupling them to raw data."""
+"""解析机器人与桌面标定，并允许调用方在缺少仿真布局时提供估计结果。"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -139,8 +140,12 @@ def resolve_deployment_calibration(
     profile: str = "auto",
     rig_config: Path = DEFAULT_RIG_CONFIG,
     identity_fallback: bool = False,
+    simulation_fallback: Callable[[], DeploymentCalibration] | None = None,
 ) -> DeploymentCalibration:
-    """Resolve explicit, lab-local, then canonical simulation placement."""
+    """优先显式和本地标定；标准仿真文件缺失时可调用估计回调。
+
+    回调仅处理未定义的仿真布局；显式路径、local 要求及无效文件仍严格校验。
+    """
     if profile not in {"auto", "local", "sim"}:
         raise ValueError(f"Unsupported deployment profile {profile!r}.")
     if explicit_path is not None:
@@ -202,8 +207,11 @@ def resolve_deployment_calibration(
                 "from configs/calibration/table/local/example.yaml, or configure "
                 f"deployment.table_calibrations.{robot} in {rig_config}."
             )
+    simulation_path = simulation_calibration_path(robot)  # 标准仿真布局的位置。
+    if not simulation_path.exists() and simulation_fallback is not None:
+        return simulation_fallback()
     return load_deployment_calibration(
-        simulation_calibration_path(robot),
+        simulation_path,
         expected_robot=robot,
         profile="sim",
     )

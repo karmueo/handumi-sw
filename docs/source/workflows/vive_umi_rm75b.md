@@ -272,27 +272,75 @@ Rerun 的四个面板分别显示相机、三维位姿、夹爪开度和采集�
 
 ## 6. 数据检查和仿真
 
+先检查原始录制数据：
+
 ```bash
 handumi validate outputs/umi-demo
-handumi replay outputs/umi-demo --robot rm75b --retarget-mode local-relative --strict-ik
-handumi dataset qa outputs/umi-demo --robot rm75b --deployment-profile sim
-handumi convert outputs/umi-demo --robot rm75b --retarget-mode local-relative --output outputs/umi-joints
-handumi replay-joints outputs/umi-joints --robot rm75b
 ```
 
-如需无窗口预先准备全部 episode，可运行：
+首次为整个数据集计算共享 base 位置和朝向，并无窗口验证全部 episode：
 
 ```bash
 handumi replay outputs/umi-demo --robot rm75b \
-  --retarget-mode absolute-tcp --strict-ik --headless --prepare-mode all
+  --deployment-profile sim --retarget-mode absolute-tcp \
+  --base-placement dataset-xy-yaw \
+  --strict-ik --headless --prepare-mode all
 ```
+
+该搜索为所有 episode 选择同一个固定布局，搜索水平位置和绕桌面法向的朝向，
+保留参考布局的高度和倾斜。缺少参考仿真布局时，按 base 与桌面等高且竖直开始搜索。
+至少一段完整通过后，布局保存至
+`outputs/umi-demo/.handumi/base_placement/rm75b.yaml`，搜索及批次评估详情保存在同目录 JSON。
+仍需检查最终批次结果；只有全部选中段通过时，批量命令才成功退出。
+保存的是未经实测验证的仿真布局，不能直接作为实体安装标定。
+
+后续 QA、回放和转换默认复用这份共享布局，并统一采用 `absolute-tcp`、
+`dataset-xy-yaw` 及对应的误差门槛。完整检查与转换可依次运行：
+
+```bash
+handumi dataset qa outputs/umi-demo --robot rm75b \
+  --deployment-profile sim --skip-direction --skip-validate
+
+handumi convert outputs/umi-demo --robot rm75b \
+  --deployment-profile sim --output outputs/umi-joints
+
+handumi replay-joints outputs/umi-joints --robot rm75b
+```
+
+这里 `--skip-validate` 复用第一步生成的录制质量报告，采集数据变化后应重新检查，
+或移除此参数。`--skip-direction` 用于没有固定工作台摄像头的数据集；
+若录制了工作台画面且至少有三个 episode，可移除此参数以检查示范方向。
+QA 汇总报告位于 `outputs/umi-demo/meta/handumi_analysis.md`，
+通过后再转换为关节数据集。
+
+转换会复用配置匹配的轨迹缓存；未命中缓存的段默认最多使用 8 个进程并行求解，
+实际进程数受待求解段数和 CPU 数限制。使用 `--jobs 1` 可串行求解，
+也可用 `--jobs N` 指定最大进程数。输出数据集由主进程按顺序写入。
+输出的 `outputs/umi-joints/meta/info.json`
+在 `handumi.deployment_calibration` 中记录布局来源和 `robot_from_table_pose7`，
+在 `handumi.ik_fidelity` 中记录各段的 base 位姿、双向坐标变换及 IK 误差。
+因此可以追溯关节数据使用的机器人摆放和求解配置。
+
+共享文件存在时，下面的回放命令也会自动复用它，无需再次指定搜索策略：
+
+```bash
+handumi replay outputs/umi-demo --robot rm75b \
+  --deployment-profile sim --retarget-mode absolute-tcp \
+  --strict-ik --headless --prepare-mode all
+```
+
+共享文件缺失时，这条省略 `--base-placement` 的命令不会启动全数据集共享布局搜索；
+首次计算应使用上面的 `--base-placement dataset-xy-yaw` 命令。
+如需重估已保存的 base，在首次搜索命令中添加 `--refresh-base-placement`；
+`--refresh-cache` 仅重新计算轨迹，不重新搜索 base。
 
 默认最多使用 8 个并行准备进程；可通过 `--prepare-workers` 根据 CPU 和内存调整。
 准备结果会写入缓存，相同输入和求解配置下再次运行时可复用。
 
 RM75B 绝对 TCP 回放使用覆盖夹爪主体与两指整个开合行程的单个包围盒，检查其与
 非邻接机械臂连杆的间距，安全间距为 1 mm。该检查不包含机械臂连杆之间的碰撞。
-模式默认从每段首帧直接开始，TCP 最大位置误差为 20 mm、最大旋转误差为 10°；如需
+模式默认从每段首帧直接开始，首帧位置容差和逐帧 TCP 位置误差上限均为 5 mm、
+逐帧旋转误差上限为 5°；如需
 从 home 接近首帧，可显式指定 `--approach-seconds 1`。检查覆盖每帧、
 相邻帧之间的关节插值和启用的 home 接近轨迹；无法满足间距或 TCP 误差阈值的
 片段会被拒绝，批量模式继续准备其余片段并最终返回失败状态。关键帧之间在
@@ -321,16 +369,24 @@ JAX_PLATFORMS=cpu python -m handumi.robots.mesh_surface_audit
 该审计需要 `rtree` 和 `sim` 可选依赖中的 PyVista/VTK；运行不足以证明表面安全时
 返回失败，不将未证明当成碰撞结论。VTK 用于上述独立审计的上界见证。
 
-质量检查不通过时，先按报告重录或使用现有筛选流程。默认从 `[0,20,0,70,0,90,90]°` 开始，以 1∶1 相对运动映射至 Link7。查看目标/实际轨迹、IK 误差、开度百分比和曲线。夹指随录制开度开合：开度 1 为 CAD 全开，0 为两指各向内最大平移 18.134 mm，左指沿 −X、右指沿 +X。模型按 STL 整体 X 边界在闭合后保留约 0.2 mm 间隙；夹指弯曲，实际指尖间隙可能更大，该近似不是实物净宽。机械臂命令和转换数据的训练语义仍为七轴；转换结果不新增米制夹爪宽度列，开度保存在独立的 normalized 辅助列，`replay-joints` 在存在该列时逐帧恢复双指，旧七列数据仍可加载并保持 home 夹指姿态。夹爪沿法兰 +Z 的 6 mm 装配偏移不代表抓取 TCP，TCP 仍需单独标定。
+质量检查不通过时，先核对模式、布局和标定，再根据报告决定数据取舍。显式指定
+`--retarget-mode local-relative` 时，每段以模型 HOME 姿态
+`[0,20,0,70,0,90,90]°` 为起点，以 1∶1 相对运动映射至 Link7；
+这会切换到另一套轨迹，已有 `absolute-tcp` 的 QA 通过结果不覆盖该模式。
+查看目标/实际轨迹、IK 误差、开度百分比和曲线。夹指随录制开度开合：开度 1 为 CAD 全开，0 为两指各向内最大平移 18.134 mm，左指沿 −X、右指沿 +X。模型按 STL 整体 X 边界在闭合后保留约 0.2 mm 间隙；夹指弯曲，实际指尖间隙可能更大，该近似不是实物净宽。机械臂命令和转换数据的训练语义仍为七轴；转换结果不新增米制夹爪宽度列，开度保存在独立的 normalized 辅助列，`replay-joints` 在存在该列时逐帧恢复双指，旧七列数据仍可加载并保持 home 夹指姿态。夹爪沿法兰 +Z 的 6 mm 装配偏移不代表抓取 TCP，TCP 仍需单独标定。
 
 原始数据仍是 16 维，未采集左侧中立填充，净宽槽位为零占位。新版 `synchronized_sources_v2` 和 `width_available=false` 表明没有米制净宽。读取器必须使用 `observation.gripper.right.normalized`，禁止将零占位解释为实测闭合；要求米制净宽的转换会拒绝该数据。
 
 `observation.state` 保存桌面坐标系中的 Tracker 锚点位姿，工具 TCP 偏移仍由
 后续流程应用一次；原始 OpenVR 位姿、桌面 TCP 位姿与桌面变换保存在 tracking 列。数据集的
 `tracking_workspace=table` 和 `umi_table_session` 保存参考系及完整桌面快照。
-回放/转换的 `auto` 模式因此选择 `absolute-table`，需要目标机器人的
-`robot_from_table` 配置；上方命令显式使用 `local-relative` 演示相对运动回放。
-桌面标定不包含机器人与桌面的安装关系。
+桌面标定不包含机器人与桌面的安装关系，后者由部署标定或计算得到的共享 base 布局确定。
+存在上述共享布局时，QA、回放和转换的默认模式统一为 `absolute-tcp`；
+显式指定其他重定向模式、布局或标定文件时按用户设置执行。
+使用 `auto` 部署配置时，本地实体部署标定保持优先。
+没有共享布局时，桌面数据的 `auto` 模式沿用 `absolute-table`；
+标准仿真部署配置也缺失时会提示并进行粗略布局估计。
+要得到经过完整轨迹验证的共享布局，应先运行本节的首次搜索命令。
 
 ## 7. 实机验收
 

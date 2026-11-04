@@ -191,6 +191,62 @@ def test_cache_identity_is_per_episode_and_tracks_geometry(tmp_path, monkeypatch
     assert prepare.episode_identity(args, tuple(loaded))[0] != first
 
 
+def test_dataset_placement_cache_identity_tracks_pose_and_source(tmp_path, monkeypatch):
+    """数据集共享位姿的平移、朝向及标定来源均进入逐段缓存身份。"""
+    from dataclasses import replace
+
+    from handumi.calibration.deployment import DeploymentCalibration
+
+    args, loaded, _ = _args_and_loaded(tmp_path, monkeypatch)
+    args.base_placement = "dataset-xy-yaw"
+    args.deployment_selection = DeploymentCalibration(
+        robot="rm75b", pose7=np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32),
+        path=None, scope="simulation", source="dataset_xy_yaw_search",
+        verified=False, profile="dataset-xy-yaw", lab=None,
+    )
+    original, _ = prepare.episode_identity(args, tuple(loaded))
+    pose = args.deployment_selection.pose7.copy()
+    pose[0] = 0.1
+    args.deployment_selection = replace(args.deployment_selection, pose7=pose)
+    moved, _ = prepare.episode_identity(args, tuple(loaded))
+    assert moved != original
+    args.deployment_selection = replace(args.deployment_selection, source="other-generation")
+    assert prepare.episode_identity(args, tuple(loaded))[0] != moved
+
+
+def test_dataset_negative_cache_keeps_frame_count_and_first_frame(tmp_path, monkeypatch):
+    """冷求解与确定性失败缓存均报告完整帧数、首帧失败及实际身份。"""
+    from handumi.calibration.deployment import DeploymentCalibration
+    from handumi.scripts.replay.replay_dataset_placement import PrefixObserver
+
+    args, loaded, _ = _args_and_loaded(tmp_path, monkeypatch)
+    args.base_placement = "dataset-xy-yaw"
+    args.deployment_selection = DeploymentCalibration(
+        robot="rm75b", pose7=np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32),
+        path=None, scope="simulation", source="test", verified=False,
+        profile="dataset-xy-yaw", lab=None,
+    )
+    calls = []
+
+    def fail(trial):
+        """模拟首帧初始化失败。"""
+        calls.append(1)
+        raise SystemExit("Unable to prepare replay start pose: unreachable")
+
+    monkeypatch.setattr(replay, "solve_episode", fail)
+    identities = []
+    for _ in range(2):
+        observer = PrefixObserver()
+        args._placement_score = observer
+        with pytest.raises(SystemExit, match="Unable to prepare replay start pose"):
+            prepare.prepare_episode(args)
+        assert observer.prefix == 0 and observer.total_frames == len(loaded[0])
+        assert observer.current_frame == 0
+        assert observer.identity_key is not None
+        identities.append(observer.identity_key)
+    assert len(calls) == 1 and identities[0] == identities[1]
+
+
 def test_atomic_cache_damage_and_write_failure(tmp_path, monkeypatch):
     """截断当作 miss；替换失败不能破坏已存在的完整文件。"""
     cache = EpisodeSolveCache(tmp_path)

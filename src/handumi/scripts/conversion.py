@@ -290,7 +290,7 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
         default="commanded",
         help=advanced("For local-relative mode, compose on previous target or achieved FK."),
     )
-    ik.add_argument("--base-placement", choices=("auto", "fixed", "episode-xy"), default="auto")
+    ik.add_argument("--base-placement", choices=("auto", "fixed", "episode-xy", "dataset-xy-yaw"), default="auto")
     ik.add_argument(
         "--translation-scale",
         type=float,
@@ -529,18 +529,29 @@ def _resolve_retarget_mode(
         )
 
     if args.retarget_mode in {"absolute-table", "absolute-tcp"}:
+        from handumi.scripts.replay.replay_deployment import estimate_dataset_deployment
+
+        def estimate_deployment():
+            """使用同一数据集与输入标定估计转换所需的仿真布局。"""
+            trial = argparse.Namespace(**vars(args))
+            trial.robot = args.embodiment
+            trial.dataset_root = args.root
+            return estimate_dataset_deployment(trial)
+
         try:
-            selection = resolve_deployment_calibration(
+            selection = getattr(args, "deployment_selection", None) or resolve_deployment_calibration(
                 args.embodiment,
                 explicit_path=args.deployment_calibration,
                 profile=args.deployment_profile,
                 rig_config=args.rig_config,
                 identity_fallback=args.retarget_mode == "absolute-tcp",
+                simulation_fallback=estimate_deployment,
             )
         except SystemExit as exc:
             parser.error(str(exc))
         args.deployment_selection = selection
-        args.deployment_calibration = selection.path
+        if args.base_placement != "dataset-xy-yaw":
+            args.deployment_calibration = selection.path
         print_deployment_calibration(selection, prefix="[convert]")
         if args.retarget_mode == "absolute-tcp":
             from handumi.calibration.robot_tcp import load_robot_tcp_calibration
@@ -1463,7 +1474,6 @@ def main() -> None:
         parser.print_help()
         return
     args = parser.parse_args(raw_argv)
-    _resolve_cli_profile(parser, args)
     args.ik_reports = []
 
     if args.left_only and args.right_only:
@@ -1479,6 +1489,10 @@ def main() -> None:
         parser.error(str(exc))
     args.repo_id = selection.repo_id
     args.root = selection.root
+    from handumi.scripts.replay.replay_deployment import select_saved_dataset_placement
+
+    select_saved_dataset_placement(args, allow_explicit=True)
+    _resolve_cli_profile(parser, args)
 
     # ------------------------------------------------------------------
     # Resolve paths and names
@@ -1527,6 +1541,8 @@ def main() -> None:
         f"  Output: {output_root} ({output_repo_id})\n"
         f"  Robot profile: {args.embodiment}\n"
         f"  Retargeting: {args.retarget_mode}\n"
+        f"  Base placement: {args.base_placement}\n"
+        f"  Placement file: {getattr(getattr(args, 'deployment_selection', None), 'path', None) or args.deployment_calibration or 'automatic'}\n"
         f"  Episodes: {args.episodes or 'all'}\n"
         f"  Output layout: {'canonical (radians + meters)' if output_layout is None else output_layout.robot_type + (' (use_degrees)' if output_layout.use_degrees and output_layout.degrees_option == 'optional' else '')}"
     )

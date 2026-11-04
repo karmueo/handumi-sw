@@ -200,20 +200,45 @@ def _worker_prepare(
     captured = _WarningCapture()
     progress = WorkerProgress(episode, _PROGRESS_EVENTS)
     args._replay_progress = progress
+    observer = None
+    if getattr(args, "base_placement", None) == "dataset-xy-yaw":
+        from handumi.scripts.replay.replay_dataset_placement import PrefixObserver
+
+        observer = PrefixObserver()
+        args._placement_score = observer
     stderr_capture = _BoundedStderr() if values.get("_batch_compact") else None
     stderr_context = stderr_capture if stderr_capture is not None else contextlib.nullcontext()
     try:
         with contextlib.redirect_stdout(captured), stderr_context:
             rollout = prepare_episode(args, runtime_provider=_runtime_for)
         response = {"warnings": captured.warnings, **progress.finish()}
+        if observer is not None:
+            import numpy as np
+
+            response["placement_metrics"] = {
+                "prefix_frames": observer.prefix,
+                "total_frames": observer.total_frames,
+                "solve_identity": observer.identity_key,
+                "first_failed_frame": observer.failed_frame,
+                "max_position_error_m": float(max(np.max(rollout["left_pos_error_m"]), np.max(rollout["right_pos_error_m"]))),
+                "max_rotation_error_deg": float(max(np.max(rollout["left_rot_error_deg"]), np.max(rollout["right_rot_error_deg"]))),
+            }
         if stderr_capture is not None:
             response["logs"] = stderr_capture.text()
         if not values.get("_batch_compact") or episode == values.get("_batch_current"):
             response["rollout"] = rollout
         return response
     except (Exception, SystemExit) as exc:
-        return {"error": str(exc), "logs": stderr_capture.text() if stderr_capture else "",
-                **progress.finish()}
+        result = {"error": str(exc), "logs": stderr_capture.text() if stderr_capture else "",
+                  **progress.finish()}
+        if observer is not None:
+            result["placement_metrics"] = {
+                "prefix_frames": observer.prefix,
+                "total_frames": observer.total_frames,
+                "solve_identity": observer.identity_key,
+                "first_failed_frame": (observer.failed_frame if observer.failed_frame is not None else observer.current_frame),
+            }
+        return result
 
 
 class EpisodeScheduler:
@@ -261,6 +286,7 @@ class EpisodeScheduler:
         self.failures: dict[int, str] = {}
         self.cache_hits = 0
         self.stage_seconds: dict[str, float] = {}
+        self.placement_metrics: dict[int, dict] = {}
         self.warning_sink = print
         self.warnings: dict[int, list[str]] = {}
         self.results: OrderedDict[int, dict[str, Any]] = OrderedDict()
@@ -294,6 +320,8 @@ class EpisodeScheduler:
             except Exception as exc:
                 response = {"error": f"worker failed: {exc}"}
             self.cache_hits += int(response.get("cache_hit", False))
+            if "placement_metrics" in response:
+                self.placement_metrics[episode] = response["placement_metrics"]
             for stage, seconds in response.get("stage_seconds", {}).items():
                 self.stage_seconds[stage] = self.stage_seconds.get(stage, 0.0) + seconds
             if response.get("logs"):

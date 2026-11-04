@@ -731,6 +731,32 @@ def test_tool_matrix_validation_and_cache_digest(tmp_path):
         load_robot_tcp_calibration("rm75b", arms, explicit_path=path)
 
 
+@pytest.mark.parametrize("placement", ["auto", "dataset-xy-yaw"])
+def test_rm75b_absolute_tcp_restores_precise_defaults(placement):
+    """逐段与共享底座使用相同的 5 mm/5° 默认值，显式参数始终优先。"""
+    parser = replay.build_parser()
+    options = ["unused", "--robot", "rm75b", "--retarget-mode", "absolute-tcp",
+               "--base-placement", placement, "--strict-ik", "--headless", "--prepare-mode", "all"]
+    args = parser.parse_args(options)
+    replay.resolve_replay_options(args)
+    assert (args.initial_position_tolerance_m, args.max_ik_position_error_m,
+            args.max_ik_rotation_error_deg) == (0.005, 0.005, 5.0)
+    explicit = parser.parse_args(options + ["--initial-position-tolerance-m", "0.012",
+        "--max-ik-position-error-m", "0.015", "--max-ik-rotation-error-deg", "8"])
+    replay.resolve_replay_options(explicit)
+    assert (explicit.initial_position_tolerance_m, explicit.max_ik_position_error_m,
+            explicit.max_ik_rotation_error_deg) == (0.012, 0.015, 8.0)
+
+
+@pytest.mark.parametrize("mode", ["local-relative", "anchored", "absolute-table"])
+def test_rm75b_other_retarget_defaults_are_unchanged(mode):
+    """其他重定向模式保留原先的首帧、位置与姿态容差。"""
+    args = replay.build_parser().parse_args(["unused", "--robot", "rm75b", "--retarget-mode", mode])
+    replay.resolve_replay_options(args)
+    assert (args.initial_position_tolerance_m, args.max_ik_position_error_m,
+            args.max_ik_rotation_error_deg) == (0.01, 0.03, 45.0)
+
+
 def test_identity_fallback_and_option_defaults(tmp_path):
     """仅新模式在缺失桌面标定时采用有来源标记的单位变换。"""
     placement = resolve_deployment_calibration(

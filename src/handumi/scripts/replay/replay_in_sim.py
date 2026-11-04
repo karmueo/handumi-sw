@@ -145,8 +145,16 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--base-placement", choices=("auto", "fixed", "episode-xy"), default="auto",
+        "--base-placement", choices=("auto", "fixed", "episode-xy", "dataset-xy-yaw"), default="auto",
         help="Select fixed placement or per-episode virtual XY placement for absolute-tcp.",
+    )
+    parser.add_argument(
+        "--refresh-base-placement", action="store_true",
+        help="Search for a new dataset-wide base placement even when one is saved.",
+    )
+    parser.add_argument(
+        "--placement-search-candidates", type=int, default=8,
+        help=advanced("Maximum number of dataset-wide candidates fully validated."),
     )
     parser.add_argument(
         "--translation-scale",
@@ -338,11 +346,25 @@ def build_parser(*, show_advanced: bool = False) -> argparse.ArgumentParser:
 def resolve_replay_options(args: argparse.Namespace) -> None:
     """补全按模式区分的默认值，并拒绝与绝对 TCP 朝向冲突的设置。"""
     absolute_tcp = args.retarget_mode == "absolute-tcp"
+    robot = getattr(args, "robot", None) or getattr(args, "embodiment", None)  # 回放与转换共用的目标机器人。
     if getattr(args, "approach_seconds", None) is None:
         # RM75B 绝对 TCP 回放直接从首帧摆放，其他模式保留原接近轨迹。
-        args.approach_seconds = 0.0 if absolute_tcp and getattr(args, "robot", None) == "rm75b" else 1.0
-    if getattr(args, "base_placement", "auto") == "episode-xy" and not absolute_tcp:
-        raise SystemExit("--base-placement episode-xy requires --retarget-mode absolute-tcp.")
+        args.approach_seconds = 0.0 if absolute_tcp and robot == "rm75b" else 1.0
+    policy = getattr(args, "base_placement", "auto")
+    if policy in {"episode-xy", "dataset-xy-yaw"} and not absolute_tcp:
+        raise SystemExit(f"--base-placement {policy} requires --retarget-mode absolute-tcp.")
+    if policy == "dataset-xy-yaw":
+        if robot != "rm75b":
+            raise SystemExit("--base-placement dataset-xy-yaw currently requires --robot rm75b.")
+        if (getattr(args, "start_frame", 0) != 0 or getattr(args, "max_frames", None) is not None
+                or getattr(args, "stride", 1) != 1 or getattr(args, "only_manipulation", False)):
+            raise SystemExit("dataset-xy-yaw requires all original frames; frame selection and --only-manipulation are not supported.")
+        if getattr(args, "deployment_calibration", None) is not None:
+            raise SystemExit("dataset-xy-yaw cannot be combined with --deployment-calibration; use --base-placement fixed to load a calibration.")
+        if getattr(args, "placement_search_candidates", 8) < 1:
+            raise SystemExit("--placement-search-candidates must be >= 1.")
+    elif getattr(args, "refresh_base_placement", False):
+        raise SystemExit("--refresh-base-placement requires --base-placement dataset-xy-yaw.")
     orientation = getattr(args, "absolute_orientation", None)
     if absolute_tcp and orientation == "relative-start":
         raise SystemExit("absolute-tcp requires table-absolute orientation; relative-start conflicts.")
@@ -354,11 +376,7 @@ def resolve_replay_options(args: argparse.Namespace) -> None:
         ("max_ik_rotation_error_deg", 5.0, 45.0),
     ):
         if getattr(args, name, None) is None:
-            if absolute_tcp and getattr(args, "robot", None) == "rm75b":
-                # 快速回放允许更宽的 TCP 误差，显式参数仍优先。
-                value = 10.0 if name == "max_ik_rotation_error_deg" else 0.02
-            else:
-                value = new_default if absolute_tcp else old_default
+            value = new_default if absolute_tcp else old_default
             setattr(args, name, value)
         if absolute_tcp and (not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0):
             raise SystemExit(f"{name} must be finite and greater than zero.")
@@ -855,7 +873,9 @@ def solve_episode(args: argparse.Namespace) -> dict[str, np.ndarray]:
 
     resolve_replay_options(args)
     policy = getattr(args, "base_placement", "auto")
-    if args.retarget_mode != "absolute-tcp" or policy == "fixed":
+    if policy == "dataset-xy-yaw" and getattr(args, "deployment_selection", None) is None:
+        raise SystemExit("Dataset-wide base placement has not been resolved.")
+    if args.retarget_mode != "absolute-tcp" or policy in {"fixed", "dataset-xy-yaw"}:
         return _solve_episode_fixed(argparse.Namespace(**vars(args)))
 
     attempt = argparse.Namespace(**vars(args))
@@ -1147,6 +1167,9 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
         frame_indices = frame_indices[: args.max_frames]
     if not frame_indices:
         raise ValueError("No frames selected for replay.")
+    placement_score = getattr(args, "_placement_score", None)
+    if placement_score is not None:
+        placement_score.configure_frames(len(frame_indices), int(frame_indices[0]))
     if source_metadata.get("tracking_workspace") == "table" and tcp_diagnostics:
         minimum_tcp_z = min(float(tcp_diagnostics["workspace_min_z_m"][i])
                            for i, side in enumerate(("left", "right")) if side in runtime.arms)
@@ -1261,12 +1284,17 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
         deployment_calibration = (getattr(args, "_placement_override", None)
                                   or getattr(args, "deployment_selection", None))
         if deployment_calibration is None:
+            from handumi.scripts.replay.replay_deployment import (
+                estimate_dataset_deployment,
+            )
+
             deployment_calibration = resolve_deployment_calibration(
                 args.robot,
                 explicit_path=args.deployment_calibration,
                 profile=args.deployment_profile,
                 rig_config=args.rig_config,
                 identity_fallback=retarget_mode == "absolute-tcp",
+                simulation_fallback=lambda: estimate_dataset_deployment(args),
             )
         robot_from_table = deployment_calibration.pose7
         print_deployment_calibration(deployment_calibration)
@@ -1292,7 +1320,12 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
                     "runtime": runtime, "tool": robot_tcp, "deployment": deployment_calibration,
                     "targets": {"left": source_left, "right": source_right},
                     "locked": locked_joint_indices,
+                    "states_for_retarget": states_for_retarget,
+                    "gripper_openings": gripper_openings,
+                    "collision_checker": collision_checker,
                 })
+                if getattr(args, "_dataset_placement_context_only", False):
+                    raise _PlacementContextReady
                 if (getattr(args, "_placement_context_only", False)
                         and getattr(args, "deployment_selection", None) is None
                         and getattr(args, "deployment_calibration", None) is None
@@ -1405,6 +1438,9 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
     keyframe_end = -1
     keyframe_q = None
     for selected_index, frame_index in enumerate(frame_indices):
+        placement_score = getattr(args, "_placement_score", None)
+        if placement_score is not None:
+            placement_score.start_frame(int(frame_index), len(frame_indices))
         report(args, "逐帧求解", current=selected_index, total=len(frame_indices),
                candidate=getattr(args, "_placement_candidate", None))
         previous_q = q.copy()
@@ -1613,6 +1649,18 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
                         )
         if robot_tcp is not None:
             _require_finite_frame(frame_index, "output joint", q)
+        placement_score = getattr(args, "_placement_score", None)
+        if placement_score is not None:
+            frame_errors = pose_error_arrays(
+                left_pose7[None], right_pose7[None],
+                fk_left_pose7[None], fk_right_pose7[None],
+            )
+            within = all(
+                float(frame_errors[f"{side}_pos_error_m"][0]) <= args.max_ik_position_error_m
+                and float(frame_errors[f"{side}_rot_error_deg"][0]) <= args.max_ik_rotation_error_deg
+                for side in runtime.arms
+            )
+            placement_score.frame_checked(int(frame_index), within)
         qs.append(q.copy())
         raw_left_gt.append(raw_left)
         raw_right_gt.append(raw_right)
@@ -1834,7 +1882,7 @@ def _solve_episode_fixed(args: argparse.Namespace) -> dict[str, np.ndarray]:
         "table_from_robot_pose7": np.asarray(
             [pose_inv(robot_from_table)] if robot_from_table is not None else [], dtype=np.float32,
         ),
-        "base_placement_policy": np.asarray(["fixed"]),
+        "base_placement_policy": np.asarray(["dataset-xy-yaw" if getattr(args, "base_placement", "auto") == "dataset-xy-yaw" else "fixed"]),
         "base_placement_scope": np.asarray([deployment_calibration.scope if deployment_calibration is not None else ""]),
         "base_placement_verified": np.asarray([deployment_calibration.verified if deployment_calibration is not None else False]),
         "base_placement_diagnostics_json": np.asarray([""]),
@@ -2144,6 +2192,9 @@ def _prepare_all_episodes(args: argparse.Namespace, *, initial_failure: str | No
             for episode, message in sorted(scheduler.failures.items()):
                 print(f"[replay] episode {episode} failed: {message}")
         failures = dict(scheduler.failures)
+        if getattr(args, "base_placement", None) == "dataset-xy-yaw":
+            args._dataset_evaluation_results.update(getattr(scheduler, "placement_metrics", {}))
+            args._dataset_stage_seconds = dict(getattr(scheduler, "stage_seconds", {}))
     finally:
         scheduler.close()
     # 本轮已经刷新完成，后续切换按内容键读取刚写入的结果。
@@ -2188,6 +2239,10 @@ def _prepare_all_headless(args: argparse.Namespace) -> tuple[dict | None, dict[i
             )
             print(f"[replay] worker stage time (sum across workers): {totals}")
         print(f"[replay] total preparation wall time: {time.monotonic() - started:.2f}s")
+        if getattr(args, "base_placement", None) == "dataset-xy-yaw":
+            args._dataset_evaluation_results = dict(getattr(scheduler, "placement_metrics", {}))
+            args._dataset_stage_seconds = dict(getattr(scheduler, "stage_seconds", {}))
+            args._dataset_wall_seconds = time.monotonic() - started
         rollout = None if args.episode in scheduler.failures else scheduler.take(args.episode)
         return rollout, dict(scheduler.failures)
     finally:
@@ -2460,7 +2515,6 @@ def main() -> None:
         parser.print_help()
         return
     args = parser.parse_args(raw_argv)
-    resolve_replay_options(args)
     try:
         selection = resolve_dataset_selection(
             args.dataset,
@@ -2470,6 +2524,10 @@ def main() -> None:
         parser.error(str(exc))
     args.repo_id = selection.repo_id
     args.dataset_root = selection.root
+    from handumi.scripts.replay.replay_deployment import select_saved_dataset_placement
+
+    select_saved_dataset_placement(args)
+    resolve_replay_options(args)
     print(
         "Replay plan\n"
         f"  Dataset: {selection.root}\n"
@@ -2477,6 +2535,8 @@ def main() -> None:
         f"  Episode: {args.episode}\n"
         f"  Robot profile: {args.robot}\n"
         f"  Retargeting: {args.retarget_mode}\n"
+        f"  Base placement: {args.base_placement}\n"
+        f"  Placement file: {getattr(getattr(args, 'deployment_selection', None), 'path', None) or args.deployment_calibration or 'automatic'}\n"
         f"  Deployment profile: {args.deployment_profile}"
     )
     if args.dry_run:
@@ -2501,8 +2561,22 @@ def main() -> None:
         raise ValueError("--table-clearance-warning-m must be > 0.")
     from handumi.scripts.replay.replay_prepare import prepare_episode
 
+    dataset_placement = args.base_placement == "dataset-xy-yaw"
+    if dataset_placement:
+        from handumi.scripts.replay.replay_dataset_placement import (
+            PrefixObserver,
+            resolve_dataset_placement,
+            write_evaluation_report,
+        )
+
+        args.strict_ik = True
+        args.deployment_selection = resolve_dataset_placement(args)
+        args._dataset_evaluation_results = {}
+
     if args.headless and args.prepare_mode == "all":
         rollout, failures = _prepare_all_headless(args)
+        if dataset_placement:
+            write_evaluation_report(args, failures)
         if failures:
             raise SystemExit(f"Preparation failed for {len(failures)} episode(s).")
         if rollout is None:
@@ -2511,16 +2585,38 @@ def main() -> None:
         return
 
     initial_failure = None
+    if dataset_placement:
+        args._placement_score = PrefixObserver()
     try:
         rollout = prepare_episode(args)
     except (Exception, SystemExit) as exc:
+        if dataset_placement:
+            observer = args._placement_score
+            args._dataset_evaluation_results[args.episode] = {
+                "prefix_frames": observer.prefix, "total_frames": observer.total_frames,
+                "solve_identity": observer.identity_key,
+                "first_failed_frame": (observer.failed_frame if observer.failed_frame is not None else observer.current_frame),
+            }
         if args.prepare_mode != "all":
+            if dataset_placement:
+                write_evaluation_report(args, {args.episode: str(exc)}, completed=[args.episode])
             raise
         initial_failure = str(exc)
         print(f"[replay] episode {args.episode} failed: {initial_failure}")
         rollout = None
+    if dataset_placement and rollout is not None:
+        observer = args._placement_score
+        args._dataset_evaluation_results[args.episode] = {
+            "prefix_frames": observer.prefix, "total_frames": observer.total_frames,
+            "solve_identity": observer.identity_key,
+            "first_failed_frame": observer.failed_frame,
+            "max_position_error_m": float(max(np.max(rollout["left_pos_error_m"]), np.max(rollout["right_pos_error_m"]))),
+            "max_rotation_error_deg": float(max(np.max(rollout["left_rot_error_deg"]), np.max(rollout["right_rot_error_deg"]))),
+        }
     if args.prepare_mode == "all":
         failures = _prepare_all_episodes(args, initial_failure=initial_failure)
+        if dataset_placement:
+            write_evaluation_report(args, failures)
         if args.headless and failures:
             raise SystemExit(f"Preparation failed for {len(failures)} episode(s).")
         if rollout is None and not args.headless:
@@ -2530,6 +2626,8 @@ def main() -> None:
                 raise SystemExit("No episode could be prepared.")
             args.episode = usable[0]
             rollout = prepare_episode(args)
+    elif dataset_placement:
+        write_evaluation_report(args, {}, completed=[args.episode])
     if rollout is not None:
         save_rollout(args, rollout)
     if not args.headless:

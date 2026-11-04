@@ -40,9 +40,9 @@ def test_rm75_absolute_tcp_defaults_to_direct_start() -> None:
     direct = parser.parse_args(["unused", "--robot", "rm75b", "--retarget-mode", "absolute-tcp"])
     replay.resolve_replay_options(direct)
     assert direct.approach_seconds == 0.0
-    assert direct.initial_position_tolerance_m == 0.02
-    assert direct.max_ik_position_error_m == 0.02
-    assert direct.max_ik_rotation_error_deg == 10.0
+    assert direct.initial_position_tolerance_m == 0.005
+    assert direct.max_ik_position_error_m == 0.005
+    assert direct.max_ik_rotation_error_deg == 5.0
     approach = parser.parse_args(["unused", "--robot", "rm75b", "--retarget-mode", "absolute-tcp", "--approach-seconds", "1"])
     replay.resolve_replay_options(approach)
     assert approach.approach_seconds == 1.0

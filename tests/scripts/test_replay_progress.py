@@ -12,8 +12,7 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
-from handumi.scripts.replay import replay_progress
-from handumi.scripts.replay import replay_scheduler
+from handumi.scripts.replay import replay_progress, replay_scheduler
 
 
 def _flood_worker():
@@ -112,3 +111,58 @@ def test_terminal_progress_translates_cache_and_closes_on_interrupt():
             raise KeyboardInterrupt()
     assert progress.live is not None and not progress.live.is_started
     assert "缓存命中" in stream.getvalue()
+
+
+@pytest.mark.parametrize("mode", ["auto", "on"])
+def test_dataset_progress_non_terminal_limits_repeated_updates(monkeypatch, mode):
+    """非交互终端在阶段切换时输出，并对频繁帧事件限频。"""
+    clock = [100.0]
+    monkeypatch.setattr(replay_progress.time, "monotonic", lambda: clock[0])
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None)
+    with replay_progress.DatasetPlacementProgress(mode, console=console) as display:
+        display.update("准备输入", 0, 2, detail="episode 1/2")
+        first = stream.getvalue()
+        assert "准备输入 0/2" in first
+        clock[0] += 1
+        display.update("准备输入", 1, 2, detail="episode 2/2")
+        assert stream.getvalue() == first
+        clock[0] += 5
+        display.update("准备输入", 2, 2)
+        display.update("生成候选", 0, 16, detail="朝向 1/8")
+        display.update("代表帧预筛", 0, 8, detail="候选 1/8", frame_current=2, frame_total=9)
+        display.update("完整轨迹验证", 1, 16, detail="候选 1/8 · episode 2/2",
+                       frame_current=3, frame_total=20)
+    output = stream.getvalue()
+    assert "准备输入 2/2" in output and "生成候选 0/16" in output
+    assert "代表帧预筛 0/8" in output and "帧 2/9" in output
+    assert "完整轨迹验证 1/16" in output and "帧 3/20" in output
+    assert "\x1b" not in output
+
+
+def test_dataset_progress_off_suppresses_all_status():
+    """关闭模式不会启动动态显示，也不会输出各阶段文本。"""
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=True, color_system=None)
+    with replay_progress.DatasetPlacementProgress("off", console=console) as display:
+        display.update("准备输入", 0, 2, force=True)
+        display.update("完整轨迹验证", 1, 8, frame_current=5, frame_total=10)
+    assert display.live is None and stream.getvalue() == ""
+
+
+def test_dataset_terminal_progress_closes_on_error_without_fake_completion():
+    """真实动态进度可展示当前帧，并在异常后关闭且保留真实完成量。"""
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=True, color_system=None)
+    display = replay_progress.DatasetPlacementProgress("on", console=console)
+    with pytest.raises(RuntimeError, match="failure"):
+        with display:
+            display.update("完整轨迹验证", 1, 8, detail="候选 2/8 · episode 1/2",
+                           frame_current=3, frame_total=10, force=True)
+            assert display.progress.tasks[display.task].completed == 1
+            assert display.progress.tasks[display.frame_task].completed == 3
+            raise RuntimeError("failure")
+    assert display.live is not None and not display.live.is_started
+    assert display.progress.tasks[display.task].completed == 1
+    assert "完整轨迹验证" in stream.getvalue()
+    assert "候选 2/8" in stream.getvalue()

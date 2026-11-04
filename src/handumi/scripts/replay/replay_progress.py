@@ -9,7 +9,13 @@ from collections import defaultdict
 
 from rich.console import Console, Group
 from rich.live import Live
-from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.text import Text
 
 
@@ -61,6 +67,82 @@ class WorkerProgress:
             self.stage = None
         return {"cache_hit": self.cache_hit, "elapsed": now - self.started,
                 "stage_seconds": dict(self.stage_seconds)}
+
+
+class DatasetPlacementProgress:
+    """展示共享底座估计的阶段、候选、episode 和当前帧进度。"""
+
+    def __init__(self, mode: str = "auto", *, console=None):
+        """创建进度条；非交互输出限频，关闭模式不发送进度。"""
+        self.mode = mode
+        self.console = console or Console(file=sys.stderr)
+        self.terminal = self.console.is_terminal and mode != "off"
+        self.started = time.monotonic()
+        self.last_print = self.started
+        self.last_render = 0.0
+        self.stage = None
+        self.state = None
+        self.progress = Progress(TextColumn("[progress.description]{task.description}"),
+                                 BarColumn(), TaskProgressColumn(), TimeElapsedColumn(),
+                                 console=self.console)
+        self.task = self.progress.add_task("底座估计", total=1)
+        self.frame_task = self.progress.add_task("当前帧", total=1, visible=False)
+        self.live = Live(console=self.console, refresh_per_second=5) if self.terminal else None
+
+    def __enter__(self):
+        """启动交互显示；非交互模式按事件输出文本。"""
+        if self.live:
+            self.live.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        """退出或中断时关闭显示，并保留实际进度。"""
+        if self.live:
+            self.live.stop()
+        elif self.mode != "off" and self.state is not None:
+            self._print_text(time.monotonic())
+
+    def _print_text(self, now: float) -> None:
+        """输出最近一次状态，不将尚未完成的工作标为完成。"""
+        stage, current, total, detail, frame_current, frame_total = self.state
+        frame = (f" 帧 {frame_current}/{frame_total}"
+                 if frame_current is not None and frame_total is not None else "")
+        suffix = f" {detail}" if detail else ""
+        self.console.print(
+            f"[replay] 底座估计 {stage} {current}/{total}{suffix}{frame} "
+            f"用时 {now - self.started:.1f}s", markup=False, highlight=False,
+        )
+        self.last_print = now
+
+    def update(self, stage: str, current: int, total: int, *, detail: str = "",
+               frame_current: int | None = None, frame_total: int | None = None,
+               force: bool = False) -> None:
+        """根据实际完成数量刷新阶段，并报告当前工作，不影响求解。"""
+        if self.mode == "off":
+            return
+        changed = stage != self.stage
+        self.stage = stage
+        self.state = (stage, current, total, detail, frame_current, frame_total)
+        now = time.monotonic()
+        if self.live:
+            if changed:
+                self.progress.reset(self.task, total=total, completed=current, description=stage)
+            else:
+                self.progress.update(self.task, total=total, completed=current)
+            if frame_current is not None and frame_total is not None:
+                previous = self.progress.tasks[self.frame_task]
+                if frame_current < previous.completed or frame_total != previous.total:
+                    self.progress.reset(self.frame_task, total=frame_total,
+                                        completed=frame_current, visible=True)
+                else:
+                    self.progress.update(self.frame_task, completed=frame_current, visible=True)
+            else:
+                self.progress.update(self.frame_task, visible=False)
+            if changed or force or now - self.last_render >= 0.2:
+                self.live.update(Group(self.progress, Text(detail)))
+                self.last_render = now
+        elif changed or force or now - self.last_print >= 5:
+            self._print_text(now)
 
 
 class BatchProgress:
