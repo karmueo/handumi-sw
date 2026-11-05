@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing as mp
 import os
+import queue
 import shutil
 import tempfile
+import time
+import traceback
 from pathlib import Path
 
 import cv2
@@ -19,6 +23,14 @@ from handumi.calibration.umi import transform
 from handumi.dataset.reader import load_raw_episode
 from handumi.dataset.selection import resolve_dataset_selection
 from handumi.dataset.writer import load_info
+from handumi.scripts._export_tcp_runtime import (
+    EpisodeReader,
+    OfflineStreamingEncoder,
+    encoder_config,
+    select_encoder,
+    split_episodes,
+    worker_threads,
+)
 
 # 输出元数据使用的缩放方式描述。
 IMAGE_PREPROCESSING = {
@@ -217,13 +229,20 @@ def write_episode(
     *,
     image_size: tuple[int, int] = (224, 224),
     resize_mode: str = "letterbox",
-) -> None:
+    reader: EpisodeReader | None = None,
+    decoder_threads: int | None = None,
+) -> dict[str, float]:
     """读取一个回合的同步位姿和视频，向输出写入同帧示教数据。"""
-    raw = load_raw_episode(root=source, repo_id=repo_id, episode=index)
-    state = relative_tcp(
-        raw.signals["observation.tracking.right_tcp_pose"],
-        raw.signals["observation.gripper.right.normalized"],
-    )
+    elapsed = {key: 0.0 for key in ("read", "decode", "resize", "feed", "save")}
+    start_time = time.perf_counter()
+    if reader is None:
+        raw = load_raw_episode(root=source, repo_id=repo_id, episode=index)
+        poses = raw.signals["observation.tracking.right_tcp_pose"]
+        gripper = raw.signals["observation.gripper.right.normalized"]
+    else:
+        poses, gripper = reader.read(index, int(row["length"]))
+    state = relative_tcp(poses, gripper)
+    elapsed["read"] += time.perf_counter() - start_time
     if len(state) != int(row["length"]):
         raise ValueError("TCP 帧数与回合元数据不一致")
     video_key = "observation.images.right_wrist"
@@ -237,7 +256,19 @@ def write_episode(
     end = round(float(row[prefix + "to_timestamp"]) * 30)
     if start < 0 or end - start != len(state):
         raise ValueError("视频时间区间与回合帧数不匹配")
-    cap = cv2.VideoCapture(str(video))
+    cap = None
+    if decoder_threads is not None and hasattr(cv2, "CAP_PROP_N_THREADS"):
+        try:
+            cap = cv2.VideoCapture(
+                str(video), cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, decoder_threads]
+            )
+        except (TypeError, cv2.error):
+            cap = None
+    if cap is not None and not cap.isOpened():
+        cap.release()
+        cap = None
+    if cap is None:
+        cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         cap.release()
         raise ValueError(f"无法打开视频 {video}")
@@ -247,12 +278,17 @@ def write_episode(
         if not cap.set(cv2.CAP_PROP_POS_FRAMES, start):
             raise ValueError("无法定位视频回合起点")
         for value in state:
+            start_time = time.perf_counter()
             ok, bgr = cap.read()
+            elapsed["decode"] += time.perf_counter() - start_time
             if not ok:
                 raise ValueError("视频帧数不足")
+            start_time = time.perf_counter()
             rgb = cv2.cvtColor(
                 resize_image(bgr, image_size, resize_mode), cv2.COLOR_BGR2RGB
             )
+            elapsed["resize"] += time.perf_counter() - start_time
+            start_time = time.perf_counter()
             dataset.add_frame(
                 {
                     "observation.images.front": rgb,
@@ -261,9 +297,212 @@ def write_episode(
                     "task": str(row["tasks"][0]),
                 }
             )
+            elapsed["feed"] += time.perf_counter() - start_time
     finally:
         cap.release()
-    dataset.save_episode()
+    start_time = time.perf_counter()
+    from handumi.scripts._record_encoding import _prepare_streaming_episode
+
+    encoding_times = _prepare_streaming_episode(dataset, len(state))
+    elapsed.update(encoding_times)
+    # 每段独立视频避免上游反复拼接的开销及极短片段 DTS 冲突。
+    limit = dataset.meta.info.video_files_size_in_mb
+    dataset.meta.info.video_files_size_in_mb = 1e-9
+    try:
+        dataset.save_episode()
+    finally:
+        dataset.meta.info.video_files_size_in_mb = limit
+    elapsed["save"] += time.perf_counter() - start_time - sum(encoding_times.values())
+    return elapsed
+
+
+def _run_shard(args: dict, report) -> None:
+    """在独立数据集中按顺序导出一组源回合。"""
+    import pyarrow as pa
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    from handumi.scripts._record_encoding import _StrictStreamingEncoder
+
+    cv2.setNumThreads(1)
+    pa.set_cpu_count(1)
+    reader = EpisodeReader(args["source"], args["info"])
+    config = encoder_config(args["codec"])
+    dataset = None
+    try:
+        dataset = LeRobotDataset.create(
+            args["repo_id"],
+            fps=30,
+            features=args["features"],
+            root=args["root"],
+            robot_type="umi",
+            streaming_encoding=True,
+            rgb_encoder=config,
+            encoder_queue_maxsize=30,
+            encoder_threads=args["threads"],
+        )
+        dataset.writer._streaming_encoder = _StrictStreamingEncoder(
+            OfflineStreamingEncoder(
+                fps=30,
+                rgb_encoder=config,
+                queue_maxsize=30,
+                encoder_threads=args["threads"],
+            ),
+            verify_video_frames=True,
+            rgb_vcodec=args["codec"],
+        )
+        for index in args["indices"]:
+            try:
+                elapsed = write_episode(
+                    dataset,
+                    args["source"],
+                    args["info"],
+                    args["episodes"][index],
+                    args["source_repo_id"],
+                    index,
+                    image_size=args["image_size"],
+                    resize_mode=args["resize_mode"],
+                    reader=reader,
+                    decoder_threads=min(2, args["threads"]),
+                )
+            except Exception as exc:
+                raise RuntimeError(f"导出源回合 {index} 失败: {exc}") from exc
+            report(("episode", index, int(args["episodes"][index]["length"]), elapsed))
+        dataset.finalize()
+        # 首回合写视频元数据时临时阈值可能被持久化；恢复真实元数据。
+        from lerobot.datasets.io_utils import write_info
+
+        write_info(dataset.meta.info, dataset.root)
+    finally:
+        if dataset is not None and not dataset._is_finalized:
+            dataset.finalize()
+
+
+def _shard_process(args: dict, events) -> None:
+    """向父进程转发分片进度与错误。"""
+    try:
+        _run_shard(args, events.put)
+        events.put(("done",))
+    except BaseException:
+        events.put(("error", traceback.format_exc()))
+        raise
+
+
+def _repair_aggregated_stats(root: Path) -> None:
+    """按聚合后回合统计重算全局编号统计，避免沿用分片本地编号。"""
+    from lerobot.datasets.compute_stats import aggregate_feature_stats
+
+    files = sorted((root / "meta" / "episodes").glob("chunk-*/*.parquet"))
+    table = pq.read_table(files)
+    stats_path = root / "meta" / "stats.json"
+    stats = json.loads(stats_path.read_text())
+    for feature in ("episode_index", "index", "task_index"):
+        prefix = f"stats/{feature}/"
+        names = [name for name in table.column_names if name.startswith(prefix)]
+        values = {name[len(prefix) :]: table[name].to_pylist() for name in names}
+        per_episode = [
+            {name: np.asarray(column[index]) for name, column in values.items()}
+            for index in range(table.num_rows)
+        ]
+        stats[feature] = {
+            name: value.tolist()
+            for name, value in aggregate_feature_stats(per_episode).items()
+        }
+    stats_path.write_text(json.dumps(stats, indent=4) + "\n")
+
+
+def _export_shards(
+    shards: list[dict], output: Path, repo_id: str, total_frames: int
+) -> dict[str, float]:
+    """并行生成分片，输出进度并按源顺序聚合。"""
+    timings: dict[str, float] = {}
+    completed = frames = 0
+    total = sum(len(shard["indices"]) for shard in shards)
+    started = time.monotonic()
+
+    def receive(event) -> None:
+        """统计各工作进程的阶段耗时并输出整体进度。"""
+        nonlocal completed, frames
+        if event[0] != "episode":
+            return
+        _, index, count, elapsed = event
+        completed += 1
+        frames += count
+        for key, value in elapsed.items():
+            timings[key] = timings.get(key, 0.0) + value
+        seconds = max(time.monotonic() - started, 1e-9)
+        fps = frames / seconds
+        eta = (total_frames - frames) / fps
+        print(
+            f"已导出 {completed}/{total}，源回合 {index}，"
+            f"{fps:.1f} 帧/秒，预计剩余 {eta:.0f} 秒",
+            flush=True,
+        )
+
+    if len(shards) == 1:
+        old_cv_threads = cv2.getNumThreads()
+        import pyarrow as pa
+
+        old_arrow_threads = pa.cpu_count()
+        try:
+            _run_shard(shards[0], receive)
+        finally:
+            cv2.setNumThreads(old_cv_threads)
+            pa.set_cpu_count(old_arrow_threads)
+        return timings
+
+    context = mp.get_context("spawn")
+    events = context.Queue()
+    processes = [
+        context.Process(target=_shard_process, args=(shard, events)) for shard in shards
+    ]
+    done = 0
+    try:
+        for process in processes:
+            process.start()
+        while done < len(processes):
+            try:
+                event = events.get(timeout=0.5)
+            except queue.Empty:
+                failures = [
+                    p.exitcode for p in processes if p.exitcode not in (None, 0)
+                ]
+                if failures:
+                    raise RuntimeError(f"导出子进程异常退出: {failures}")
+                if all(p.exitcode is not None for p in processes):
+                    raise RuntimeError("导出子进程未返回完成状态")
+                continue
+            if event[0] == "error":
+                raise RuntimeError(f"导出子进程失败:\n{event[1]}")
+            if event[0] == "done":
+                done += 1
+            else:
+                receive(event)
+        for process in processes:
+            process.join()
+            if process.exitcode:
+                raise RuntimeError(f"导出子进程异常退出: {process.exitcode}")
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            if process.pid is not None:
+                process.join()
+        events.close()
+        events.join_thread()
+    from lerobot.datasets.aggregate import aggregate_datasets
+
+    start_time = time.perf_counter()
+    aggregate_datasets(
+        repo_ids=[shard["repo_id"] for shard in shards],
+        aggr_repo_id=repo_id,
+        roots=[shard["root"] for shard in shards],
+        aggr_root=output,
+        concatenate_videos=False,
+    )
+    _repair_aggregated_stats(output)
+    timings["aggregate"] = time.perf_counter() - start_time
+    return timings
 
 
 def export(
@@ -275,15 +514,21 @@ def export(
     resize_mode: str = "letterbox",
     robot: str | None = None,
     robot_tcp_calibration: Path | None = None,
+    encoder: str = "cpu",
+    workers: int | None = None,
 ) -> None:
-    """导出数据到临时目录并校验；image_size 的顺序为宽、高。"""
+    """并行导出到临时目录并校验；image_size 的顺序为宽、高。"""
     validate_image_options(image_size, resize_mode)
-
-    from lerobot.configs.video import RGBEncoderConfig
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    if encoder not in ("auto", "cpu", "gpu"):
+        raise ValueError("编码器策略必须为 auto、cpu 或 gpu")
+    if workers is not None and (
+        isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0
+    ):
+        raise ValueError("工作进程数必须为正整数")
 
     from handumi.dataset.curation import validate_dataset_integrity
 
+    started = time.monotonic()
     selection = resolve_dataset_selection(source)
     info = load_info(source)
     meta = info.get("handumi", {})
@@ -301,8 +546,26 @@ def export(
         info, robot=robot, robot_tcp_calibration=robot_tcp_calibration
     )
     episode_files = sorted((source / "meta" / "episodes").glob("chunk-*/*.parquet"))
+    video_prefix = "videos/observation.images.right_wrist/"
     episodes = sorted(
-        pq.read_table(episode_files).to_pylist(), key=lambda row: row["episode_index"]
+        pq.read_table(
+            episode_files,
+            columns=[
+                "episode_index",
+                "length",
+                "tasks",
+                *(
+                    video_prefix + key
+                    for key in (
+                        "chunk_index",
+                        "file_index",
+                        "from_timestamp",
+                        "to_timestamp",
+                    )
+                ),
+            ],
+        ).to_pylist(),
+        key=lambda row: row["episode_index"],
     )
     if len(episodes) != int(info["total_episodes"]):
         raise ValueError("回合元数据数量不匹配")
@@ -311,6 +574,11 @@ def export(
     kept, rejected = quality_selection(source, selection.repo_id, episodes)
     if output.exists() or output.resolve().is_relative_to(source.resolve()):
         raise FileExistsError(f"输出路径已存在: {output}")
+    worker_count = min(
+        workers if workers is not None else min(os.cpu_count() or 1, 8), len(kept)
+    )
+    codec = select_encoder(encoder, image_size, worker_count)
+    print(f"视频编码：{codec}；工作进程：{worker_count}", flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
     build = temp / "dataset"
@@ -331,37 +599,33 @@ def export(
             "names": ["x", "y", "z", "rx", "ry", "rz", "gripper"],
         },
     }
-    dataset = None
     try:
-        dataset = LeRobotDataset.create(
-            repo_id,
-            fps=30,
-            features=features,
-            root=build,
-            robot_type="umi",
-            image_writer_threads=4,
-            rgb_encoder=RGBEncoderConfig(vcodec="h264", preset="fast", crf=23),
-        )
-        mapping = []
-        for new_index, index in enumerate(kept):
-            try:
-                write_episode(
-                    dataset,
-                    source,
-                    info,
-                    episodes[index],
-                    selection.repo_id,
-                    index,
-                    image_size=image_size,
-                    resize_mode=resize_mode,
-                )
-                mapping.append(
-                    {"episode_index": new_index, "source_episode_index": index}
-                )
-                print(f"已导出 {new_index + 1}/{len(kept)}，源回合 {index}", flush=True)
-            except Exception as exc:
-                raise RuntimeError(f"导出源回合 {index} 失败: {exc}") from exc
-        dataset.finalize()
+        groups = split_episodes(kept, episodes, worker_count)
+        shards = [
+            {
+                "source": source,
+                "source_repo_id": selection.repo_id,
+                "root": build if worker_count == 1 else temp / f"shard-{number}",
+                "repo_id": repo_id
+                if worker_count == 1
+                else f"local/tcp-shard-{number}",
+                "info": info,
+                "episodes": episodes,
+                "indices": group,
+                "features": features,
+                "image_size": image_size,
+                "resize_mode": resize_mode,
+                "codec": codec,
+                "threads": worker_threads(worker_count),
+            }
+            for number, group in enumerate(groups)
+        ]
+        total_frames = sum(int(episodes[index]["length"]) for index in kept)
+        timings = _export_shards(shards, build, repo_id, total_frames)
+        mapping = [
+            {"episode_index": new_index, "source_episode_index": index}
+            for new_index, index in enumerate(kept)
+        ]
         contract = {
             **metadata,
             "pose_frame": "episode_start_tcp",
@@ -384,16 +648,21 @@ def export(
         (build / "meta" / "fastumi.json").write_text(
             json.dumps(contract, indent=2, ensure_ascii=False) + "\n"
         )
+        validate_started = time.perf_counter()
         validate_dataset_integrity(build, repo_id=repo_id)
+        timings["validate"] = time.perf_counter() - validate_started
         if output.exists():
             raise FileExistsError(f"输出路径已存在: {output}")
         os.rename(build, output)
+        seconds = time.monotonic() - started
+        print(
+            f"导出完成：{total_frames} 帧，{seconds:.1f} 秒，"
+            f"{total_frames / max(seconds, 1e-9):.1f} 帧/秒；"
+            f"各进程阶段耗时之和（秒）：{json.dumps(timings, ensure_ascii=False)}",
+            flush=True,
+        )
     finally:
-        try:
-            if dataset is not None and not dataset._is_finalized:
-                dataset.finalize()
-        finally:
-            shutil.rmtree(temp)
+        shutil.rmtree(temp)
 
 
 def main() -> None:
@@ -424,12 +693,27 @@ def main() -> None:
         default=(224, 224),
         help="输出图像的宽和高，均须为正偶数（默认 224 224）",
     )
+    parser.add_argument(
+        "--encoder",
+        choices=("auto", "cpu", "gpu"),
+        default="cpu",
+        help="视频编码策略：自动、CPU 或强制 GPU（默认 cpu）",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="工作进程数（正整数，默认最多 8 个）",
+    )
     args = parser.parse_args()
     image_size = tuple(args.image_size)
     try:
         validate_image_options(image_size, args.resize_mode)
         if args.robot_tcp_calibration is not None and args.robot is None:
             raise ValueError("--robot-tcp-calibration 需要同时指定 --robot")
+        if args.workers is not None and args.workers <= 0:
+            raise ValueError("工作进程数必须为正整数")
     except ValueError as exc:
         parser.error(str(exc))
     export(
@@ -440,6 +724,8 @@ def main() -> None:
         resize_mode=args.resize_mode,
         robot=args.robot,
         robot_tcp_calibration=args.robot_tcp_calibration,
+        encoder=args.encoder,
+        workers=args.workers,
     )
 
 
