@@ -340,7 +340,7 @@ handumi dataset qa outputs/umi-demo --robot rm75b \
 ```bash
 handumi dataset export-tcp outputs/umi-demo \
   --output outputs/umi-demo-tcp-dp \
-  --repo-id local/umi-demo-tcp-dp
+  --repo-id local/umi-demo-tcp-dp --robot rm75b
 cat outputs/umi-demo-tcp-dp/meta/info.json
 cat outputs/umi-demo-tcp-dp/meta/fastumi.json
 ```
@@ -357,12 +357,30 @@ cat outputs/umi-demo-tcp-dp/meta/fastumi.json
 ```bash
 handumi dataset export-tcp outputs/umi-demo \
   --output outputs/umi-demo-tcp-crop \
-  --repo-id local/umi-demo-tcp-crop \
+  --repo-id local/umi-demo-tcp-crop --robot rm75b \
   --resize-mode center-crop --image-size 320 240
 ```
 
 `fastumi.json` 中的 `image_size` 按 `[高度, 宽度]` 记录，
 `image_preprocessing` 记录实际缩放方式。
+
+导出还会记录以下采集与部署参数：
+
+| 字段 | 含义与来源 |
+| --- | --- |
+| `fps` | 数据集帧率，当前流程为 30。 |
+| `gripper_mode` | `normalized`，连续开度 0 表示闭合、1 表示张开。 |
+| `umi_camera_from_tcp` | 米制 4×4 矩阵，将 TCP 坐标转换到原始采集相机坐标；由采集快照中的 `inv(tracker_camera) @ tracker_tcp` 计算。 |
+| `deployment_tool_offset` | 米制 4×4 矩阵，将部署 TCP 坐标转换到机器人末端链接坐标，即机器人标定中的 `ee_to_tcp`，包含平移和旋转。 |
+| `urdf_sha256` | `--robot` 对应配置所引用 URDF 文件的 SHA-256。 |
+
+`--robot rm75b` 同时写入 `deployment_robot`、`deployment_ee_link` 和完整的
+`robot_tcp_calibration` 来源与 `verified` 状态，仅补充元数据，示教轨迹保持原有坐标与数值。
+工具标定默认读取 `configs/calibration/robot_tcp/local/rm75b.yaml`，可通过
+`--robot-tcp-calibration PATH` 显式指定；该参数需与 `--robot` 一起使用。
+未指定机器人时，部署偏移和 URDF 摘要为 `null`；旧录制缺少 UMI 标定快照时，
+相机外参为 `null`。显式指定的标定缺失或已有快照损坏时导出会报错。
+图像缩放影响像素坐标和内参，相机与 TCP 间的刚体变换保持不变。
 
 输出路径必须不存在。核对回合和帧数量、坐标与单位，`fastumi.json` 中的 `episodes` 提供新旧回合编号对应，`rejected` 给出跳过的回合与原因。检查通过的回合全部导出，不使用关节筛选结果。
 

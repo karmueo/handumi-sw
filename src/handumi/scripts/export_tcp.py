@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from scipy.spatial.transform import Rotation
 
+from handumi.calibration.umi import transform
 from handumi.dataset.reader import load_raw_episode
 from handumi.dataset.selection import resolve_dataset_selection
 from handumi.dataset.writer import load_info
@@ -24,6 +26,64 @@ IMAGE_PREPROCESSING = {
     "center-crop": "center_crop_inter_area",
     "stretch": "stretch_inter_area",
 }
+
+
+def export_metadata(
+    info: dict,
+    *,
+    robot: str | None = None,
+    robot_tcp_calibration: Path | None = None,
+) -> dict:
+    """生成采集与部署契约；可选机器人仅补充元数据，不改变示教轨迹。
+
+    两个外参均为米制 4×4 矩阵，分别将 TCP 坐标转换到采集相机和
+    部署末端链接坐标。未提供相应标定或机器人时返回 null；显式配置
+    缺失或无效时抛出异常，避免写入猜测的单位变换。
+    """
+    if robot_tcp_calibration is not None and robot is None:
+        raise ValueError("--robot-tcp-calibration 需要同时指定 --robot")
+    # 采集契约不依赖部署机器人；空值明确表示尚未绑定部署配置。
+    metadata = {
+        "fps": int(info["fps"]),
+        "gripper_mode": "normalized",
+        "umi_camera_from_tcp": None,
+        "umi_camera_from_tcp_convention": "p_camera = umi_camera_from_tcp @ p_tcp",
+        "deployment_robot": robot,
+        "deployment_ee_link": None,
+        "deployment_tool_offset": None,
+        "deployment_tool_offset_convention": "p_ee = deployment_tool_offset @ p_tcp",
+        "urdf_sha256": None,
+        "robot_tcp_calibration": None,
+    }
+    # 采集快照中的两个矩阵均以 Tracker 为父坐标系。
+    snapshot = info.get("handumi", {}).get("umi_calibration")
+    if snapshot is not None:
+        try:
+            tracker_camera = transform(snapshot["tracker_camera"])
+            tracker_tcp = transform(snapshot["tracker_tcp"])
+            metadata["umi_camera_from_tcp"] = transform(
+                np.linalg.inv(tracker_camera) @ tracker_tcp
+            ).tolist()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("UMI 标定快照中的相机或 TCP 外参无效") from exc
+    if robot is not None:
+        from handumi.calibration.robot_tcp import load_robot_tcp_calibration
+        from handumi.robots.registry import load_robot_config
+
+        config = load_robot_config(robot)
+        if "right" not in config.arms:
+            raise ValueError("TCP 导出要求部署机器人包含 right 机械臂")
+        # 仅绑定当前单右侧示教所需的末端标定，不运行 IK 或改变动作值。
+        tool = load_robot_tcp_calibration(
+            robot, {"right": config.arms["right"]}, explicit_path=robot_tcp_calibration
+        )
+        metadata.update(
+            deployment_ee_link=tool.ee_links["right"],
+            deployment_tool_offset=tool.matrices["right"].tolist(),
+            urdf_sha256=hashlib.sha256(config.urdf.read_bytes()).hexdigest(),
+            robot_tcp_calibration=tool.metadata(),
+        )
+    return metadata
 
 
 def relative_tcp(poses: np.ndarray, gripper: np.ndarray) -> np.ndarray:
@@ -213,6 +273,8 @@ def export(
     *,
     image_size: tuple[int, int] = (224, 224),
     resize_mode: str = "letterbox",
+    robot: str | None = None,
+    robot_tcp_calibration: Path | None = None,
 ) -> None:
     """导出数据到临时目录并校验；image_size 的顺序为宽、高。"""
     validate_image_options(image_size, resize_mode)
@@ -235,6 +297,9 @@ def export(
         or int(info.get("fps", 0)) != 30
     ):
         raise ValueError("需要 30 FPS、单右侧、桌面系 TCP 的 Vive 录制")
+    metadata = export_metadata(
+        info, robot=robot, robot_tcp_calibration=robot_tcp_calibration
+    )
     episode_files = sorted((source / "meta" / "episodes").glob("chunk-*/*.parquet"))
     episodes = sorted(
         pq.read_table(episode_files).to_pylist(), key=lambda row: row["episode_index"]
@@ -298,6 +363,7 @@ def export(
                 raise RuntimeError(f"导出源回合 {index} 失败: {exc}") from exc
         dataset.finalize()
         contract = {
+            **metadata,
             "pose_frame": "episode_start_tcp",
             "end_frame": "tcp",
             "tcp_definition": "gripper_grasp_center",
@@ -337,6 +403,14 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--repo-id", required=True)
     parser.add_argument(
+        "--robot", help="绑定部署机器人的 URDF 与工具 TCP 标定，仅补充元数据"
+    )
+    parser.add_argument(
+        "--robot-tcp-calibration",
+        type=Path,
+        help="部署末端到 TCP 的标定文件（需指定 --robot，默认使用本地约定路径）",
+    )
+    parser.add_argument(
         "--resize-mode",
         choices=tuple(IMAGE_PREPROCESSING),
         default="letterbox",
@@ -354,6 +428,8 @@ def main() -> None:
     image_size = tuple(args.image_size)
     try:
         validate_image_options(image_size, args.resize_mode)
+        if args.robot_tcp_calibration is not None and args.robot is None:
+            raise ValueError("--robot-tcp-calibration 需要同时指定 --robot")
     except ValueError as exc:
         parser.error(str(exc))
     export(
@@ -362,6 +438,8 @@ def main() -> None:
         args.repo_id,
         image_size=image_size,
         resize_mode=args.resize_mode,
+        robot=args.robot,
+        robot_tcp_calibration=args.robot_tcp_calibration,
     )
 
 

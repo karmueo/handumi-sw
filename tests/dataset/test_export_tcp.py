@@ -1,7 +1,8 @@
-"""验证 TCP 导出的坐标变换、图像处理和质量筛选。"""
+"""验证 TCP 导出的坐标变换、部署元数据、图像处理和质量筛选。"""
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
@@ -11,6 +12,120 @@ from scipy.spatial.transform import Rotation
 
 from handumi.scripts import export_tcp
 from handumi.scripts.export_tcp import letterbox, quality_selection, relative_tcp
+
+
+def test_metadata_recovers_camera_from_tcp_in_correct_direction():
+    """非单位 Tracker 外参可还原 TCP 到相机的完整刚体变换。"""
+    tracker_camera = np.eye(4)
+    tracker_camera[:3, :3] = Rotation.from_euler("z", 70, degrees=True).as_matrix()
+    tracker_camera[:3, 3] = [0.1, -0.2, 0.3]
+    camera_tcp = np.eye(4)
+    camera_tcp[:3, :3] = Rotation.from_euler("x", 35, degrees=True).as_matrix()
+    camera_tcp[:3, 3] = [-0.01, 0.02, 0.25]
+    info = {
+        "fps": 30,
+        "handumi": {
+            "umi_calibration": {
+                "tracker_camera": tracker_camera.tolist(),
+                "tracker_tcp": (tracker_camera @ camera_tcp).tolist(),
+            }
+        },
+    }
+    metadata = export_tcp.export_metadata(info)
+    np.testing.assert_allclose(metadata["umi_camera_from_tcp"], camera_tcp, atol=1e-12)
+    assert metadata["fps"] == 30
+    assert metadata["gripper_mode"] == "normalized"
+    assert metadata["urdf_sha256"] is None
+    assert metadata["deployment_tool_offset"] is None
+
+
+def test_metadata_without_capture_calibration_keeps_unknown_values():
+    """旧录制缺少快照时保留明确空值，避免伪造外参或机器人信息。"""
+    metadata = export_tcp.export_metadata({"fps": 30})
+    assert metadata["umi_camera_from_tcp"] is None
+    assert metadata["deployment_robot"] is None
+    assert metadata["robot_tcp_calibration"] is None
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {},
+        {"tracker_camera": np.eye(3).tolist(), "tracker_tcp": np.eye(4).tolist()},
+        {"tracker_camera": (2 * np.eye(4)).tolist(), "tracker_tcp": np.eye(4).tolist()},
+        {
+            "tracker_camera": np.eye(4).tolist(),
+            "tracker_tcp": np.full((4, 4), np.nan).tolist(),
+        },
+    ],
+)
+def test_metadata_rejects_broken_capture_calibration(snapshot):
+    """存在但损坏的快照必须报错，不能悄悄退回未知外参。"""
+    with pytest.raises(ValueError, match="UMI 标定快照"):
+        export_tcp.export_metadata(
+            {"fps": 30, "handumi": {"umi_calibration": snapshot}}
+        )
+
+
+def test_metadata_binds_robot_model_and_tool_calibration(tmp_path, monkeypatch):
+    """绑定指定模型的摘要和工具完整矩阵，同时保留未验证标记。"""
+    import hashlib
+
+    from handumi.robots import registry
+
+    urdf = tmp_path / "robot.urdf"
+    urdf.write_text('<robot name="test"/>')
+    arm = SimpleNamespace(ee_link="Link7")
+    monkeypatch.setattr(
+        registry,
+        "load_robot_config",
+        lambda _: SimpleNamespace(urdf=urdf, arms={"right": arm}),
+    )
+    ee_tcp = np.eye(4)
+    ee_tcp[:3, :3] = Rotation.from_euler("y", 40, degrees=True).as_matrix()
+    ee_tcp[:3, 3] = [0.01, -0.02, 0.23]
+    calibration = tmp_path / "tcp.yaml"
+    calibration.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "handumi_robot_tcp_calibration",
+                "robot": "rm75b",
+                "verified": False,
+                "calibration": {
+                    "arms": {
+                        "right": {"ee_link": "Link7", "ee_to_tcp": ee_tcp.tolist()}
+                    }
+                },
+            }
+        )
+    )
+    metadata = export_tcp.export_metadata(
+        {"fps": 30}, robot="rm75b", robot_tcp_calibration=calibration
+    )
+    assert metadata["deployment_robot"] == "rm75b"
+    assert metadata["deployment_ee_link"] == "Link7"
+    np.testing.assert_array_equal(metadata["deployment_tool_offset"], ee_tcp)
+    assert metadata["urdf_sha256"] == hashlib.sha256(urdf.read_bytes()).hexdigest()
+    assert (
+        metadata["robot_tcp_calibration"]["sha256"]
+        == hashlib.sha256(calibration.read_bytes()).hexdigest()
+    )
+    assert metadata["robot_tcp_calibration"]["verified"] is False
+
+    calibration.unlink()
+    with pytest.raises(SystemExit, match="Missing robot TCP calibration"):
+        export_tcp.export_metadata(
+            {"fps": 30}, robot="rm75b", robot_tcp_calibration=calibration
+        )
+
+
+def test_metadata_tool_calibration_requires_robot(tmp_path):
+    """显式工具标定必须绑定机器人，防止忽略调用者传入的配置。"""
+    with pytest.raises(ValueError, match="需要同时指定 --robot"):
+        export_tcp.export_metadata(
+            {"fps": 30}, robot_tcp_calibration=tmp_path / "tcp.yaml"
+        )
 
 
 def test_relative_tcp_uses_each_episode_initial_orientation():
@@ -126,7 +241,63 @@ def test_cli_passes_image_options(
         ["export-tcp", "source", "--output", "out", "--repo-id", "a/b", *extra_args],
     )
     export_tcp.main()
-    assert calls == [{"image_size": expected_size, "resize_mode": expected_mode}]
+    assert calls == [
+        {
+            "image_size": expected_size,
+            "resize_mode": expected_mode,
+            "robot": None,
+            "robot_tcp_calibration": None,
+        }
+    ]
+
+
+def test_cli_passes_deployment_metadata_options(monkeypatch):
+    """部署机器人和显式标定路径原样传给导出接口。"""
+    calls = []
+    monkeypatch.setattr(
+        export_tcp, "export", lambda *args, **kwargs: calls.append(kwargs)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "export-tcp",
+            "source",
+            "--output",
+            "out",
+            "--repo-id",
+            "a/b",
+            "--robot",
+            "rm75b",
+            "--robot-tcp-calibration",
+            "tcp.yaml",
+        ],
+    )
+    export_tcp.main()
+    assert calls[0]["robot"] == "rm75b"
+    assert calls[0]["robot_tcp_calibration"] == Path("tcp.yaml")
+
+
+def test_cli_rejects_tool_calibration_without_robot(monkeypatch, capsys):
+    """缺少机器人参数时在读取数据集前给出清晰的命令行错误。"""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "export-tcp",
+            "source",
+            "--output",
+            "out",
+            "--repo-id",
+            "a/b",
+            "--robot-tcp-calibration",
+            "tcp.yaml",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        export_tcp.main()
+    assert exc.value.code == 2
+    assert "需要同时指定 --robot" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -382,6 +553,15 @@ def test_export_shared_video_and_skipped_episode(
             "recording_device": "vive",
             "active_sides": ["right"],
             "capture_schema": "synchronized_sources_v2",
+            "umi_calibration": {
+                "tracker_camera": np.eye(4).tolist(),
+                "tracker_tcp": [
+                    [1, 0, 0, 0.01],
+                    [0, 1, 0, -0.02],
+                    [0, 0, 1, 0.23],
+                    [0, 0, 0, 1],
+                ],
+            },
             "tcp_pose": {
                 "frame": "table",
                 "feature": "observation.tracking.right_tcp_pose",
@@ -470,6 +650,14 @@ def test_export_shared_video_and_skipped_episode(
         3,
     ]
     assert contract["image_size"] == [image_size[1], image_size[0]]
+    assert contract["fps"] == output_info["fps"] == 30
+    assert contract["gripper_mode"] == "normalized"
+    assert contract["deployment_tool_offset"] is None
+    assert contract["urdf_sha256"] is None
+    np.testing.assert_allclose(
+        contract["umi_camera_from_tcp"],
+        info["handumi"]["umi_calibration"]["tracker_tcp"],
+    )
     assert contract["image_preprocessing"] == preprocessing
     assert [row["source_episode_index"] for row in contract["episodes"]] == [0, 2]
     assert contract["rejected"][0]["source_episode_index"] == 1
