@@ -65,6 +65,9 @@ COMMANDS = {
         "handumi.scripts.export_dataset",
         "Rewrite a joints dataset into an external stack's layout",
     ),
+    ("dataset", "export-tcp"): Command(
+        "handumi.scripts.export_tcp", "Export Vive TCP demonstrations for DP training"
+    ),
     ("replay",): Command(
         "handumi.scripts.replay.replay_in_sim", "Replay a dataset in simulation"
     ),

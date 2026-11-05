@@ -270,31 +270,50 @@ Rerun 的四个面板分别显示相机、三维位姿、夹爪开度和采集�
 仍须通过设备、标定及桌面会话身份检查才能续录。`--dry-run` 只展示录制
 计划，不启动 Rerun、连接硬件或修改输出目录。
 
-## 6. 数据检查和仿真
+### 5.2 实机验收
 
-在项目根目录执行。流程为：检查录制质量 → 搜索共享摆放 → QA → 处理失败段 → 转换关节数据 → 回放。
-原始数据、筛选后的原始数据和转换后的关节数据分别使用独立目录，输出目录请使用尚不存在的新路径。
+先完成时间和桌面标定，再分别录制静止、平移旋转、夹爪开合片段。检查图像与
+开度同帧、TCP 轴旋转正确且定位稳定，将 TCP 接触桌面时高度应接近零。
+录制中遮挡标签超过配置的保持期限时丢弃该段；Tracker 定位失效时立即丢弃该段，
+Tracker、Camera 和 TCP 三轴隐藏，恢复后需重新按空格。最后保存有效片段，并按第 6.1 节检查录制质量。
 
-### 6.1 检查并搜索共享摆放
+自动测试不代替实机验收。需要设备操作者完成上述动作，并确认实物标定板尺寸、SteamVR 定位和相机视野。
+
+## 6. 数据检查
+
+### 6.1 TCP 检查
+
+在项目根目录执行录制质量检查：
 
 ```bash
 handumi validate outputs/umi-demo
+```
 
+检查 `outputs/umi-demo/meta/handumi_quality.json`，处理报告的录制质量问题后重检。第 7.1 节转换会跳过 `rejected` 段，并在输出 `meta/fastumi.json` 中记录原因和源回合编号。录制质量报告与关节检查报告各自独立。
+
+### 6.2 关节检查
+
+```bash
 handumi replay outputs/umi-demo --robot rm75b \
   --deployment-profile sim --retarget-mode absolute-tcp \
   --base-placement dataset-xy-yaw \
   --strict-ik --headless --prepare-mode all --approach-seconds 0
 ```
 
-第一步检查录制质量；先处理其报告的问题，再运行回放准备。
-第二步为整个数据集搜索一个共享摆放，并验证全部 episode。至少一段完整通过后，
+先完成 6.1 的录制质量检查，再运行上述准备。
+该命令为整个数据集搜索一个共享摆放，并验证全部 episode。至少一段完整通过后，
 摆放保存到 `outputs/umi-demo/.handumi/base_placement/rm75b.yaml`。
 这是仿真布局，不能直接用于实体安装。
 
 查看最终通过/失败数量。**部分 episode 失败时，命令会返回失败状态，已保存的布局和通过段仍可使用。**
 若全部失败，先核对标定、工作空间和采集动作，暂不转换。
 
-### 6.2 汇总 QA 结果
+共享摆放不适合所有动作时，第 7.2 C 节提供每回合独立搜索 XY 摆放的筛选流程。
+排除失败段后，针对整理后的目录使用相同摆放参数重新筛选，再转换。
+
+RM75B 绝对 TCP 流程要求逐帧位置误差 ≤5 mm、旋转误差 ≤5°。夹爪包围盒与非邻接机械臂连杆的安全间距为 1 mm，检查覆盖每帧及相邻帧的关节运动。包围盒覆盖夹指全行程，可能保守拒绝。检查范围包括夹爪与非邻接机械臂连杆，桌面、环境障碍物、机械臂连杆间碰撞和接触动力学需另行评估。
+
+#### 汇总 QA 结果
 
 存在上述共享摆放后运行：
 
@@ -307,14 +326,30 @@ handumi dataset qa outputs/umi-demo --robot rm75b \
 
 - `rejected`：不满足当前质量或机器人回放要求，转换前排除或修复后重检。
 - `review` / `flagged`：需要人工判断，例如时长偏长；动作正常时可以保留。
-- 全部可用：执行 **6.3 A**；存在需要排除的段：执行 **6.3 B**。
+- 全部可用：执行 **7.2 A**；存在需要排除的段：执行 **7.2 B**。
 
 `--skip-validate` 复用 6.1 的录制质量报告，数据变化后应移除此参数重新检查。
 `--skip-direction` 适用于没有固定工作台摄像头的数据；有工作台画面且至少三段时可移除。
 
-### 6.3 转换为关节数据
+## 7. 数据转换
 
-以下命令统一使用 `absolute-tcp`。A、B 通过 `fixed` 加载 6.1 保存的共享摆放；
+### 7.1 TCP 转换
+
+转换读取桌面系右侧 TCP 和连续归一化夹爪，将每段位姿表示在该段首帧 TCP 坐标系。`observation.state` 与同帧示范 `action` 均为七维 `[x,y,z,rx,ry,rz,gripper]`，单位为米、弧度及 0～1 开度。右腕图像等比缩放并补黑至 224×224 RGB。每个录制段保留完整抓放过程及末帧。
+
+```bash
+handumi dataset export-tcp outputs/umi-demo \
+  --output outputs/umi-demo-tcp-dp \
+  --repo-id local/umi-demo-tcp-dp
+cat outputs/umi-demo-tcp-dp/meta/info.json
+cat outputs/umi-demo-tcp-dp/meta/fastumi.json
+```
+
+输出路径必须不存在。核对回合和帧数量、坐标与单位，`fastumi.json` 中的 `episodes` 提供新旧回合编号对应，`rejected` 给出跳过的回合与原因。检查通过的回合全部导出，不使用关节筛选结果。
+
+### 7.2 关节转换
+
+以下命令统一使用 `absolute-tcp`。A、B 通过 `fixed` 加载 6.2 保存的共享摆放；
 需要每个 episode 独立选择 base 时，使用 C。
 **A、B 中的 `--deployment-calibration` 搭配 `--base-placement fixed`，不能搭配 `dataset-xy-yaw`。**
 参数行为见[回放参数解析](../../../src/handumi/scripts/replay/replay_in_sim.py)。
@@ -375,7 +410,7 @@ handumi convert outputs/umi-demo-curated --robot rm75b \
 固定，高度和朝向沿用参考摆放。该模式不搜索 yaw，也不支持 base 随帧移动。
 结果用于仿真，不能直接作为实体机器人共享安装位置。
 
-此流程不依赖 6.1 的共享摆放文件。先运行 `handumi validate outputs/umi-demo`
+此流程不依赖 6.2 的共享摆放文件。先运行 `handumi validate outputs/umi-demo`
 检查录制质量，再按以下命令筛选和转换；即使已经执行 A、B 或 6.2，也应重新
 生成 `episode-xy` 筛选报告，避免沿用共享摆放下的拒绝结果。
 
@@ -409,14 +444,14 @@ handumi dataset curate outputs/umi-demo \
 将 C 中 `screen` 和 `convert` 的输入路径都改为 `outputs/umi-demo-episode-xy-curated`，
 保留 `--base-placement episode-xy`。先重新筛选，确认无 rejected 后再转换。
 
-转换结果记录各段实际使用的摆放，关节回放会读取对应记录：
+## 8. 仿真
+
+C 的转换结果记录各段实际使用的摆放，关节回放会读取对应记录：
 
 ```bash
 handumi replay-joints outputs/umi-joints-episode-xy --robot rm75b \
   --approach-seconds 0
 ```
-
-### 6.4 回放转换结果
 
 A 或 B 的转换完成后，回放关节数据，从每段首帧直接开始（C 使用上一节的输出路径）：
 
@@ -431,17 +466,57 @@ handumi replay-joints outputs/umi-joints-passed --robot rm75b \
 
 ### 检查标准与常见问题
 
-- 当前 RM75B 绝对 TCP 流程要求逐帧位置误差 ≤5 mm、旋转误差 ≤5°；夹爪包围盒与非邻接机械臂连杆的安全间距为 1 mm。检查覆盖每帧和相邻帧之间的关节运动，包围盒覆盖夹指全行程，可能保守拒绝；不检查桌面、环境障碍物或机械臂连杆之间的碰撞，也不模拟接触动力学。
 - 首帧直接开始仍须通过首帧姿态检查。`--approach-seconds 0` 只取消 HOME 接近动画，无法解决首帧自身的碰撞或不可达问题。
 - 缺少筛选报告时，对实际要转换的目录运行 `dataset screen`；筛选与转换保持同一套参数。不要直接复制旧目录的报告。
-- 需要重估共享摆放时，在 6.1 的回放命令中添加 `--refresh-base-placement`；`--refresh-cache` 只重算轨迹。
+- 需要重估共享摆放时，在 6.2 的回放命令中添加 `--refresh-base-placement`；`--refresh-cache` 只重算轨迹。
 - 回放准备默认最多 8 个进程，可用 `--prepare-workers N` 调整；转换用 `--jobs N` 调整，配置匹配时复用轨迹缓存。
 
-## 7. 实机验收
+## 9. 模型训练
 
-先完成时间和桌面标定，再分别录制静止、平移旋转、夹爪开合片段。检查图像与
-开度同帧、TCP 轴旋转正确且定位稳定，将 TCP 接触桌面时高度应接近零。
-录制中遮挡标签超过配置的保持期限时丢弃该段；Tracker 定位失效时立即丢弃该段，
-Tracker、Camera 和 TCP 三轴隐藏，恢复后需重新按空格。最后保存有效片段并完成上述质量检查、转换及七轴加夹爪开合回放。
+### 9.1 TCP 训练
 
-自动测试不代替实机验收。需要设备操作者完成上述动作，并确认实物标定板尺寸、SteamVR 定位和相机视野。
+准备 LeRobot 训练环境，使用实际仓库路径和独立输出目录：
+
+```bash
+cd /home/scl/work/UMI/lerobot
+export UV_PROJECT_ENVIRONMENT="$PWD/.venv-tcp-dp"
+uv sync --python 3.12 --locked --extra training --extra diffusion
+uv run --no-sync lerobot-train \
+  --dataset.repo_id=local/umi-demo-tcp-dp \
+  --dataset.root=/home/scl/work/UMI/handumi-sw/outputs/umi-demo-tcp-dp \
+  --dataset.eval_split=0.1 \
+  --dataset.video_backend=torchcodec \
+  --dataset.image_transforms.enable=false \
+  --policy.type=diffusion \
+  --policy.use_relative_pose=false \
+  --policy.n_obs_steps=2 \
+  --policy.horizon=16 \
+  --policy.n_action_steps=8 \
+  --policy.drop_n_last_frames=7 \
+  --policy.down_dims='[512,1024,2048]' \
+  --policy.noise_scheduler_type=DDPM \
+  --policy.num_train_timesteps=100 \
+  --policy.resize_shape='[224,224]' \
+  --policy.crop_ratio=0.95 \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --output_dir=outputs/train/dp_umi_tcp \
+  --job_name=dp_umi_tcp \
+  --seed=1000 \
+  --batch_size=128 \
+  --num_workers=4 \
+  --steps=46233 \
+  --eval_steps=1000 \
+  --save_freq=2000 \
+  --log_freq=200 \
+  --env_eval_freq=0 \
+  --trackio.enable=false
+```
+
+本批 200 段按末尾 10% 留出，训练 180 段、49,315 帧。单卡 batch 128 时，46,233 步约为 120 个 epoch。数据规模或 batch 变化后按 `steps ≈ 目标 epoch × 训练帧数 / 总有效 batch` 重算，并以训练日志为准。显存不足时降低 batch 并相应调整步数。输出目录已存在时更换目录和任务名。
+
+`use_relative_pose=false` 保留导出时的回合起点坐标与轴角表示。部署需要记录每回合起始 TCP，并把模型输出从起始坐标系转换到机器人参考系。完整训练、恢复和部署约定见 `/home/scl/work/UMI/lerobot/docs/umi/umi_dp_相对回合起始位_训练.md`。
+
+### 9.2 关节训练
+
+待补充。
