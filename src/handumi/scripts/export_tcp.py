@@ -18,6 +18,13 @@ from handumi.dataset.reader import load_raw_episode
 from handumi.dataset.selection import resolve_dataset_selection
 from handumi.dataset.writer import load_info
 
+# 输出元数据使用的缩放方式描述。
+IMAGE_PREPROCESSING = {
+    "letterbox": "letterbox_inter_area_black_border",
+    "center-crop": "center_crop_inter_area",
+    "stretch": "stretch_inter_area",
+}
+
 
 def relative_tcp(poses: np.ndarray, gripper: np.ndarray) -> np.ndarray:
     """将桌面系 TCP 及夹爪开度转换为回合首帧坐标系中的七维数组。"""
@@ -37,16 +44,59 @@ def relative_tcp(poses: np.ndarray, gripper: np.ndarray) -> np.ndarray:
     return np.column_stack((positions, angles, gripper)).astype(np.float32)
 
 
-def letterbox(image: np.ndarray) -> np.ndarray:
-    """将 RGB 图像等比缩放并居中补黑至 224×224。"""
+def letterbox(
+    image: np.ndarray, image_size: tuple[int, int] = (224, 224)
+) -> np.ndarray:
+    """将图像等比缩放并居中补黑；image_size 的顺序为宽、高。"""
     height, width = image.shape[:2]
-    scale = min(224 / width, 224 / height)
+    target_width, target_height = image_size
+    scale = min(target_width / width, target_height / height)
     size = (max(1, round(width * scale)), max(1, round(height * scale)))
     resized = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
-    output = np.zeros((224, 224, 3), dtype=np.uint8)
-    x, y = (224 - size[0]) // 2, (224 - size[1]) // 2
+    output = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    x, y = (target_width - size[0]) // 2, (target_height - size[1]) // 2
     output[y : y + size[1], x : x + size[0]] = resized
     return output
+
+
+def resize_image(
+    image: np.ndarray, image_size: tuple[int, int], resize_mode: str
+) -> np.ndarray:
+    """按指定方式缩放图像，目标尺寸依次为宽、高。"""
+    if resize_mode == "letterbox":
+        return letterbox(image, image_size)
+    if resize_mode == "stretch":
+        return cv2.resize(image, image_size, interpolation=cv2.INTER_AREA)
+    if resize_mode != "center-crop":
+        raise ValueError(f"不支持的图像缩放方式: {resize_mode}")
+    height, width = image.shape[:2]
+    target_width, target_height = image_size
+    scale = max(target_width / width, target_height / height)
+    size = (
+        max(target_width, round(width * scale)),
+        max(target_height, round(height * scale)),
+    )
+    resized = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+    x, y = (size[0] - target_width) // 2, (size[1] - target_height) // 2
+    return resized[y : y + target_height, x : x + target_width]
+
+
+def validate_image_options(image_size: tuple[int, int], resize_mode: str) -> None:
+    """校验缩放方式以及 H.264 yuv420p 编码所需的正偶数宽高。"""
+    if not isinstance(resize_mode, str) or resize_mode not in IMAGE_PREPROCESSING:
+        raise ValueError(f"不支持的图像缩放方式: {resize_mode}")
+    if (
+        not isinstance(image_size, (tuple, list))
+        or len(image_size) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            or value % 2
+            for value in image_size
+        )
+    ):
+        raise ValueError("图像宽度和高度必须为正偶数")
 
 
 def quality_selection(
@@ -98,7 +148,15 @@ def quality_selection(
 
 
 def write_episode(
-    dataset, source: Path, info: dict, row: dict, repo_id: str, index: int
+    dataset,
+    source: Path,
+    info: dict,
+    row: dict,
+    repo_id: str,
+    index: int,
+    *,
+    image_size: tuple[int, int] = (224, 224),
+    resize_mode: str = "letterbox",
 ) -> None:
     """读取一个回合的同步位姿和视频，向输出写入同帧示教数据。"""
     raw = load_raw_episode(root=source, repo_id=repo_id, episode=index)
@@ -132,7 +190,9 @@ def write_episode(
             ok, bgr = cap.read()
             if not ok:
                 raise ValueError("视频帧数不足")
-            rgb = cv2.cvtColor(letterbox(bgr), cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(
+                resize_image(bgr, image_size, resize_mode), cv2.COLOR_BGR2RGB
+            )
             dataset.add_frame(
                 {
                     "observation.images.front": rgb,
@@ -146,8 +206,17 @@ def write_episode(
     dataset.save_episode()
 
 
-def export(source: Path, output: Path, repo_id: str) -> None:
-    """导出数据到临时目录，完成完整性校验后发布到目标目录。"""
+def export(
+    source: Path,
+    output: Path,
+    repo_id: str,
+    *,
+    image_size: tuple[int, int] = (224, 224),
+    resize_mode: str = "letterbox",
+) -> None:
+    """导出数据到临时目录并校验；image_size 的顺序为宽、高。"""
+    validate_image_options(image_size, resize_mode)
+
     from lerobot.configs.video import RGBEncoderConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -183,7 +252,7 @@ def export(source: Path, output: Path, repo_id: str) -> None:
     features = {
         "observation.images.front": {
             "dtype": "video",
-            "shape": (224, 224, 3),
+            "shape": (image_size[1], image_size[0], 3),
             "names": ["height", "width", "channel"],
         },
         "observation.state": {
@@ -212,7 +281,14 @@ def export(source: Path, output: Path, repo_id: str) -> None:
         for new_index, index in enumerate(kept):
             try:
                 write_episode(
-                    dataset, source, info, episodes[index], selection.repo_id, index
+                    dataset,
+                    source,
+                    info,
+                    episodes[index],
+                    selection.repo_id,
+                    index,
+                    image_size=image_size,
+                    resize_mode=resize_mode,
                 )
                 mapping.append(
                     {"episode_index": new_index, "source_episode_index": index}
@@ -233,8 +309,8 @@ def export(source: Path, output: Path, repo_id: str) -> None:
             "position_unit": "m",
             "rotation_unit": "rad",
             "gripper_representation": "normalized_0_1",
-            "image_size": [224, 224],
-            "image_preprocessing": "letterbox_inter_area_black_border",
+            "image_size": [image_size[1], image_size[0]],
+            "image_preprocessing": IMAGE_PREPROCESSING[resize_mode],
             "source_dataset": source.name,
             "episodes": mapping,
             "rejected": rejected,
@@ -260,8 +336,33 @@ def main() -> None:
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--repo-id", required=True)
+    parser.add_argument(
+        "--resize-mode",
+        choices=tuple(IMAGE_PREPROCESSING),
+        default="letterbox",
+        help="图像缩放方式（默认 letterbox：等比缩放并居中补黑）",
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        default=(224, 224),
+        help="输出图像的宽和高，均须为正偶数（默认 224 224）",
+    )
     args = parser.parse_args()
-    export(args.dataset, args.output, args.repo_id)
+    image_size = tuple(args.image_size)
+    try:
+        validate_image_options(image_size, args.resize_mode)
+    except ValueError as exc:
+        parser.error(str(exc))
+    export(
+        args.dataset,
+        args.output,
+        args.repo_id,
+        image_size=image_size,
+        resize_mode=args.resize_mode,
+    )
 
 
 if __name__ == "__main__":
