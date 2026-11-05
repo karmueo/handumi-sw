@@ -182,6 +182,8 @@ def test_parallel_export_preserves_data_and_reindexed_stats(source_dataset, tmp_
             text=True,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+        assert "已导出" in result.stdout
+        assert "[libx264 @" not in result.stdout + result.stderr
     tables = [
         pq.read_table(sorted((root / "data").glob("chunk-*/*.parquet")))
         for root in outputs
@@ -224,6 +226,34 @@ def test_parallel_export_preserves_data_and_reindexed_stats(source_dataset, tmp_
                 ("std", actual.std()),
             ):
                 np.testing.assert_allclose(stats[key][stat], [expected], atol=1e-8)
+
+
+def test_ffmpeg_encoder_errors_remain_visible(tmp_path):
+    """恢复 FFmpeg 默认回调后，编码错误仍应显示在标准错误中。"""
+    script = """
+import sys
+import av
+from handumi.scripts.export_tcp import _configure_ffmpeg_logging
+
+_configure_ffmpeg_logging()
+av.logging.restore_default_callback()
+with av.open(sys.argv[1], mode="w") as container:
+    stream = container.add_stream("libx264", rate=30)
+    stream.width = 1
+    stream.height = 1
+    stream.pix_fmt = "yuv420p"
+    try:
+        stream.encode(av.VideoFrame(1, 1, "rgb24"))
+    except av.error.FFmpegError:
+        pass
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "invalid.mp4")],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "not divisible by 2" in result.stderr
 
 
 def test_reader_rejects_mismatched_camera_sequence(source_dataset):
