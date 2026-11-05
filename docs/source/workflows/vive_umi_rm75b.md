@@ -335,7 +335,7 @@ handumi dataset qa outputs/umi-demo --robot rm75b \
 
 ### 7.1 TCP 转换
 
-转换读取桌面系右侧 TCP 和连续归一化夹爪，将每段位姿表示在该段首帧 TCP 坐标系。`observation.state` 与同帧示范 `action` 均为七维 `[x,y,z,rx,ry,rz,gripper]`，单位为米、弧度及 0～1 开度。右腕图像等比缩放并补黑至 224×224 RGB。每个录制段保留完整抓放过程及末帧。
+转换读取桌面系右侧 TCP 和连续归一化夹爪，将每段位姿表示在该段首帧 TCP 坐标系。`observation.state` 与同帧示范 `action` 均为七维 `[x,y,z,rx,ry,rz,gripper]`，单位为米、弧度及 0～1 开度。右腕图像默认等比缩放并补黑至 224×224 RGB。每个录制段保留完整抓放过程及末帧。
 
 ```bash
 handumi dataset export-tcp outputs/umi-demo \
@@ -344,6 +344,25 @@ handumi dataset export-tcp outputs/umi-demo \
 cat outputs/umi-demo-tcp-dp/meta/info.json
 cat outputs/umi-demo-tcp-dp/meta/fastumi.json
 ```
+
+图像缩放可以通过以下参数调整：
+
+- `--resize-mode letterbox`：等比缩放至目标范围内，再居中补黑，默认方式。
+- `--resize-mode center-crop`：等比缩放至覆盖目标范围，再居中裁剪。
+- `--resize-mode stretch`：直接拉伸至目标宽高，可能改变图像比例。
+- `--image-size WIDTH HEIGHT`：输出宽和高，默认 `224 224`，均须为正偶数。
+
+三种方式均使用 OpenCV `INTER_AREA` 插值。自定义输出示例：
+
+```bash
+handumi dataset export-tcp outputs/umi-demo \
+  --output outputs/umi-demo-tcp-crop \
+  --repo-id local/umi-demo-tcp-crop \
+  --resize-mode center-crop --image-size 320 240
+```
+
+`fastumi.json` 中的 `image_size` 按 `[高度, 宽度]` 记录，
+`image_preprocessing` 记录实际缩放方式。
 
 输出路径必须不存在。核对回合和帧数量、坐标与单位，`fastumi.json` 中的 `episodes` 提供新旧回合编号对应，`rejected` 给出跳过的回合与原因。检查通过的回合全部导出，不使用关节筛选结果。
 
@@ -514,6 +533,9 @@ uv run --no-sync lerobot-train \
 ```
 
 本批 200 段按末尾 10% 留出，训练 180 段、49,315 帧。单卡 batch 128 时，46,233 步约为 120 个 epoch。数据规模或 batch 变化后按 `steps ≈ 目标 epoch × 训练帧数 / 总有效 batch` 重算，并以训练日志为准。显存不足时降低 batch 并相应调整步数。输出目录已存在时更换目录和任务名。
+
+训练示例的 `policy.resize_shape='[224,224]'` 会将图像缩放至 224×224；
+使用自定义导出分辨率时，应同时检查训练阶段的预处理配置。
 
 `use_relative_pose=false` 保留导出时的回合起点坐标与轴角表示。部署需要记录每回合起始 TCP，并把模型输出从起始坐标系转换到机器人参考系。完整训练、恢复和部署约定见 `/home/scl/work/UMI/lerobot/docs/umi/umi_dp_相对回合起始位_训练.md`。
 

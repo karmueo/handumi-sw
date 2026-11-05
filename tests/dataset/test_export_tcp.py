@@ -1,8 +1,10 @@
 """验证 TCP 导出的坐标变换、图像处理和质量筛选。"""
 
 import json
+import sys
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
@@ -33,6 +35,162 @@ def test_letterbox_preserves_image_and_black_borders():
     assert output.shape == (224, 224, 3)
     assert not output[0].any()
     assert output[112].min() == 255
+
+
+@pytest.mark.parametrize("shape", [(108, 192), (191, 107), (13, 13), (1, 500)])
+def test_letterbox_default_matches_previous_output(shape):
+    """默认参数与原实现的缩放、取整和像素内容一致。"""
+    image = np.random.default_rng(123).integers(0, 256, (*shape, 3), dtype=np.uint8)
+    height, width = shape
+    scale = min(224 / width, 224 / height)
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    resized = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+    expected = np.zeros((224, 224, 3), dtype=np.uint8)
+    x, y = (224 - size[0]) // 2, (224 - size[1]) // 2
+    expected[y : y + size[1], x : x + size[0]] = resized
+    np.testing.assert_array_equal(letterbox(image), expected)
+
+
+@pytest.mark.parametrize("shape", [(3, 5), (5, 3)])
+def test_letterbox_centers_odd_border_remainder(shape):
+    """横图和竖图的奇数补边余量分别位于底部或右侧。"""
+    image = np.full((*shape, 3), 255, dtype=np.uint8)
+    output = export_tcp.resize_image(image, (8, 8), "letterbox")
+    if shape[0] < shape[1]:
+        assert not output[0].any()
+        assert output[1:6].min() == 255
+        assert not output[6:].any()
+    else:
+        assert not output[:, 0].any()
+        assert output[:, 1:6].min() == 255
+        assert not output[:, 6:].any()
+
+
+@pytest.mark.parametrize("vertical", [False, True])
+def test_center_crop_removes_odd_remainder_from_bottom_or_right(vertical):
+    """中心裁剪保留居中像素，多余的一行或一列放在底部或右侧。"""
+    image = np.broadcast_to(np.arange(7, dtype=np.uint8)[None, :, None], (4, 7, 3))
+    if vertical:
+        image = image.transpose(1, 0, 2)
+    output = export_tcp.resize_image(image, (4, 4), "center-crop")
+    expected = image[1:5, :] if vertical else image[:, 1:5]
+    np.testing.assert_array_equal(output, expected)
+
+
+@pytest.mark.parametrize("vertical", [False, True])
+def test_center_crop_scales_and_discards_outer_bands(vertical):
+    """中心裁剪在缩放后丢弃横图或竖图两端的内容。"""
+    image = np.full((4, 8, 3), (50, 100, 200), dtype=np.uint8)
+    image[:, :2] = (255, 0, 0)
+    image[:, -2:] = (0, 255, 0)
+    if vertical:
+        image = image.transpose(1, 0, 2)
+    output = export_tcp.resize_image(image, (6, 6), "center-crop")
+    np.testing.assert_array_equal(output, np.full((6, 6, 3), (50, 100, 200)))
+
+
+@pytest.mark.parametrize("shape", [(4, 8), (8, 4), (4, 4)])
+def test_stretch_preserves_edges_at_non_square_size(shape):
+    """直接拉伸保留横图、竖图和方图边缘以及指定目标宽高。"""
+    image = np.full((*shape, 3), (32, 128, 240), dtype=np.uint8)
+    image[:, 0] = (200, 100, 50)
+    image[:, -1] = (50, 100, 200)
+    output = export_tcp.resize_image(image, (16, 12), "stretch")
+    assert output.shape == (12, 16, 3)
+    np.testing.assert_array_equal(output[6, 0], image[0, 0])
+    np.testing.assert_array_equal(output[6, -1], image[0, -1])
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected_size", "expected_mode"),
+    [
+        ([], (224, 224), "letterbox"),
+        (
+            ["--image-size", "320", "240", "--resize-mode", "center-crop"],
+            (320, 240),
+            "center-crop",
+        ),
+    ],
+)
+def test_cli_passes_image_options(
+    monkeypatch, extra_args, expected_size, expected_mode
+):
+    """命令行默认值和自定义值按宽、高顺序传给导出接口。"""
+    calls = []
+    monkeypatch.setattr(
+        export_tcp, "export", lambda *args, **kwargs: calls.append(kwargs)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["export-tcp", "source", "--output", "out", "--repo-id", "a/b", *extra_args],
+    )
+    export_tcp.main()
+    assert calls == [{"image_size": expected_size, "resize_mode": expected_mode}]
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--resize-mode", "bad"],
+        ["--image-size", "224"],
+        ["--image-size", "wide", "224"],
+        ["--image-size", "0", "224"],
+        ["--image-size", "-2", "224"],
+        ["--image-size", "225", "224"],
+        ["--image-size", "224", "225"],
+    ],
+)
+def test_cli_rejects_invalid_image_options(monkeypatch, extra_args):
+    """参数不合法时命令行以错误状态退出且不开始导出。"""
+    calls = []
+    monkeypatch.setattr(
+        export_tcp, "export", lambda *args, **kwargs: calls.append(args)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["export-tcp", "source", "--output", "out", "--repo-id", "a/b", *extra_args],
+    )
+    with pytest.raises(SystemExit) as exc:
+        export_tcp.main()
+    assert exc.value.code == 2
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    ("image_size", "resize_mode"),
+    [
+        ((0, 224), "letterbox"),
+        ((224, 225), "letterbox"),
+        ((224.0, 224), "letterbox"),
+        ((True, 224), "letterbox"),
+        ((224,), "letterbox"),
+        (None, "letterbox"),
+        ((224, 224), "bad"),
+    ],
+)
+def test_export_rejects_invalid_options_before_io(
+    tmp_path, monkeypatch, image_size, resize_mode
+):
+    """Python 导出入口在访问源数据和创建输出目录之前拒绝非法选项。"""
+    source = tmp_path / "missing-source"
+    output = tmp_path / "missing-parent" / "output"
+
+    def fail_if_read(*args, **kwargs):
+        """在参数检查前尝试读取源数据时使测试失败。"""
+        pytest.fail("非法参数触发了源数据读取")
+
+    monkeypatch.setattr(export_tcp, "resolve_dataset_selection", fail_if_read)
+    with pytest.raises(ValueError):
+        export_tcp.export(
+            source,
+            output,
+            "local/output",
+            image_size=image_size,
+            resize_mode=resize_mode,
+        )
+    assert not output.parent.exists()
 
 
 def test_quality_selection_preserves_rejected_reason(tmp_path):
@@ -173,9 +331,19 @@ def test_export_cleans_partial_dataset_on_short_video(tmp_path, monkeypatch):
     assert not list(tmp_path.glob(".output-*"))
 
 
-def test_export_shared_video_and_skipped_episode(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("image_size", "resize_mode", "preprocessing"),
+    [
+        ((224, 224), "letterbox", "letterbox_inter_area_black_border"),
+        ((80, 40), "letterbox", "letterbox_inter_area_black_border"),
+        ((80, 40), "center-crop", "center_crop_inter_area"),
+        ((80, 40), "stretch", "stretch_inter_area"),
+    ],
+)
+def test_export_shared_video_and_skipped_episode(
+    tmp_path, monkeypatch, image_size, resize_mode, preprocessing
+):
     """真实写入器保留两个回合末帧，视频读取跨过被拒绝回合。"""
-    import cv2
     import pyarrow.parquet as pq
 
     source = tmp_path / "source"
@@ -186,7 +354,12 @@ def test_export_shared_video_and_skipped_episode(tmp_path, monkeypatch):
     video = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (64, 48))
     assert video.isOpened()
     for intensity in [20, 40, 60, 80, 120, 160]:
-        video.write(np.full((48, 64, 3), intensity, dtype=np.uint8))
+        frame = np.full(
+            (48, 64, 3), (intensity // 4, intensity // 2, intensity), dtype=np.uint8
+        )
+        frame[:6, :] = (0, 220, 0)
+        frame[-6:, :] = (220, 0, 0)
+        video.write(frame)
     video.release()
     prefix = "videos/observation.images.right_wrist/"
     rows = [
@@ -245,7 +418,9 @@ def test_export_shared_video_and_skipped_episode(tmp_path, monkeypatch):
 
     monkeypatch.setattr(export_tcp, "load_raw_episode", raw)
     output = tmp_path / "output"
-    export_tcp.export(source, output, "local/output")
+    export_tcp.export(
+        source, output, "local/output", image_size=image_size, resize_mode=resize_mode
+    )
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -262,11 +437,39 @@ def test_export_shared_video_and_skipped_episode(tmp_path, monkeypatch):
             < 1e-5
         )
         assert item["task"] == "pick place"
-        expected = [20, 40, 120, 160][index] / 255
-        assert (
-            abs(float(item["observation.images.front"][:, 112, 112].mean()) - expected)
-            < 0.05
+        intensity = [20, 40, 120, 160][index]
+        image = item["observation.images.front"]
+        assert tuple(image.shape) == (3, image_size[1], image_size[0])
+        expected_rgb = np.array([intensity, intensity // 2, intensity // 4]) / 255
+        np.testing.assert_allclose(
+            image[:, image_size[1] // 2, image_size[0] // 2], expected_rgb, atol=0.05
         )
+        if image_size == (224, 224):
+            # 方形补黑位于顶部和底部。
+            np.testing.assert_allclose(image[:, 2, 112], 0, atol=0.06)
+            np.testing.assert_allclose(image[:, -3, 112], 0, atol=0.06)
+        else:
+            # 80×40 的补黑位于左右两侧；裁剪和拉伸都填满画面。
+            expected_side = 0 if resize_mode == "letterbox" else expected_rgb
+            np.testing.assert_allclose(image[:, 20, 2], expected_side, atol=0.06)
+            np.testing.assert_allclose(image[:, 20, -3], expected_side, atol=0.06)
+            # 中心裁剪去掉上下色带，补黑和拉伸均保留色带。
+            expected_top = (
+                expected_rgb if resize_mode == "center-crop" else [0, 220 / 255, 0]
+            )
+            expected_bottom = (
+                expected_rgb if resize_mode == "center-crop" else [0, 0, 220 / 255]
+            )
+            np.testing.assert_allclose(image[:, 2, 40], expected_top, atol=0.08)
+            np.testing.assert_allclose(image[:, -3, 40], expected_bottom, atol=0.08)
     contract = json.loads((output / "meta" / "fastumi.json").read_text())
+    output_info = json.loads((output / "meta" / "info.json").read_text())
+    assert output_info["features"]["observation.images.front"]["shape"] == [
+        image_size[1],
+        image_size[0],
+        3,
+    ]
+    assert contract["image_size"] == [image_size[1], image_size[0]]
+    assert contract["image_preprocessing"] == preprocessing
     assert [row["source_episode_index"] for row in contract["episodes"]] == [0, 2]
     assert contract["rejected"][0]["source_episode_index"] == 1
