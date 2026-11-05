@@ -314,8 +314,9 @@ handumi dataset qa outputs/umi-demo --robot rm75b \
 
 ### 6.3 转换为关节数据
 
-以下命令统一使用 `absolute-tcp`，并通过 `fixed` 加载 6.1 保存的摆放。
-**`--deployment-calibration` 必须搭配 `--base-placement fixed`，不能搭配 `dataset-xy-yaw`。**
+以下命令统一使用 `absolute-tcp`。A、B 通过 `fixed` 加载 6.1 保存的共享摆放；
+需要每个 episode 独立选择 base 时，使用 C。
+**A、B 中的 `--deployment-calibration` 搭配 `--base-placement fixed`，不能搭配 `dataset-xy-yaw`。**
 参数行为见[回放参数解析](../../../src/handumi/scripts/replay/replay_in_sim.py)。
 
 **A. 全部 episode 可用：按固定摆放确认筛选，再转换。**
@@ -367,9 +368,57 @@ handumi convert outputs/umi-demo-curated --robot rm75b \
 **先确认 `screen` 没有 rejected，再执行 `convert`。** 若仍有失败，按新报告处理后重检。
 不要用 `--allow-flagged-episodes` 绕过尚未解决的碰撞或精度问题。
 
+**C. 每个 episode 独立选择 base：逐段搜索 XY 摆放后转换。**
+
+适用于各段动作需要不同仿真摆放的情况。`episode-xy` 为每个 episode 独立
+搜索 base 在桌面坐标系中的 XY 位置，并验证整段轨迹；同一段内 base 保持
+固定，高度和朝向沿用参考摆放。该模式不搜索 yaw，也不支持 base 随帧移动。
+结果用于仿真，不能直接作为实体机器人共享安装位置。
+
+此流程不依赖 6.1 的共享摆放文件。先运行 `handumi validate outputs/umi-demo`
+检查录制质量，再按以下命令筛选和转换；即使已经执行 A、B 或 6.2，也应重新
+生成 `episode-xy` 筛选报告，避免沿用共享摆放下的拒绝结果。
+
+```bash
+handumi dataset screen outputs/umi-demo --robot rm75b \
+  --deployment-profile sim --retarget-mode absolute-tcp \
+  --base-placement episode-xy
+
+# 确认筛选报告没有 rejected 后执行。
+handumi convert outputs/umi-demo --robot rm75b \
+  --deployment-profile sim --retarget-mode absolute-tcp \
+  --base-placement episode-xy \
+  --output outputs/umi-joints-episode-xy
+```
+
+两条命令均显式使用 `--deployment-profile sim`，无需传入
+`--deployment-calibration`。`episode-xy` 不允许修改实体（`physical`）桌面
+标定；也不要添加仅用于共享摆放搜索的 `--refresh-base-placement`。
+
+若需要排除失败段，先用本次 `episode-xy` 筛选结果更新 `meta/handumi_analysis.json`，
+再让 `curate` 按更新后的分析报告排除 rejected 段：
+
+```bash
+handumi dataset analyze outputs/umi-demo \
+  --quality-report outputs/umi-demo/meta/handumi_screening_rm75b.json
+
+handumi dataset curate outputs/umi-demo \
+  --output outputs/umi-demo-episode-xy-curated --exclude-rejected
+```
+
+将 C 中 `screen` 和 `convert` 的输入路径都改为 `outputs/umi-demo-episode-xy-curated`，
+保留 `--base-placement episode-xy`。先重新筛选，确认无 rejected 后再转换。
+
+转换结果记录各段实际使用的摆放，关节回放会读取对应记录：
+
+```bash
+handumi replay-joints outputs/umi-joints-episode-xy --robot rm75b \
+  --approach-seconds 0
+```
+
 ### 6.4 回放转换结果
 
-A 或 B 的转换完成后，回放关节数据，从每段首帧直接开始：
+A 或 B 的转换完成后，回放关节数据，从每段首帧直接开始（C 使用上一节的输出路径）：
 
 ```bash
 handumi replay-joints outputs/umi-joints-passed --robot rm75b \
