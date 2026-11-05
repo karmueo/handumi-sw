@@ -380,9 +380,9 @@ def _capture_issues(health, duplicate_frame):
 def capture_status_text(
     *, mode, health, tracking, gripper, healthy, duplicate_frame=False,
     recording=False, saving=False, exit_requested=False, frame_count=0, fps=30, saved=0, last_result="",
-    camera_status=None,
+    camera_status=None, total_episodes=0,
 ):
-    """生成当前采集状态的 Markdown；帧数和保存数由调用方维护。"""
+    """生成采集状态；总数仅包含已保存段，零起始 ID 对应当前或下一段。"""
     issues = _capture_issues(health, duplicate_frame)
     if not healthy and not issues:
         issues.append("采集状态无效")
@@ -393,7 +393,9 @@ def capture_status_text(
         lines = [
             f"## {phase}",
             f"当前段：{frame_count} 帧 · 数据时长 {frame_count / fps:.1f} 秒  ",
-            f"本次已保存：{saved} 段",
+            f"本次已保存：{saved} 段  ",
+            f"episode 总数（已保存）：{total_episodes}  ",
+            f"{'当前' if recording or saving else '下一段'} episode ID：{total_episodes}（从 0 开始）",
         ]
         if last_result:
             lines.extend(["", f"最近结果：{last_result}"])
@@ -764,6 +766,7 @@ def main(argv=None, *, mode="record"):
     camera_stalled = False  # 仅在停帧和恢复时提示，避免终端刷屏。
     camera_waiting_first_frame = False  # 首帧尚不可用时只提示一次。
     saved = 0
+    total_episodes = 0  # 主线程维护已提交总数，保存期间保持当前段 ID 稳定。
     frame_count = 0
     frame_times = []  # 每个成功录制帧的主机单调时间。
     camera_times = []  # 对应相机采集时间，用于计算原始帧间隔。
@@ -811,6 +814,12 @@ def main(argv=None, *, mode="record"):
             if mode == "record":
                 dataset = _open_recording_dataset(
                     args, snapshot, recording_metadata
+                )
+                total_episodes = dataset.meta.total_episodes if args.resume else 0
+                print(
+                    f"episode 总数（已保存）：{total_episodes}；"
+                    f"下一段 episode ID：{total_episodes}（从 0 开始）",
+                    flush=True,
                 )
                 info = getattr(dataset, "_handumi_encoding", None)
                 if isinstance(info, dict):
@@ -886,6 +895,7 @@ def main(argv=None, *, mode="record"):
                                 save_failure = exc
                                 raise RuntimeError(f"保存当前段失败：{exc}") from exc
                             saved += 1
+                            total_episodes += 1
                             metrics = _capture_metrics(
                                 frame_times, camera_times, add_durations, save_durations,
                                 time.monotonic() - save_requested_at,
@@ -895,7 +905,11 @@ def main(argv=None, *, mode="record"):
                             last_result = f"已保存 {frame_count} 帧"
                             frame_count = 0
                             next_preview = 0.0
-                            print(f"已保存 {saved} 段")
+                            print(
+                                f"本次已保存 {saved} 段；已保存 episode ID：{total_episodes - 1}；"
+                                f"episode 总数（已保存）：{total_episodes}；"
+                                f"下一段 episode ID：{total_episodes}", flush=True,
+                            )
                             if args.num_episodes > 0 and saved >= args.num_episodes:
                                 exit_requested = True
                     else:
@@ -911,11 +925,15 @@ def main(argv=None, *, mode="record"):
                         mode=mode, health=health, tracking=tracking, gripper=gripper,
                         healthy=healthy, duplicate_frame=duplicate_frame,
                         recording=recording, frame_count=frame_count, fps=args.fps,
-                        saved=saved, last_result=last_result,
+                        saved=saved, last_result=last_result, total_episodes=total_episodes,
                         camera_status=getattr(getattr(devices, "camera", None), "status", None),
                     )
                     if dataset is not None:
                         if action == "start":
+                            print(
+                                f"开始录制；当前 episode ID：{total_episodes}；"
+                                f"episode 总数（已保存）：{total_episodes}", flush=True,
+                            )
                             frame_count = 0
                             previous_recorded_sequence = None
                             frame_times.clear()

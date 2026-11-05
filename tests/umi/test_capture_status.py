@@ -98,10 +98,12 @@ def test_status_explains_capture_failures_and_held_gripper():
     health = CaptureHealth(True, True, 150_000_000, 0)
     text = capture_status_text(
         mode="record", health=health, tracking=tracking, gripper=gripper,
-        healthy=True, recording=True, frame_count=45, fps=30, saved=3,
+        healthy=True, recording=True, frame_count=45, fps=30, saved=3, total_episodes=11,
     )
     for content in ("录制中", "45 帧", "1.5 秒", "本次已保存：3 段", "短暂漏检", "位姿无效"):
         assert content in text
+    assert "episode 总数（已保存）：11" in text
+    assert "当前 episode ID：11（从 0 开始）" in text
     assert "不可录制原因" not in text
 
 
@@ -124,6 +126,7 @@ def test_saving_hides_recording_shortcuts():
         mode="record", health=CaptureHealth(True, True, 150_000_000, 0),
         tracking=tracking, gripper=gripper, healthy=True, recording=True, saving=True,
     )
+    assert "当前 episode ID：0（从 0 开始）" in text
     assert "保存中" in text and "正在保存，请稍候" in text
     assert "空格" not in text and "Esc" not in text
 

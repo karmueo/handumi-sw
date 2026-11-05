@@ -251,7 +251,7 @@ def test_record_save_discard_and_exit_without_ik(tmp_path, monkeypatch, early_ex
 
 
 @pytest.mark.parametrize("resume", [False, True])
-def test_status_persists_results_and_resets_for_each_session(tmp_path, monkeypatch, resume):
+def test_status_persists_results_and_resets_for_each_session(tmp_path, monkeypatch, resume, capsys):
     """普通刷新保留结果，新段清除结果，续录也只统计本次保存段数。"""
     calibration = tmp_path / "calibration.yaml"
     calibration.write_text("{}")
@@ -266,7 +266,7 @@ def test_status_persists_results_and_resets_for_each_session(tmp_path, monkeypat
         (output / "meta").mkdir(exist_ok=True)
         (output / "meta/info.json").write_text("{}")
         # 假设续录数据集已有多段；面板不应把它们计入本次保存数。
-        dataset.meta.total_episodes = 8
+        dataset.meta.total_episodes = 8 if resume else 0
         return dataset
 
     class FakeDevice:
@@ -336,6 +336,15 @@ def test_status_persists_results_and_resets_for_each_session(tmp_path, monkeypat
     normal = [status for status in statuses if not status.get("saving", False)]
     assert len(normal) == 7
     ready, first_start, saved, saved_wait, next_start, discarded, discarded_wait = normal
+    initial_total = 8 if resume else 0  # 续录从已有段数继续编号。
+    assert ready["total_episodes"] == initial_total
+    assert first_start["total_episodes"] == initial_total
+    assert all(s["total_episodes"] == initial_total for s in statuses if s.get("saving"))
+    assert all(s["total_episodes"] == initial_total + 1 for s in normal[2:])
+    terminal = capsys.readouterr().out
+    assert f"当前 episode ID：{initial_total}；" in terminal
+    assert f"已保存 episode ID：{initial_total}；" in terminal
+    assert f"episode 总数（已保存）：{initial_total + 1}；" in terminal
     assert ready["saved"] == 0 and not ready["last_result"]
     assert first_start["recording"] and first_start["frame_count"] == 1
     assert saved["saved"] == 1 and saved["last_result"] == "已保存 1 帧"
