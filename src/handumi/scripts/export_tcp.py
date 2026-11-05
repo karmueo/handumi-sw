@@ -40,6 +40,14 @@ IMAGE_PREPROCESSING = {
 }
 
 
+def _configure_ffmpeg_logging() -> None:
+    """限制 FFmpeg 原生日志，保留编码警告和错误。"""
+    import av
+
+    # LeRobot 结束编码后会恢复原生回调，因此需要设置 FFmpeg 自身的级别。
+    av.logging.set_libav_level(av.logging.WARNING)
+
+
 def export_metadata(
     info: dict,
     *,
@@ -380,6 +388,7 @@ def _run_shard(args: dict, report) -> None:
 def _shard_process(args: dict, events) -> None:
     """向父进程转发分片进度与错误。"""
     try:
+        _configure_ffmpeg_logging()
         _run_shard(args, events.put)
         events.put(("done",))
     except BaseException:
@@ -716,6 +725,7 @@ def main() -> None:
             raise ValueError("工作进程数必须为正整数")
     except ValueError as exc:
         parser.error(str(exc))
+    _configure_ffmpeg_logging()
     export(
         args.dataset,
         args.output,
