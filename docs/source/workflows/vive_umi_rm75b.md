@@ -364,6 +364,43 @@ handumi dataset export-tcp outputs/umi-demo \
 `fastumi.json` 中的 `image_size` 按 `[高度, 宽度]` 记录，
 `image_preprocessing` 记录实际缩放方式。
 
+转换默认使用 CPU H.264 编码，并以最多 8 个工作进程并行处理回合。
+启动时会输出实际编码器和进程数，处理期间显示进度、帧率及预计剩余时间；
+结束时显示总耗时和各进程阶段耗时之和。后者是各进程工作时间的累计值，
+并行执行时不等于总耗时。流式编码直接处理图像帧，编码队列拥塞时等待，
+每段输出都解码核对帧数。
+每个回合保存为独立视频文件，LeRobot 根据元数据索引读取，训练使用方式不变。
+
+- `--encoder auto`：探测目标尺寸和并发工作数下的硬件编码，失败时回退 CPU。
+- `--encoder cpu`：使用 CPU H.264 编码，默认方式。
+- `--encoder gpu`：要求硬件 H.264 编码，探测失败时退出并报告原因。
+- `--workers N`：指定正整数工作进程数；默认取 CPU 逻辑数、保留回合数和 8 中的最小值。
+
+例如使用默认 CPU 编码和进程数，将图像直接缩放至 240×134：
+
+```bash
+handumi dataset export-tcp outputs/umi-demo \
+  --output outputs/umi-tcp-dp-240_134 --repo-id umi/tcp-dp \
+  --resize-mode stretch --image-size 240 134
+```
+
+图像缩放始终使用 OpenCV CPU `INTER_AREA`；GPU 用于视频编码。H.264 有损编码
+会随软硬件编码器产生细微像素差异；帧序、坐标和夹爪数据保持一致。
+图像统计信息在流式编码时重新计算，采样方式与旧版 PNG 转换不同。
+
+可用以下命令在通过质量检查的前 20 个回合上比较优化前版本、CPU 单进程及四进程、
+GPU 单进程及四进程。每种方案默认预热一次、测量三次；
+`--baseline-ref` 填写优化前的 Git 提交或引用：
+
+```bash
+.venv/bin/python -m handumi.scripts.benchmark_export_tcp outputs/umi-demo \
+  --output-dir outputs/tcp-export-benchmark --baseline-ref b0f93a3
+```
+
+基准在独立临时目录写入数据，保留 `report.json`、`report.txt` 和各次运行日志。
+报告中的内存为进程树定时采样的常驻内存峰值；缺少 `psutil` 时不显示内存。
+可使用 `--modes cpu4 gpu4` 仅测量指定方案；测量旧版时必须指定 `--baseline-ref`。
+
 输出路径必须不存在。核对回合和帧数量、坐标与单位，`fastumi.json` 中的 `episodes` 提供新旧回合编号对应，`rejected` 给出跳过的回合与原因。检查通过的回合全部导出，不使用关节筛选结果。
 
 ### 7.2 关节转换

@@ -102,18 +102,32 @@ def test_stretch_preserves_edges_at_non_square_size(shape):
 
 
 @pytest.mark.parametrize(
-    ("extra_args", "expected_size", "expected_mode"),
+    (
+        "extra_args",
+        "expected_size",
+        "expected_mode",
+        "expected_encoder",
+        "expected_workers",
+    ),
     [
-        ([], (224, 224), "letterbox"),
+        ([], (224, 224), "letterbox", "cpu", None),
         (
             ["--image-size", "320", "240", "--resize-mode", "center-crop"],
             (320, 240),
             "center-crop",
+            "cpu",
+            None,
         ),
+        (["--encoder", "auto", "--workers", "2"], (224, 224), "letterbox", "auto", 2),
     ],
 )
 def test_cli_passes_image_options(
-    monkeypatch, extra_args, expected_size, expected_mode
+    monkeypatch,
+    extra_args,
+    expected_size,
+    expected_mode,
+    expected_encoder,
+    expected_workers,
 ):
     """命令行默认值和自定义值按宽、高顺序传给导出接口。"""
     calls = []
@@ -126,7 +140,81 @@ def test_cli_passes_image_options(
         ["export-tcp", "source", "--output", "out", "--repo-id", "a/b", *extra_args],
     )
     export_tcp.main()
-    assert calls == [{"image_size": expected_size, "resize_mode": expected_mode}]
+    assert calls == [
+        {
+            "image_size": expected_size,
+            "resize_mode": expected_mode,
+            "encoder": expected_encoder,
+            "workers": expected_workers,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("cpu_count", "episode_count", "options", "expected_workers"),
+    [
+        (16, 12, {}, 8),
+        (3, 12, {}, 3),
+        (16, 3, {}, 3),
+        (None, 12, {}, 1),
+        (3, 12, {"workers": 11}, 11),
+    ],
+)
+def test_export_default_cpu_and_worker_limit(
+    tmp_path, monkeypatch, cpu_count, episode_count, options, expected_workers
+):
+    """验证默认 CPU 和进程数限制，并保留显式进程数的行为。"""
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "output"
+    rows = [{"episode_index": index, "length": 2} for index in range(episode_count)]
+    info = {
+        "fps": 30,
+        "total_episodes": episode_count,
+        "handumi": {
+            "recording_device": "vive",
+            "active_sides": ["right"],
+            "capture_schema": "synchronized_sources_v2",
+            "tcp_pose": {
+                "frame": "table",
+                "feature": "observation.tracking.right_tcp_pose",
+            },
+        },
+    }
+    calls = []
+    monkeypatch.setattr(export_tcp.os, "cpu_count", lambda: cpu_count)
+    monkeypatch.setattr(export_tcp, "load_info", lambda _: info)
+    monkeypatch.setattr(
+        export_tcp.pq,
+        "read_table",
+        lambda *args, **kwargs: SimpleNamespace(to_pylist=lambda: rows),
+    )
+    monkeypatch.setattr(
+        export_tcp,
+        "quality_selection",
+        lambda *args: (list(range(episode_count)), []),
+    )
+    monkeypatch.setattr(
+        export_tcp,
+        "select_encoder",
+        lambda *args: calls.append(args) or "h264",
+    )
+
+    def check_shards(shards, *args):
+        """验证配置已落实到分片，无需启动进程或写入实际数据。"""
+        assert len(shards) == expected_workers
+        assert [index for shard in shards for index in shard["indices"]] == list(
+            range(episode_count)
+        )
+        assert all(shard["codec"] == "h264" for shard in shards)
+        raise RuntimeError("已验证配置")
+
+    monkeypatch.setattr(export_tcp, "_export_shards", check_shards)
+    with pytest.raises(RuntimeError, match="已验证配置"):
+        export_tcp.export(source, output, "local/output", **options)
+    assert calls == [("cpu", (224, 224), expected_workers)]
+    assert not output.exists()
+    assert not list(tmp_path.glob(".output-*"))
 
 
 @pytest.mark.parametrize(
@@ -139,6 +227,10 @@ def test_cli_passes_image_options(
         ["--image-size", "-2", "224"],
         ["--image-size", "225", "224"],
         ["--image-size", "224", "225"],
+        ["--encoder", "invalid"],
+        ["--workers", "0"],
+        ["--workers", "-1"],
+        ["--workers", "x"],
     ],
 )
 def test_cli_rejects_invalid_image_options(monkeypatch, extra_args):
@@ -262,7 +354,9 @@ def test_export_cleans_partial_dataset_on_short_video(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(export_tcp, "load_info", lambda _: info)
     monkeypatch.setattr(
-        export_tcp.pq, "read_table", lambda _: SimpleNamespace(to_pylist=lambda: [row])
+        export_tcp.pq,
+        "read_table",
+        lambda *args, **kwargs: SimpleNamespace(to_pylist=lambda: [row]),
     )
     monkeypatch.setattr(export_tcp, "quality_selection", lambda *args: ([0], []))
     poses = np.array([[0, 0, 0, 0, 0, 0, 1]] * 2)
@@ -275,6 +369,11 @@ def test_export_cleans_partial_dataset_on_short_video(tmp_path, monkeypatch):
                 "observation.gripper.right.normalized": [0.8, 0.7],
             }
         ),
+    )
+    monkeypatch.setattr(
+        export_tcp,
+        "EpisodeReader",
+        lambda *args: SimpleNamespace(read=lambda *args: (poses, [0.8, 0.7])),
     )
 
     class Writer:
@@ -290,6 +389,7 @@ def test_export_cleans_partial_dataset_on_short_video(tmp_path, monkeypatch):
             self._is_finalized = True
 
     writer = Writer()
+    writer.writer = SimpleNamespace()
     monkeypatch.setattr(
         lerobot_dataset.LeRobotDataset, "create", lambda *args, **kwargs: writer
     )
@@ -325,7 +425,7 @@ def test_export_cleans_partial_dataset_on_short_video(tmp_path, monkeypatch):
 
     monkeypatch.setattr(export_tcp.cv2, "VideoCapture", Capture)
     with pytest.raises(RuntimeError, match="视频帧数不足"):
-        export_tcp.export(source, output, "local/output")
+        export_tcp.export(source, output, "local/output", encoder="cpu", workers=1)
     assert writer._is_finalized
     assert not output.exists()
     assert not list(tmp_path.glob(".output-*"))
@@ -417,9 +517,25 @@ def test_export_shared_video_and_skipped_episode(
         )
 
     monkeypatch.setattr(export_tcp, "load_raw_episode", raw)
+    monkeypatch.setattr(
+        export_tcp,
+        "EpisodeReader",
+        lambda *args: SimpleNamespace(
+            read=lambda index, length: (
+                raw(episode=index).signals["observation.tracking.right_tcp_pose"],
+                raw(episode=index).signals["observation.gripper.right.normalized"],
+            )
+        ),
+    )
     output = tmp_path / "output"
     export_tcp.export(
-        source, output, "local/output", image_size=image_size, resize_mode=resize_mode
+        source,
+        output,
+        "local/output",
+        image_size=image_size,
+        resize_mode=resize_mode,
+        encoder="cpu",
+        workers=1,
     )
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
